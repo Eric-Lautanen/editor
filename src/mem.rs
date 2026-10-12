@@ -44,6 +44,26 @@ use std::alloc::{GlobalAlloc, Layout, System};
 
 const MAX_COMPONENTS: usize = 16;
 
+/// Pointer -> component registry so `dealloc` attributes the free to the
+/// component that made the allocation, regardless of `CURRENT` at drop
+/// time (Vecs outlive their constructors: buffers, canvases, display
+/// lists are all dropped on the same thread much later). Open-addressed
+/// static slots: no heap inside the allocator, linear probe, `0` ptr =
+/// empty. Overflow just marks the entry untagged (the table is sized for
+/// ~the app's typical live pointer population; census precision, not
+/// completeness, is the goal).
+const TAG_SLOTS: usize = 1 << 14; // 16384
+const TAG_MASK: usize = TAG_SLOTS - 1;
+
+#[repr(C)]
+struct TagSlot {
+    ptr: usize,
+    size: u32,
+    comp: u8,
+}
+
+static mut TAGS: [TagSlot; TAG_SLOTS] = unsafe { std::mem::zeroed() };
+
 // Variants land as components get instrumented; they are the stable wire
 // names for the census, listed up front so adding a tag needs no re-plumbing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,22 +116,24 @@ unsafe impl GlobalAlloc for Tracked {
         let c = unsafe { CURRENT };
         let idx = c as usize % MAX_COMPONENTS;
         let size = layout.size() as u64;
-        unsafe {
-            LIVE[idx] += size;
-            TOTAL[idx] += size;
-            GLOBAL_LIVE += size;
-            GLOBAL_TOTAL += size;
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            unsafe {
+                LIVE[idx] += size;
+                TOTAL[idx] += size;
+                GLOBAL_LIVE += size;
+                GLOBAL_TOTAL += size;
+                tag_set(p as usize, layout.size() as u32, idx as u8);
+            }
         }
-        System.alloc(layout)
+        p
     }
 
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        let c = unsafe { CURRENT };
-        let idx = c as usize % MAX_COMPONENTS;
-        // Allocations made before attribution started (or freed later under
-        // a different thread than they were tagged) can go negative per-
-        // component; the numbers are then still monotone globally, which is
-        // what the report's "where does the RAM go" question needs.
+        // Attribute by pointer (the component that allocated it), falling
+        // back to CURRENT for pre-tagging allocations.
+        let cur = (unsafe { CURRENT }) as usize % MAX_COMPONENTS;
+        let idx = unsafe { tag_take(p as usize) }.unwrap_or(cur);
         unsafe {
             LIVE[idx] = LIVE[idx].saturating_sub(layout.size() as u64);
             GLOBAL_LIVE = GLOBAL_LIVE.saturating_sub(layout.size() as u64);
@@ -120,20 +142,61 @@ unsafe impl GlobalAlloc for Tracked {
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let c = unsafe { CURRENT };
-        let idx = c as usize % MAX_COMPONENTS;
-        // Net change: subtract the old block, add the new (both arriving
-        // whenever System.realloc moves the block).
-        unsafe {
-            let old = layout.size() as u64;
-            let new = new_size as u64;
-            LIVE[idx] = LIVE[idx].saturating_sub(old) + new;
-            TOTAL[idx] += new;
-            GLOBAL_LIVE = GLOBAL_LIVE.saturating_sub(old) + new;
-            GLOBAL_TOTAL += new;
+        let old_idx = unsafe { tag_take(p as usize) }
+            .unwrap_or((unsafe { CURRENT }) as usize % MAX_COMPONENTS);
+        let np = System.realloc(p, layout, new_size);
+        if !np.is_null() {
+            let new_idx = (unsafe { CURRENT }) as usize % MAX_COMPONENTS;
+            unsafe {
+                let old = layout.size() as u64;
+                let new = new_size as u64;
+                LIVE[old_idx] = LIVE[old_idx].saturating_sub(old);
+                GLOBAL_LIVE = GLOBAL_LIVE.saturating_sub(old);
+                LIVE[new_idx] += new;
+                GLOBAL_LIVE += new;
+                GLOBAL_TOTAL += new;
+                // TOTAL stays on the allocating component only (live is what
+                // the report reads; total shows gross traffic).
+                TOTAL[new_idx] += new;
+                tag_set(np as usize, new_size as u32, new_idx as u8);
+            }
         }
-        System.realloc(p, layout, new_size)
+        np
     }
+}
+
+#[inline]
+unsafe fn tag_set(ptr: usize, size: u32, comp: u8) {
+    let mut i = ptr.wrapping_mul(0x9E37_79B9) & TAG_MASK;
+    for _ in 0..8 {
+        let s = &mut TAGS[i];
+        if s.ptr == 0 || s.ptr == ptr {
+            s.ptr = ptr;
+            s.size = size;
+            s.comp = comp;
+            return;
+        }
+        i = (i + 1) & TAG_MASK;
+    }
+    // Full probe: leave untagged (dealloc will fall back to CURRENT).
+}
+
+#[inline]
+unsafe fn tag_take(ptr: usize) -> Option<usize> {
+    let mut i = ptr.wrapping_mul(0x9E37_79B9) & TAG_MASK;
+    for _ in 0..8 {
+        let s = &TAGS[i];
+        if s.ptr == ptr {
+            let comp = s.comp as usize;
+            TAGS[i].ptr = 0;
+            return Some(comp);
+        }
+        if s.ptr == 0 {
+            return None;
+        }
+        i = (i + 1) & TAG_MASK;
+    }
+    None
 }
 
 // -- component attribution ------------------------------------------------

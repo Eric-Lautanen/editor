@@ -97,11 +97,19 @@ pub fn run(args: Vec<String>) -> Result<()> {
     #[cfg(any(test, feature = "mem-census"))]
     if o.mem_report {
         if let Some(path) = o.file.as_deref() {
-            let _ = App::new(Some(path.to_path_buf())).map(|app| {
-                let mut a = app;
-                let _ = a.render_headless(o.size.0, o.size.1, o.scale);
-                crate::platform::print_line(&crate::mem::report());
-            });
+            let mut a = App::new(Some(path.to_path_buf()))?;
+            let _ = a.render_headless(o.size.0, o.size.1, o.scale);
+            crate::platform::print_line("-- after tab 1 --");
+            crate::platform::print_line(&crate::mem::report());
+            // Open the same file a second time (2-tab cost, like the user's
+            // report), repaint, and print again.
+            a.open_path(
+                path.to_path_buf(),
+                &mut crate::platform::NullHost::default(),
+            );
+            let _ = a.render_headless(o.size.0, o.size.1, o.scale);
+            crate::platform::print_line("-- after 2nd tab (same file) --");
+            crate::platform::print_line(&crate::mem::report());
             return Ok(());
         }
     }
