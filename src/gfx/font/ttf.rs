@@ -50,6 +50,10 @@ const FLATTEN_TOL_UNITS: f32 = 8.0;
 /// these; horizontal coverage stays exact per sample.
 const RASTER_SAMPLES: u32 = 4;
 
+/// Hostile fonts can carry enormous coordinate deltas; cap the bitmap size
+/// in each axis so a single glyph can never ask for an absurd allocation.
+const MAX_BITMAP_DIM: usize = 4_096;
+
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)] // BadMagic/BadTable/BadGlyph shape the message; rename would read worse.
 pub enum TtfError {
@@ -183,7 +187,8 @@ fn parse_hhea(data: &[u8]) -> Result<(f32, f32, u16), TtfError> {
 fn parse_loca(data: &[u8], short: bool, num_glyphs: u16) -> Result<Vec<u32>, TtfError> {
     let (off, len) = table(data, b"loca");
     let need = num_glyphs as usize + 1;
-    let entry = usize::from(short).max(4);
+    // Short loca stores 2-byte entries, long stores 4.
+    let entry = if short { 2 } else { 4 };
     if (len as usize) < need * entry {
         return Err(TtfError::BadTable("loca"));
     }
@@ -416,6 +421,9 @@ impl Face {
         }
         let mut cmap = Cmap::parse(data)?;
         let (upem, short_loca) = parse_head(data)?;
+        if !(upem > 0.0 && upem.is_finite()) {
+            return Err(TtfError::BadTable("head upem"));
+        };
         let num_glyphs = parse_maxp(data)?;
         let (ascent, descent, nhm) = parse_hhea(data)?;
         let loca = parse_loca(data, short_loca, num_glyphs)?;
@@ -481,9 +489,15 @@ impl Face {
         if end <= start {
             return Ok(vec![]);
         }
-        // loca offsets are relative to the glyf table, not the file.
-        let glyph_bytes = &self.data
-            [self.glyf_off as usize + start..(self.glyf_off as usize + end).min(self.data.len())];
+        // loca offsets are relative to the glyf table, not the file. A hostile
+        // face can point past the file (or glyf may be missing entirely);
+        // degrade to an empty glyph instead of an out-of-bounds slice.
+        let abs_start = self.glyf_off as usize + start;
+        let abs_end = (self.glyf_off as usize + end).min(self.data.len());
+        if abs_start >= self.data.len() || abs_start >= abs_end {
+            return Ok(vec![]);
+        }
+        let glyph_bytes = &self.data[abs_start..abs_end];
         let mut r = Reader::new(glyph_bytes);
         let n_contours = r.i16()?;
         if n_contours >= 0 {
@@ -718,11 +732,15 @@ impl Face {
     /// the y negation.
     fn rasterize(edges: &[Edge]) -> Glyph {
         let (min_x, min_y, max_x, max_y) = bounds(edges);
-        let dx0 = min_x.floor() as i32;
-        let dy_top = max_y.ceil() as i32; // bitmap's top row edge (y-up)
-        let dy_bot = min_y.floor() as i32;
-        let w = ((max_x.ceil() as i32 - dx0).max(1)) as usize;
-        let h = ((dy_top - dy_bot).max(1)) as usize;
+        let dx0 = (min_x.floor() as i32).clamp(-(MAX_BITMAP_DIM as i32), MAX_BITMAP_DIM as i32);
+        let dy_top = (max_y
+            .ceil()
+            .clamp(-(MAX_BITMAP_DIM as f32), MAX_BITMAP_DIM as f32)) as i32;
+        let dy_bot = min_y
+            .floor()
+            .clamp(-(MAX_BITMAP_DIM as f32), MAX_BITMAP_DIM as f32) as i32;
+        let w = (((max_x.ceil() as i32).clamp(dx0, MAX_BITMAP_DIM as i32) - dx0).max(1)) as usize;
+        let h = ((dy_top - dy_bot).clamp(1, MAX_BITMAP_DIM as i32)) as usize;
         let mut cov = vec![0.0f32; w * h];
 
         for j in 0..h {
@@ -1044,5 +1062,77 @@ mod tests {
         ));
         // Empty cache key must be cheap: char + 1/16-px size = 8 bytes.
         assert_eq!(std::mem::size_of::<CacheKey>(), 8);
+    }
+
+    #[test]
+    fn fuzz_byte_truncations_never_panic() {
+        let full = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
+        // Truncate every power-of-two prefix (plus last-100 bytes); each
+        // shorter prefix is a worst case for table-boundary math.
+        let mut n = 1usize;
+        while n <= full.len() {
+            if let Ok(f) = Face::parse(&full[..n]) {
+                // Whatever survives parsing must be safe to rasterize.
+                let _ = f.glyph('A', 16.0);
+                let _ = f.glyph('X', 24.0);
+                let _ = f.glyph_id(0x2019);
+            }
+            n = n.saturating_mul(2);
+        }
+        if let Ok(f) = Face::parse(&full[..full.len().saturating_sub(100)]) {
+            let _ = f.glyph('W', 16.0);
+        }
+    }
+
+    #[test]
+    fn fuzz_single_byte_corruption_never_panics() {
+        let full = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
+        // Corrupt one byte at each structurally interesting spot: header
+        // fields, table-directory entries, and a few mid-table offsets.
+        let mut spots = Vec::new();
+        for k in 0..12 {
+            spots.push(k);
+        }
+        let n_tables = u16::from_be_bytes([full[4], full[5]]) as usize;
+        for t in 0..n_tables.clamp(1, 16) {
+            let base = 12 + t * 16;
+            if base + 16 <= full.len() {
+                for d in [0usize, 4, 8, 12, 15] {
+                    spots.push(base + d);
+                }
+            }
+        }
+        for s in spots {
+            if s >= full.len() {
+                continue;
+            }
+            let mut bad = full.clone();
+            bad[s] = bad[s].wrapping_add(0xA5);
+            if let Ok(f) = Face::parse(&bad) {
+                let _ = f.glyph('A', 16.0);
+                let _ = f.glyph('é', 24.0);
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_zero_upem_yields_error_not_nan() {
+        let full = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
+        // Zero head.unitsPerEm (a hostile font): parse must reject rather
+        // than later divide by zero into NaN metrics.
+        let mut bad = full.clone();
+        bad[334] = 0;
+        bad[335] = 0;
+        assert!(matches!(Face::parse(&bad), Err(TtfError::BadTable(_))));
+    }
+
+    #[test]
+    fn hostile_glyph_returns_empty_or_error_never_panic() {
+        let f = load("LiberationSans-Regular");
+        // Out-of-range gids: loca/outline paths must not read wild memory.
+        assert!(matches!(f.outline(u16::MAX, 0), Err(TtfError::BadGlyph(_))));
+        assert!(matches!(f.outline(50_000, 0), Err(TtfError::BadGlyph(_))));
+        // Deep composite recursion self-terminates at MAX_COMPONENT_DEPTH.
+        let _ = f.outline(f.glyph_id(b'A' as u32), MAX_COMPONENT_DEPTH + 1);
     }
 }

@@ -294,6 +294,8 @@ mod ffi {
     pub const HTBOTTOMRIGHT: isize = 17;
 
     // System metrics
+    pub const SM_CXSCREEN: i32 = 0;
+    pub const SM_CYSCREEN: i32 = 1;
     pub const SM_CXFRAME: i32 = 32;
     pub const SM_CXPADDEDBORDER: i32 = 92;
 
@@ -1276,6 +1278,32 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             handler_dark: system_prefers_dark(),
         }));
 
+        // Center the window on the primary screen (CW_USEDEFAULT parks a
+        // WS_POPUP window in the top-left corner).
+        let (win_w, win_h) = (1100, 800);
+        let (sw, sh) = (
+            get_system_metrics(SM_CXSCREEN),
+            get_system_metrics(SM_CYSCREEN),
+        );
+        let (x, y) = if sw > 0 && sh > 0 {
+            ((sw - win_w) / 2, (sh - win_h) / 2)
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        };
+
+        // Center the window on the primary monitor (CW_USEDEFAULT parks a
+        // WS_POPUP window in the top-left corner).
+        let (win_w, win_h) = (1100, 800);
+        let (sx, sy) = (
+            get_system_metrics(SM_CXSCREEN),
+            get_system_metrics(SM_CYSCREEN),
+        );
+        let (x, y) = if sx > 0 && sy > 0 {
+            ((sx - win_w) / 2, (sy - win_h) / 2)
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        };
+
         let hwnd = create_window_ex_w(
             0,
             class.as_ptr(),
@@ -1283,10 +1311,10 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             // Borderless with a custom-drawn title bar: resize frame + min/max
             // + system menu, no OS caption.
             WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1100,
-            800,
+            x,
+            y,
+            win_w,
+            win_h,
             null_mut(),
             null_mut(),
             hinst,

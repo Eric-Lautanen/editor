@@ -797,7 +797,6 @@ impl App {
 
     fn on_mouse_up(&mut self, x: f32, y: f32, button: MouseButton, host: &mut dyn Host) {
         let _ = (x, y);
-        let _ = (x, y);
         if button == MouseButton::Left {
             self.drag_anchor = None;
             self.preview_drag = false;

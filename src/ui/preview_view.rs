@@ -11,6 +11,94 @@ use crate::{
     },
 };
 
+/// Geometry of one overlay scrollbar: the visible thumb, the interactive
+/// zone around it (wider, for aiming), and the thumb's travel math shared
+/// by painting, the cursor, and drag interaction.
+#[derive(Clone, Copy, Debug)]
+pub struct SbGeom {
+    /// The visible thumb.
+    pub thumb: Rect,
+    /// Interactive strip the pointer can grab (thumb + slack).
+    pub zone: Rect,
+    /// Leading edge of the thumb's travel (x for horizontal, y vertical).
+    pub start: f32,
+    /// Travel length available to the thumb's leading edge.
+    pub travel: f32,
+    /// Max scroll offset this bar controls.
+    pub max: f32,
+}
+
+impl SbGeom {
+    /// Scroll offset that puts the thumb's leading edge at `pos`.
+    pub fn offset_for(&self, pos: f32) -> f32 {
+        ((pos - self.start) / self.travel.max(1.0) * self.max).clamp(0.0, self.max)
+    }
+    /// Leading-edge position of the thumb for a scroll offset.
+    pub fn pos_for(&self, offset: f32) -> f32 {
+        self.start + (offset / self.max.max(1.0)).clamp(0.0, 1.0) * self.travel
+    }
+}
+
+/// Vertical bar for a pane of `area` holding `content` px at `scroll`.
+/// `None` when everything fits (no bar is shown).
+pub fn v_geom(area: Rect, content: f32, scroll: f32, scale: f32) -> Option<SbGeom> {
+    if content <= area.h + 1.0 {
+        return None;
+    }
+    let w = 8.0 * scale;
+    let track = area.h - 8.0 * scale;
+    let thumb_h = (area.h / content * track).max(32.0 * scale).min(track);
+    let max = content - area.h;
+    let travel = track - thumb_h;
+    Some(SbGeom {
+        thumb: Rect::new(
+            area.right() - w - 3.0 * scale,
+            area.y + 4.0 * scale + (scroll / max).clamp(0.0, 1.0) * travel,
+            w,
+            thumb_h,
+        ),
+        zone: Rect::new(
+            area.right() - w - 9.0 * scale,
+            area.y,
+            w + 9.0 * scale,
+            area.h,
+        ),
+        start: area.y + 4.0 * scale,
+        travel,
+        max,
+    })
+}
+
+/// Horizontal bar for the no-wrap editor lines. `None` when they fit.
+pub fn h_geom(area: Rect, h_max: f32, h_offset: f32, scale: f32) -> Option<SbGeom> {
+    if h_max <= 0.0 {
+        return None;
+    }
+    let hgt = 8.0 * scale;
+    let track = area.w - 8.0 * scale;
+    let thumb_w = (area.w / (h_max + area.w) * track)
+        .max(32.0 * scale)
+        .min(track);
+    let travel = track - thumb_w;
+    Some(SbGeom {
+        thumb: Rect::new(
+            area.x + 4.0 * scale + (h_offset / h_max).clamp(0.0, 1.0) * travel,
+            area.bottom() - hgt - 3.0 * scale,
+            thumb_w,
+            hgt,
+        ),
+        zone: Rect::new(
+            area.x,
+            area.bottom() - hgt - 9.0 * scale,
+            area.w,
+            hgt + 9.0 * scale,
+        ),
+        start: area.x + 4.0 * scale,
+        travel,
+        max: h_max,
+    })
+}
+
 /// Holds the last laid-out preview and paints it with a scroll offset.
 #[derive(Default)]
 pub struct PreviewView {
@@ -187,26 +275,14 @@ impl PreviewView {
         }
         self.paint_scrollbar(canvas, theme, area, scroll.y, scale);
         // Horizontal scrollbar for the no-wrap editor lines.
-        if scroll.h_max > 0.0 {
-            let track = area.w - 8.0 * scale;
-            let thumb_w = (area.w / (scroll.h_max + area.w) * track)
-                .max(32.0 * scale)
-                .min(track);
-            let thumb_x = area.x
-                + 4.0 * scale
-                + (scroll.h_offset / scroll.h_max).clamp(0.0, 1.0) * (track - thumb_w);
-            let hgt = 8.0 * scale;
+        if let Some(g) = h_geom(area, scroll.h_max, scroll.h_offset, scale) {
             let c = Color::rgba(theme.muted.r, theme.muted.g, theme.muted.b, 110);
-            canvas.fill_rounded_rect(
-                Rect::new(thumb_x, area.bottom() - hgt - 3.0 * scale, thumb_w, hgt),
-                hgt / 2.0,
-                c,
-            );
+            canvas.fill_rounded_rect(g.thumb, g.thumb.h / 2.0, c);
         }
         canvas.set_clip(None);
     }
 
-    /// Thin overlay scrollbar (display only for now; dragging arrives with M5).
+    /// Thin overlay scrollbar, painted from the shared geometry.
     fn paint_scrollbar(
         &self,
         canvas: &mut Canvas,
@@ -215,42 +291,114 @@ impl PreviewView {
         scroll: f32,
         scale: f32,
     ) {
-        let content = self.list.height;
-        if content <= area.h + 1.0 {
+        let Some(g) = v_geom(area, self.list.height, scroll, scale) else {
             return;
-        }
-        let track = area.h - 8.0 * scale;
-        let thumb_h = (area.h / content * track).max(32.0 * scale).min(track);
-        let max_scroll = content - area.h;
-        let thumb_y =
-            area.y + 4.0 * scale + (scroll / max_scroll).clamp(0.0, 1.0) * (track - thumb_h);
-        let w = 8.0 * scale;
+        };
         let c = Color::rgba(theme.muted.r, theme.muted.g, theme.muted.b, 110);
-        canvas.fill_rounded_rect(
-            Rect::new(area.right() - w - 3.0 * scale, thumb_y, w, thumb_h),
-            w / 2.0,
-            c,
-        );
+        canvas.fill_rounded_rect(g.thumb, g.thumb.w / 2.0, c);
     }
 
-    /// Hit zones of the overlay scrollbars for `area`, mirroring
-    /// `paint_scrollbar` + the horizontal bar's layout. Cursor and click
-    /// handling share this so the pointer shape always matches what draws
-    /// there: the track is wider than the visible thumb for easier aiming.
+    /// Vertical scrollbar geometry for this pane's content, if scrollable.
+    pub fn v_sb(&self, area: Rect, scroll: f32, scale: f32) -> Option<SbGeom> {
+        v_geom(area, self.list.height, scroll, scale)
+    }
+
+    /// Horizontal scrollbar geometry (no-wrap editor lines), if scrollable.
+    pub fn h_sb(&self, area: Rect, scroll: PaneScroll, scale: f32) -> Option<SbGeom> {
+        h_geom(area, scroll.h_max, scroll.h_offset, scale)
+    }
+
+    /// Hit zones of the overlay scrollbars for `area`, mirroring what
+    /// paints there: the track is wider than the visible thumb for easier
+    /// aiming. Cursor and click handling share this so the pointer shape
+    /// always matches what draws there.
     pub fn scrollbar_hit(&self, area: Rect, scroll: PaneScroll, scale: f32, p: Point) -> bool {
-        let sb_margin = 3.0 * scale;
-        let v_w = 8.0 * scale + sb_margin + 6.0 * scale; // thumb + margin + grab slack
-        let v = Rect::new(area.right() - v_w, area.y, v_w, area.h);
-        if v.contains(p) {
-            return true;
-        }
-        if scroll.h_max > 0.0 {
-            let h_h = 8.0 * scale + sb_margin + 6.0 * scale;
-            let h = Rect::new(area.x, area.bottom() - h_h, area.w, h_h);
-            if h.contains(p) {
-                return true;
-            }
-        }
-        false
+        self.v_sb(area, scroll.y, scale)
+            .is_some_and(|g| g.zone.contains(p))
+            || self
+                .h_sb(area, scroll, scale)
+                .is_some_and(|g| g.zone.contains(p))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v_geom_hidden_when_content_fits() {
+        let area = Rect::new(0.0, 0.0, 400.0, 300.0);
+        assert!(v_geom(area, 300.0, 0.0, 1.0).is_none());
+        assert!(v_geom(area, 1000.0, 0.0, 1.0).is_some());
+    }
+
+    #[test]
+    fn v_geom_drag_round_trip() {
+        let area = Rect::new(0.0, 40.0, 400.0, 300.0);
+        let g = v_geom(area, 3000.0, 500.0, 1.0).unwrap();
+        // Thumb sits where the scroll ratio says, inside the zone.
+        assert!(g.thumb.y >= g.start);
+        assert!(g.thumb.y + g.thumb.h <= g.start + g.travel + g.thumb.h);
+        assert!(g.zone.contains(Point {
+            x: g.thumb.x + 1.0,
+            y: g.thumb.y + 1.0
+        }));
+        // Dragging the thumb's leading edge maps back to the offset.
+        let pos = g.pos_for(500.0);
+        assert!((g.offset_for(pos) - 500.0).abs() < 0.5);
+        // Clamped at both ends of the travel.
+        assert_eq!(g.offset_for(g.start), 0.0);
+        assert!((g.offset_for(g.start + g.travel) - g.max).abs() < 0.5);
+    }
+
+    #[test]
+    fn h_geom_drag_round_trip() {
+        let area = Rect::new(0.0, 40.0, 400.0, 300.0);
+        assert!(h_geom(area, 0.0, 0.0, 1.0).is_none());
+        let g = h_geom(area, 1200.0, 300.0, 1.0).unwrap();
+        let pos = g.pos_for(300.0);
+        assert!((g.offset_for(pos) - 300.0).abs() < 0.5);
+        assert_eq!(g.offset_for(g.start), 0.0);
+        assert!((g.offset_for(g.start + g.travel) - g.max).abs() < 0.5);
+    }
+
+    #[test]
+    fn v_geom_thumb_tracks_offset_and_round_trips() {
+        let area = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let g = v_geom(area, 1000.0, 350.0, 1.0).unwrap();
+        // Thumb sits proportionally along the track.
+        assert!((g.thumb.y - g.start - 0.5 * g.travel).abs() < 1.0);
+        // Dragging the thumb to a position maps back to the same offset.
+        let pos = g.pos_for(350.0);
+        assert!((g.offset_for(pos) - 350.0).abs() < 0.5);
+        // Clamped at both ends.
+        assert_eq!(g.offset_for(g.start - 50.0), 0.0);
+        assert_eq!(g.offset_for(g.start + g.travel + 50.0), g.max);
+        // The thumb stays inside the pane.
+        assert!(g.thumb.y >= area.y && g.thumb.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn h_geom_hidden_when_lines_fit() {
+        let area = Rect::new(0.0, 0.0, 400.0, 300.0);
+        assert!(h_geom(area, 0.0, 0.0, 1.0).is_none());
+        let g = h_geom(area, 600.0, 300.0, 1.0).unwrap();
+        assert!((g.offset_for(g.pos_for(300.0)) - 300.0).abs() < 0.5);
+        assert!(g.thumb.x >= area.x && g.thumb.right() <= area.right());
+    }
+
+    #[test]
+    fn zones_contain_their_thumbs() {
+        let area = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let v = v_geom(area, 1000.0, 123.0, 1.0).unwrap();
+        assert!(v.zone.contains(Point {
+            x: v.thumb.x + 1.0,
+            y: v.thumb.y + 1.0
+        }));
+        let h = h_geom(area, 600.0, 123.0, 1.0).unwrap();
+        assert!(h.zone.contains(Point {
+            x: h.thumb.x + 1.0,
+            y: h.thumb.y + 1.0
+        }));
     }
 }

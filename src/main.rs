@@ -19,6 +19,7 @@ mod parse;
 mod platform;
 #[cfg(test)]
 mod scratch_test;
+mod settings;
 mod ui;
 
 fn main() {
