@@ -11,7 +11,6 @@
 //! For a caret on buffer line `L`, the pane-space row y is
 //! `pad + L*line_h` (document y minus scroll is applied by the caller).
 use crate::{
-    core::buffer::Buffer,
     gfx::{
         canvas::Canvas,
         color::Color,

@@ -11,7 +11,8 @@ const USAGE: &str = "usage: readitor [FILE]\n\
   --version | -V       print version\n\
   --install | --uninstall   register/remove file associations\n\
   --pretty             print FILE (.json/.jsonl) canonicalized to stdout\n\
-  dev: --render OUT.ppm [--size WxH] [--scale S] [--dark] [--scroll PX]   headless snapshot of FILE";
+  dev: --render OUT.ppm [--size WxH] [--scale S] [--dark] [--scroll PX]   headless snapshot of FILE
+  dev: --mem-report FILE                                                allocation census after load+layout (mem-census builds)";
 
 struct Opts {
     file: Option<PathBuf>,
@@ -21,6 +22,8 @@ struct Opts {
     scale: f32,
     dark: bool,
     scroll: f32,
+    /// Print the allocation census after the file is loaded/laid out.
+    mem_report: bool,
 }
 
 fn usage(msg: impl Into<String>) -> Error {
@@ -36,6 +39,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         scale: 1.0,
         dark: false,
         scroll: 0.0,
+        mem_report: false,
     };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -73,6 +77,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
                     .map_err(|_| usage("bad --scroll"))?
             }
             "--dark" => o.dark = true,
+            "--mem-report" => o.mem_report = true,
             other if !other.starts_with('-') => o.file = Some(PathBuf::from(other)),
             other => return Err(usage(format!("unknown flag {other}\n{USAGE}"))),
         }
@@ -88,6 +93,17 @@ pub fn run(args: Vec<String>) -> Result<()> {
     app.set_dark(o.dark || platform::system_prefers_dark());
     if o.pretty {
         return pretty_print(o.file.as_deref());
+    }
+    #[cfg(any(test, feature = "mem-census"))]
+    if o.mem_report {
+        if let Some(path) = o.file.as_deref() {
+            let _ = App::new(Some(path.to_path_buf())).map(|app| {
+                let mut a = app;
+                let _ = a.render_headless(o.size.0, o.size.1, o.scale);
+                crate::platform::print_line(&crate::mem::report());
+            });
+            return Ok(());
+        }
     }
     if let Some(out) = o.render {
         let mut c = app.render_headless(o.size.0, o.size.1, o.scale);

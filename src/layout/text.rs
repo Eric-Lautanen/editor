@@ -116,6 +116,8 @@ pub fn wrap_line(
 /// Plain text / logs / anything without a richer renderer yet: monospace,
 /// wrapped into a centered column (preview) or one row per line (editor).
 pub fn layout_plain(buf: &Buffer, viewport_w: f32, ctx: &Ctx, wrap: bool) -> DisplayList {
+    #[cfg(any(test, feature = "mem-census"))]
+    crate::mem::begin(crate::mem::Component::DisplayList);
     let t = ctx.theme;
     let style = FontStyle::Mono;
     let p = plain_params(viewport_w, ctx, wrap);
@@ -140,11 +142,14 @@ pub fn layout_plain(buf: &Buffer, viewport_w: f32, ctx: &Ctx, wrap: bool) -> Dis
             y += p.line_h;
         }
     }
-    DisplayList {
+    let out = DisplayList {
         ops,
         height: y + p.pad,
         hits: Vec::new(),
-    }
+    };
+    #[cfg(any(test, feature = "mem-census"))]
+    crate::mem::end();
+    out
 }
 
 /// One buffer line with tabs expanded for display, plus byte maps between

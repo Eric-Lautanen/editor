@@ -34,10 +34,15 @@ pub struct TextSpec {
 
 impl Canvas {
     pub fn new(width: usize, height: usize) -> Self {
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::begin(crate::mem::Component::Canvas);
+        let pixels = vec![0; width * height];
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::end();
         Self {
             width,
             height,
-            pixels: vec![0; width * height],
+            pixels,
             clip: (0, 0, width as i32, height as i32),
         }
     }
@@ -46,7 +51,11 @@ impl Canvas {
         self.width = width;
         self.height = height;
         self.pixels.clear();
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::begin(crate::mem::Component::Canvas);
         self.pixels.resize(width * height, 0);
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::end();
         self.clip = (0, 0, width as i32, height as i32);
     }
 

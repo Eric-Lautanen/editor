@@ -57,6 +57,8 @@ pub struct Row {
 impl PreviewView {
     /// Group the laid-out text ops into visual rows, top to bottom.
     pub fn rows(&self, fonts: &FontSystem) -> Vec<Row> {
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::begin(crate::mem::Component::DisplayList);
         let mut texts: Vec<(f32, f32, f32, FontStyle, String)> = Vec::new();
         for op in &self.list.ops {
             if let DrawOp::Text {
@@ -93,6 +95,8 @@ impl PreviewView {
                 }),
             }
         }
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::end();
         rows
     }
 

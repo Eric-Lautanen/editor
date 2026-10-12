@@ -14,6 +14,8 @@ pub struct Pos {
 
 impl Buffer {
     pub fn from_text(s: &str) -> Self {
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::begin(crate::mem::Component::Buffer);
         let mut lines: Vec<String> = s
             .split('\n')
             .map(|l| l.trim_end_matches('\r').to_string())
@@ -21,6 +23,8 @@ impl Buffer {
         if lines.is_empty() {
             lines.push(String::new());
         }
+        #[cfg(any(test, feature = "mem-census"))]
+        crate::mem::end();
         Self {
             lines,
             dirty: false,
