@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Readitor
+Comment=Read and lightly edit Markdown, JSON and JSONL
+Exec=readitor %f
+Icon=readitor
+Terminal=false
+Categories=Utility;TextEditor;Viewer;
+MimeType=text/markdown;application/json;application/x-ndjson;text/plain;

@@ -1,0 +1,145 @@
+use crate::{
+    app::App,
+    core::file_kind::FileKind,
+    error::{Error, Result},
+    parse::{json, jsonl},
+    platform,
+};
+use std::path::PathBuf;
+
+const USAGE: &str = "usage: readitor [FILE]\n\
+  --version | -V       print version\n\
+  --install | --uninstall   register/remove file associations\n\
+  --pretty             print FILE (.json/.jsonl) canonicalized to stdout\n\
+  dev: --render OUT.ppm [--size WxH] [--scale S] [--dark] [--scroll PX]   headless snapshot of FILE";
+
+struct Opts {
+    file: Option<PathBuf>,
+    render: Option<PathBuf>,
+    pretty: bool,
+    size: (usize, usize),
+    scale: f32,
+    dark: bool,
+    scroll: f32,
+}
+
+fn usage(msg: impl Into<String>) -> Error {
+    Error::Usage(msg.into())
+}
+
+pub fn run(args: Vec<String>) -> Result<()> {
+    let mut o = Opts {
+        file: None,
+        render: None,
+        pretty: false,
+        size: (1100, 800),
+        scale: 1.0,
+        dark: false,
+        scroll: 0.0,
+    };
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut val = |name: &str| {
+            it.next()
+                .ok_or_else(|| usage(format!("{name} needs a value")))
+        };
+        match a.as_str() {
+            "--version" | "-V" => {
+                platform::print_line(&format!("readitor {}", env!("CARGO_PKG_VERSION")));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                platform::print_line(USAGE);
+                return Ok(());
+            }
+            "--install" => return platform::install::install(),
+            "--uninstall" => return platform::install::uninstall(),
+            "--render" => o.render = Some(PathBuf::from(val("--render")?)),
+            "--pretty" => o.pretty = true,
+            "--size" => {
+                let v = val("--size")?;
+                let (w, h) = v
+                    .split_once('x')
+                    .ok_or_else(|| usage("--size expects WxH"))?;
+                o.size = (
+                    w.parse().map_err(|_| usage("bad width"))?,
+                    h.parse().map_err(|_| usage("bad height"))?,
+                );
+            }
+            "--scale" => o.scale = val("--scale")?.parse().map_err(|_| usage("bad --scale"))?,
+            "--scroll" => {
+                o.scroll = val("--scroll")?
+                    .parse()
+                    .map_err(|_| usage("bad --scroll"))?
+            }
+            "--dark" => o.dark = true,
+            other if !other.starts_with('-') => o.file = Some(PathBuf::from(other)),
+            other => return Err(usage(format!("unknown flag {other}\n{USAGE}"))),
+        }
+    }
+
+    let mut app = App::new(o.file.clone())?;
+    if o.dark {
+        app.set_dark_manual(true);
+    } else {
+        app.set_dark(platform::system_prefers_dark());
+    }
+    // Follow the OS theme unless --dark was passed; Ctrl+T detaches live.
+    app.set_dark(o.dark || platform::system_prefers_dark());
+    if o.pretty {
+        return pretty_print(o.file.as_deref());
+    }
+    if let Some(out) = o.render {
+        let mut c = app.render_headless(o.size.0, o.size.1, o.scale);
+        if o.scroll > 0.0 {
+            app.set_scroll(o.scroll);
+            c = crate::gfx::canvas::Canvas::new(o.size.0, o.size.1);
+            crate::platform::Handler::paint(&mut app, &mut c);
+        }
+        std::fs::write(&out, c.to_ppm())?;
+        platform::print_line(&format!(
+            "wrote {} ({}x{})",
+            out.display(),
+            o.size.0,
+            o.size.1
+        ));
+        return Ok(());
+    }
+    platform::run(app)
+}
+
+/// Print FILE canonicalized: `.json` pretty-prints one document, `.jsonl`
+/// pretty-prints one value per line (bad lines fail with their position).
+/// Anything else is echoed unchanged.
+fn pretty_print(file: Option<&std::path::Path>) -> Result<()> {
+    let path = file.ok_or_else(|| usage("--pretty needs a FILE"))?;
+    let src = std::fs::read_to_string(path)?;
+    match FileKind::from_path(path) {
+        FileKind::Json => {
+            let p = json::pretty::pretty(&json::parser::parse(&src)?);
+            platform::print_line(&p);
+        }
+        FileKind::JsonLines => {
+            for rec in jsonl::parse(&src) {
+                match rec.value {
+                    Ok(v) => {
+                        let p = json::pretty::pretty(&v);
+                        platform::print_line(&p);
+                    }
+                    // The parser sees one line, so re-anchor its position to
+                    // the physical file line for actionable errors.
+                    Err(Error::Parse { col, msg, .. }) => {
+                        return Err(Error::Parse {
+                            line: rec.line,
+                            col,
+                            msg,
+                        });
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+        FileKind::Markdown | FileKind::PlainText => platform::print_text(&src),
+    }
+    Ok(())
+}

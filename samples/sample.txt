@@ -1,0 +1,12 @@
+Readitor plain text sample
+==========================
+
+This is a long paragraph to exercise word wrapping: the quick brown fox jumps over the lazy dog, then keeps running through the fields until the line is wider than the column, at which point it must wrap cleanly without cutting words in half.
+
+2026-10-11 09:14:02 INFO  server started on port 8080
+2026-10-11 09:14:03 WARN  config key "cache_ttl" missing, using default
+2026-10-11 09:14:09 ERROR request failed: connection reset by peer (code=104)
+
+	tabs expand to four spaces
+Unicode: café – “quotes” • bullets … → arrows ≤ ≥ © ® ™ € £ ½ ñ Ü
+Unknown glyph fallback: 中文
