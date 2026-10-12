@@ -1,5 +1,6 @@
 pub mod editor_view;
 pub mod event;
+pub mod gutter;
 pub mod help;
 pub mod menu;
 pub mod preview_view;

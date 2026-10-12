@@ -16,7 +16,7 @@ use crate::{
     ui::{
         editor_view::EditorView,
         event::{CursorShape, Event, Key, Modifiers, MouseButton},
-        help, menu,
+        gutter, help, menu,
         preview_view::{PaneScroll, PreviewView, Row as PreviewRow},
         scroll::ScrollState,
         statusbar,
@@ -1062,10 +1062,27 @@ impl App {
 
     /// Paint selection + caret over an editor pane (document space -> pane).
     fn paint_editor_overlay(&self, canvas: &mut Canvas, area: Rect, scroll: f32) {
+        // Line-number gutter first (rail + current-row tint), then the
+        // selection/caret overlay above it. The gutter clips itself to
+        // `area` and ignores horizontal scroll: numbers stay put while long
+        // lines slide under the rail.
+        gutter::paint(
+            canvas,
+            &self.fonts,
+            &self.theme,
+            area,
+            scroll,
+            self.editor.caret.line,
+            self.buffer.line_count(),
+            &self.ctx(),
+        );
         let ctx = self.ctx();
-        let ops = self
-            .editor
-            .overlay_ops(&self.buffer, area.w, &ctx, self.caret_visible());
+        let ops = self.editor.overlay_ops(
+            &self.buffer,
+            area.w + self.h_scroll + gutter::rail_w(&self.fonts, &ctx, self.buffer.line_count()),
+            &ctx,
+            self.caret_visible(),
+        );
         if ops.is_empty() {
             return;
         }
@@ -1394,6 +1411,47 @@ impl Handler for App {
             } else {
                 CursorShape::Arrow
             };
+        }
+        // Overlay scrollbars live on top of the panes: they get the Arrow
+        // (thumb dragging lands later), never the I-beam of the text below.
+        let p = Point { x, y };
+        match self.mode {
+            Mode::Preview => {
+                if self.preview.scrollbar_hit(
+                    self.viewport(),
+                    PaneScroll::vertical(self.scroll.offset),
+                    self.scale,
+                    p,
+                ) {
+                    return CursorShape::Arrow;
+                }
+            }
+            Mode::Edit => {
+                if self.editor_pane.scrollbar_hit(
+                    self.viewport(),
+                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max),
+                    self.scale,
+                    p,
+                ) {
+                    return CursorShape::Arrow;
+                }
+            }
+            Mode::Split => {
+                let (left, right) = self.split_panes();
+                if self.preview.scrollbar_hit(
+                    left,
+                    PaneScroll::vertical(self.scroll.offset),
+                    self.scale,
+                    p,
+                ) || self.editor_pane.scrollbar_hit(
+                    right,
+                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max),
+                    self.scale,
+                    p,
+                ) {
+                    return CursorShape::Arrow;
+                }
+            }
         }
         if self.editor_point(x, y).is_some() {
             return CursorShape::IBeam;
@@ -2404,6 +2462,35 @@ mod tests {
             min - left.x < 60.0,
             "column should be centered in the pane, not the window (min x {min} vs pane {left:?})"
         );
+    }
+
+    #[test]
+    fn cursor_over_scrollbars_is_arrow_not_ibeam() {
+        let mut app = open(
+            "readitor_test_sbcur.txt",
+            &"long line without scrolling\n".repeat(60),
+        );
+        app.on_event(ctrl('e'), &mut NullHost::default()); // Edit (=> editor pane)
+        let _ = app.render_headless(800, 600, 1.0);
+        // Right edge over the vertical overlay scrollbar zone.
+        let view = app.viewport();
+        let sb_x = view.right() - 4.0;
+        let y_mid = view.y + view.h / 2.0;
+        assert_eq!(app.cursor_at(sb_x, y_mid), CursorShape::Arrow);
+        // Just inside the text area, same row: still I-beam.
+        assert_eq!(
+            app.cursor_at(view.right() - 30.0, y_mid),
+            CursorShape::IBeam
+        );
+        // Horizontal bar zone (long line in Edit => h_max > 0). One file:
+        // re-use with a wide line via a fresh tab.
+        let wide = std::env::temp_dir().join("readitor_test_sbcursor_h.txt");
+        std::fs::write(&wide, format!("x{}", "y".repeat(300))).unwrap();
+        app.open_path(wide, &mut NullHost::default());
+        let _ = app.render_headless(800, 600, 1.0);
+        assert!(app.h_max > 0.0, "setup: need a wide line");
+        let h_y = app.viewport().bottom() - 4.0;
+        assert_eq!(app.cursor_at(view.x + 200.0, h_y), CursorShape::Arrow);
     }
 
     #[test]

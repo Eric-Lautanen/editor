@@ -228,4 +228,25 @@ impl PreviewView {
             c,
         );
     }
+
+    /// Hit zones of the overlay scrollbars for `area`, mirroring
+    /// `paint_scrollbar` + the horizontal bar's layout. Cursor and click
+    /// handling share this so the pointer shape always matches what draws
+    /// there: the track is wider than the visible thumb for easier aiming.
+    pub fn scrollbar_hit(&self, area: Rect, scroll: PaneScroll, scale: f32, p: Point) -> bool {
+        let sb_margin = 3.0 * scale;
+        let v_w = 8.0 * scale + sb_margin + 6.0 * scale; // thumb + margin + grab slack
+        let v = Rect::new(area.right() - v_w, area.y, v_w, area.h);
+        if v.contains(p) {
+            return true;
+        }
+        if scroll.h_max > 0.0 {
+            let h_h = 8.0 * scale + sb_margin + 6.0 * scale;
+            let h = Rect::new(area.x, area.bottom() - h_h, area.w, h_h);
+            if h.contains(p) {
+                return true;
+            }
+        }
+        false
+    }
 }
