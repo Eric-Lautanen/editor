@@ -1066,17 +1066,19 @@ impl App {
         // selection/caret overlay above it. The gutter clips itself to
         // `area` and ignores horizontal scroll: numbers stay put while long
         // lines slide under the rail.
-        gutter::paint(
+        let ctx = self.ctx();
+        gutter::paint_with(
             canvas,
-            &self.fonts,
-            &self.theme,
+            gutter::Gutter {
+                fonts: &self.fonts,
+                theme: &self.theme,
+                ctx: &ctx,
+                caret_line: self.editor.caret.line,
+                line_count: self.buffer.line_count(),
+            },
             area,
             scroll,
-            self.editor.caret.line,
-            self.buffer.line_count(),
-            &self.ctx(),
         );
-        let ctx = self.ctx();
         let ops = self.editor.overlay_ops(
             &self.buffer,
             area.w + self.h_scroll + gutter::rail_w(&self.fonts, &ctx, self.buffer.line_count()),

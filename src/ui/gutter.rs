@@ -40,20 +40,22 @@ fn mono_digit_w(fonts: &FontSystem, size: f32) -> f32 {
     fonts.advance(FontStyle::Mono, '0', size)
 }
 
+/// Inputs of `paint` bundled (rail geometry + state) to keep the signature
+/// at a sane arity.
+pub struct Gutter<'a, 'b> {
+    pub fonts: &'a FontSystem,
+    pub theme: &'a Theme,
+    pub ctx: &'a Ctx<'b>,
+    pub caret_line: usize,
+    pub line_count: usize,
+}
+
 /// Draw the gutter for the editor pane. `area` = pane rect in canvas space,
-/// `scroll` = current document offset, `caret_line` = 0-based caret line,
-/// `line_count` = total buffer lines (sizes the rail's digits). Returns the
-/// rail's right edge (pane-space) so hit tests can ignore it.
-pub fn paint(
-    canvas: &mut Canvas,
-    fonts: &FontSystem,
-    theme: &Theme,
-    area: Rect,
-    scroll: f32,
-    caret_line: usize,
-    line_count: usize,
-    ctx: &Ctx,
-) -> f32 {
+/// `scroll` = current document offset. Returns the rail's right edge
+/// (pane-space) so hit tests can ignore it.
+pub fn paint_with(canvas: &mut Canvas, g: Gutter, area: Rect, scroll: f32) -> f32 {
+    let (fonts, theme, ctx) = (g.fonts, g.theme, g.ctx);
+    let (caret_line, line_count) = (g.caret_line, g.line_count);
     let p = text::plain_params(area.w, ctx, false);
     let m = fonts.metrics(FontStyle::Mono, p.size);
     let rail = rail_w(fonts, ctx, line_count);
@@ -72,7 +74,7 @@ pub fn paint(
     let visible = (area.h / p.line_h).ceil() as usize + 2;
 
     // Caret highlight.
-    if caret_line + 1 >= first_row + 1 && caret_line < first_row + visible {
+    if caret_line > first_row && caret_line < first_row + visible {
         let y_top = area.y + (caret_line as f32 * p.line_h + p.pad) - scroll;
         canvas.fill_rect(Rect::new(area.x, y_top, rail, p.line_h), theme.sel);
     }
@@ -145,12 +147,34 @@ mod tests {
         let area = Rect::new(0.0, 0.0, 200.0, 120.0);
         // Scrolled deep: numbers around row 400 are the visible ones.
         let scroll = 400.0 * text::line_height(200.0, &c);
-        let rail = paint(&mut canvas, c.fonts, c.theme, area, scroll, 400, 500, &c);
+        let rail = paint_with(
+            &mut canvas,
+            Gutter {
+                fonts: c.fonts,
+                theme: c.theme,
+                ctx: &c,
+                caret_line: 400,
+                line_count: 500,
+            },
+            area,
+            scroll,
+        );
         assert!(rail > 20.0);
         // Far past the last row: nothing but the rail itself gets painted,
         // and no ink lands outside the pane's clip.
         let mut deep = Canvas::new(200, 120);
-        paint(&mut deep, c.fonts, c.theme, area, 1e6, 0, 500, &c);
+        paint_with(
+            &mut deep,
+            Gutter {
+                fonts: c.fonts,
+                theme: c.theme,
+                ctx: &c,
+                caret_line: 0,
+                line_count: 500,
+            },
+            area,
+            1e6,
+        );
         assert!(
             deep.pixels
                 .iter()
@@ -173,8 +197,30 @@ mod tests {
         // against an identical render with the caret parked off-screen.
         let mut with = Canvas::new(120, 80);
         let mut without = Canvas::new(120, 80);
-        paint(&mut with, c.fonts, c.theme, area, 0.0, 1, 3, &c);
-        paint(&mut without, c.fonts, c.theme, area, 0.0, 99, 3, &c);
+        paint_with(
+            &mut with,
+            Gutter {
+                fonts: c.fonts,
+                theme: c.theme,
+                ctx: &c,
+                caret_line: 1,
+                line_count: 3,
+            },
+            area,
+            0.0,
+        );
+        paint_with(
+            &mut without,
+            Gutter {
+                fonts: c.fonts,
+                theme: c.theme,
+                ctx: &c,
+                caret_line: 99,
+                line_count: 3,
+            },
+            area,
+            0.0,
+        );
         assert!(
             with.pixels != without.pixels,
             "the caret row must change the rail"
