@@ -79,18 +79,6 @@ fn right(buf: &Buffer, p: Pos) -> Pos {
     }
 }
 
-/// Character class for word boundaries: whitespace, word chars
-/// (`alphanumeric` + `_`), everything else is punctuation.
-fn word_class(c: char) -> u8 {
-    if c.is_whitespace() {
-        0
-    } else if c.is_alphanumeric() || c == '_' {
-        1
-    } else {
-        2
-    }
-}
-
 /// One line up/down at the same column (clamped later), or `None` at the edge.
 fn vertical(buf: &Buffer, p: Pos, down: bool) -> Option<Pos> {
     let line = if down {
