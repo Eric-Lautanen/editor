@@ -693,7 +693,6 @@ survived restarts (theme, mode, tabs); the window did not.
   macOS CI; 269 tests green, `clippy --all-targets` and `rustfmt --check` clean, and
   `readitor_check_win`/`_linux`/`_macos` all check clean.
 
-## Review notes (Oct 2026 hygiene + gap pass)
 ### Scroll-smoothness round (Oct 2026) — a wheel notch glides instead of jumping, 269 tests green
 - **The report**: scrolling "seems a little choppy or lagging just a little". Measured first, and the
   frame was never the problem: a full repaint of `sample.md` at 1100×800 costs ~1 ms in release
@@ -752,6 +751,24 @@ survived restarts (theme, mode, tabs); the window did not.
   (`readitor_check_linux`) but cannot be run from this machine; and the glide's tail is deliberate
   (the last ~2 px arrive at 0.05–0.2 px per frame — invisible, but they keep the clock alive for
   ~100 ms). The *first* frame is the largest step, because exponential easing starts at full speed.
+
+### M10 slice (Oct 2026) — recent files, 284 tests green
+- **The session keeps a recent-files list** (`settings.rs`): `recent <path>` lines beside the
+  `open` ones, capped at `RECENT_MAX = 10`, newest first, independent of the tabs a session
+  reopens — a file stays recent long after it stopped being open. `note_recent` (a free
+  function, so `App` and the tests share the exact rule) moves a path to the front and drops
+  the duplicate.
+- **The right-click menu lists them** (`ui/menu.rs`): a "Recent" caption (painted, muted,
+  never answers a click) followed by up to 6 file names — menu labels became owned `String`s
+  for it. `Action::Recent(i)` opens the i-th entry, which `open_path` then bumps to the front.
+- **Wiring** (`app.rs`, `cli.rs`): `App` keeps the list, notes every `open_path` and every
+  save-as (a brand-new file is as recent as an opened one), persists it with the session, and
+  `cli` restores it at startup — a file given on the command line is noted too, because
+  `App::new` opens it without going through `open_path`.
+- Tests: the settings round trip carries the list, `note_recent` moves/dedupes/caps, and an
+  app-level test opens two files, checks the menu rows, and reopens one through
+  `Action::Recent`. 284 tests, `clippy --all-targets` and `rustfmt --check` clean.
+- Still open in M10: find (`Ctrl+F`) and large-file handling.
 
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the

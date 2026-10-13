@@ -1,4 +1,4 @@
-//! Custom title bar: wordmark, one small tab per open file, window buttons.
+//! Custom title bar: one small tab per open file, plus window buttons.
 //! All painting is portable; the platform layer only maps `TitleHit::Drag`
 //! to native window dragging (and the OS resize borders).
 
@@ -19,8 +19,8 @@ const BTN_W: f32 = 44.0;
 const TAB_H: f32 = 24.0;
 const TAB_MAX_W: f32 = 180.0;
 const TAB_MIN_W: f32 = 56.0;
-const MARK_X: f32 = 14.0;
-const TABS_X: f32 = 92.0;
+/// Left edge of the first tab: no wordmark, so tabs start at the padding.
+const TABS_X: f32 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitleHit {
@@ -142,17 +142,6 @@ pub fn paint(
     let m = fonts.metrics(FontStyle::Regular, size);
     let baseline = |top: f32| (top + (m.height() - m.height()) / 2.0 + m.ascent).round();
     let bar_baseline = |r: Rect| (r.y + (r.h - m.height()) / 2.0 + m.ascent).round();
-    canvas.draw_text(
-        fonts,
-        "Readitor",
-        MARK_X * scale,
-        bar_baseline(lay.bar),
-        TextSpec {
-            size,
-            style: FontStyle::Bold,
-            color: theme.muted,
-        },
-    );
 
     for (i, (name, dirty)) in names.iter().enumerate() {
         let r = lay.tabs[i];
@@ -360,7 +349,9 @@ mod tests {
         assert_eq!(hit_test(&lay, lay.max.x + 10.0, 10.0), TitleHit::Maximize);
         assert_eq!(hit_test(&lay, lay.min.x + 10.0, 10.0), TitleHit::Minimize);
         // Empty bar area drags the window; below the bar is plain content.
-        assert_eq!(hit_test(&lay, 60.0, 4.0), TitleHit::Drag);
+        // (x=4 sits in the left padding before the first tab, which now
+        // starts at the edge since the wordmark is gone.)
+        assert_eq!(hit_test(&lay, 4.0, 4.0), TitleHit::Drag);
         assert_eq!(
             hit_test(&lay, 60.0, lay.bar.bottom() + 4.0),
             TitleHit::Client

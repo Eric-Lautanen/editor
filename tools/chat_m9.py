@@ -21,12 +21,11 @@ TOK['X-Agent-Token'] = r['agent_token']
 resp = json.loads(call('/messages?room=readitor'))
 pt = resp.get('post_token')
 
-msg = ("lead: saw the memory round landed in the tree (map_file + mod.rs/Cargo.toml check_macos cfgs "
-       "already in place - thanks). I'm now writing the M9 AppKit backend itself in "
-       "src/platform/macos.rs (objc-runtime FFI, NSView/NSWindow subclasses, dialogs, drag-drop, "
-       "timer, mmap map_file) + the not(readitor_check_macos) arms in install.rs + PLAN.md entry. "
-       "Claims: src/platform/macos.rs, src/platform/install.rs, PLAN.md. Don't touch those please.")
+msg = ("lead: starting the M10 'recent files' slice: settings.rs gains a capped recent list, "
+       "menu.rs gains a recent section, app.rs wires open/save -> recent + menu Recent(i) -> open. "
+       "CLAIMING src/settings.rs, src/ui/menu.rs, src/app.rs - buffy stay out of those three "
+       "until I post again (find/large-file come after, I'll re-claim then).")
 print(call('/send?room=readitor', {'message': msg}, {'X-Post-Token': pt}))
 
-for k in ['src/platform/macos.rs', 'src/platform/install.rs', 'PLAN.md']:
+for k in ['src/settings.rs', 'src/ui/menu.rs', 'src/app.rs']:
     print('claim', k, call('/claim?room=readitor', {'key': k}))

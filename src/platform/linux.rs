@@ -418,10 +418,11 @@ const WM_STATE_TOGGLE: i32 = 2;
 /// own maximum; `App` narrows it to just the points where a scrollbar needs the
 /// pixels, and the rest of the edge keeps the full band (see `Handler::grip_at`).
 const RESIZE_BAND: i32 = 6;
-/// Animation frame interval while the app is moving something: ~120 Hz, which
-/// is above any display this renders on, and the poll loop is already awake
-/// every 1 ms so no timer is needed to produce it.
-const FRAME_MS: u64 = 8;
+/// Animation frame interval while the app is moving something: 5 ms, ~200 Hz —
+/// well past any display this renders on and down from the first pass's 8 ms.
+/// The poll loop is already awake every 1 ms, so no timer is needed to produce
+/// it, and the app's easing is time-based, so extra beats only cost repaints.
+const FRAME_MS: u64 = 5;
 
 // ---------------------------------------------------------------- state
 
@@ -1416,8 +1417,8 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
                 last_tick = std::time::Instant::now();
                 dispatch(x.as_mut() as *mut X, Event::Tick);
             }
-            // A glide needs far more than 25 Hz; the app asks for frames only
-            // while something is actually moving.
+            // A glide or coast needs far more than 25 Hz; the app asks for
+            // frames only while something is actually moving.
             if frame_due(x.animating, last_frame.elapsed()) {
                 last_frame = std::time::Instant::now();
                 dispatch(x.as_mut() as *mut X, Event::Frame);

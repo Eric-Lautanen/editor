@@ -26,6 +26,21 @@ pub struct Settings {
     /// The window was maximized when the session ended, so the next one opens
     /// the same way (at `window`, then maximized).
     pub maximized: bool,
+    /// Recently opened files, most recent first, capped at [`RECENT_MAX`].
+    /// Independent of `files` (the tabs this session reopens): a file can be
+    /// recent long after it stopped being open.
+    pub recent: Vec<PathBuf>,
+}
+
+/// How many recent files the session keeps.
+pub const RECENT_MAX: usize = 10;
+
+/// Move `path` to the front of the recent list, dropping the duplicate and
+/// keeping [`RECENT_MAX`] entries.
+pub fn note_recent(recent: &mut Vec<PathBuf>, path: &Path) {
+    recent.retain(|p| p.as_path() != path);
+    recent.insert(0, path.to_path_buf());
+    recent.truncate(RECENT_MAX);
 }
 
 /// Per-user config directory (`%APPDATA%\\Readitor`, `~/.config/readitor`,
@@ -97,6 +112,9 @@ fn render(s: &Settings) -> String {
         // unambiguous even with spaces in the name.
         out.push_str(&format!("open {}\n", f.display()));
     }
+    for f in &s.recent {
+        out.push_str(&format!("recent {}\n", f.display()));
+    }
     out
 }
 
@@ -114,6 +132,7 @@ fn parse(text: &str) -> Settings {
             "maximized" => s.maximized = val == "1",
             "window" => s.window = parse_window(val),
             "open" => s.files.push(PathBuf::from(val)),
+            "recent" => s.recent.push(PathBuf::from(val)),
             _ => {}
         }
     }
@@ -214,9 +233,32 @@ mod tests {
             active: 1,
             window: Some((-1920, 40, 1100, 800)),
             maximized: true,
+            recent: vec![PathBuf::from("/home/u/notes.txt")],
         };
         let text = render(&s);
         assert_eq!(parse(&text), s);
+    }
+
+    #[test]
+    fn recents_move_to_the_front_and_cap() {
+        let mut recent: Vec<PathBuf> = (0..RECENT_MAX)
+            .map(|i| PathBuf::from(format!("/old/{i}.md")))
+            .collect();
+        // Re-opening an existing entry moves it to the front, not a duplicate.
+        note_recent(&mut recent, Path::new("/old/3.md"));
+        assert_eq!(recent[0], PathBuf::from("/old/3.md"));
+        assert_eq!(recent.len(), RECENT_MAX);
+        // A new file pushes the oldest out.
+        note_recent(&mut recent, Path::new("/new.md"));
+        assert_eq!(recent.len(), RECENT_MAX);
+        assert_eq!(recent[0], PathBuf::from("/new.md"));
+        assert!(!recent.contains(&PathBuf::from("/old/9.md")));
+        // And the list survives the file format.
+        let s = Settings {
+            recent: recent.clone(),
+            ..Settings::default()
+        };
+        assert_eq!(parse(&render(&s)).recent, recent);
     }
 
     #[test]
@@ -289,6 +331,7 @@ mod tests {
             active: 0,
             window: Some((120, 80, 1100, 800)),
             maximized: false,
+            recent: Vec::new(),
         };
         save_in(&dir, &s);
         // What a crash between the write and the rename leaves: a temp file with
@@ -327,6 +370,7 @@ mod tests {
             active: 0,
             window: Some((10, 20, 900, 700)),
             maximized: false,
+            recent: Vec::new(),
         };
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(file_in(&dir), render(&s)).unwrap();

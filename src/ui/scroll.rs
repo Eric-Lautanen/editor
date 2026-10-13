@@ -24,12 +24,37 @@ const GLIDE_MAX_PX_PER_MS: f32 = 6.0;
 /// chasing it would keep the frame clock running forever.
 const GLIDE_SETTLED: f32 = 0.5;
 
+/// Fraction of a coast's speed kept per millisecond. The velocity decays
+/// geometrically from wherever the finger let go — the rolodex feel, cranked
+/// as the user asked: the page keeps moving the way it *was* moving and
+/// bleeds off smoothly instead of arriving somewhere and stopping. The whole
+/// ride is the geometric sum v/(1 − decay) ≈ 667·v px, so a 3 px/ms release
+/// carries ~2000 px over a ~2.6 s bleed-off; even a soft 0.3 px/ms push
+/// coasts ~160 px over a full second.
+const COAST_DECAY_PER_MS: f32 = 0.9985;
+/// A coast slower than this (px/ms) is finished: below one pixel per frame at
+/// 60 Hz the remaining motion is invisible.
+const COAST_MIN_PX_PER_MS: f32 = 0.06;
+/// Fastest a coast may start at, in px/ms (8 px/ms = 8000 px/s). Higher
+/// release velocities are clamped here — but 8 is *deliberately* generous, so
+/// a fast flick really can throw the document a couple of thousand px: the
+/// cap exists to stop a violent fling ripping past hundreds of screens, not
+/// to slow the fast scroll a power user is asking for. (A release this hard
+/// carries ~1600 px of travel at the current decay.)
+const COAST_MAX_PX_PER_MS: f32 = 8.0;
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ScrollState {
     /// What the panes paint at.
     pub offset: f32,
     /// Where a glide is heading; equal to `offset` when nothing is animating.
     pub target: f32,
+    /// While coasting, the residual speed in px/ms. A glide has a fixed place
+    /// to arrive at; a coast has none — the velocity *itself* is the state,
+    /// decaying to zero, and where the view ends up is whatever the decay
+    /// integrates to. Published like `offset`/`target`: a nonzero value is a
+    /// ride in flight, and that is all "coasting" means.
+    pub coast: f32,
     pub content_height: f32,
     pub viewport_height: f32,
 }
@@ -42,16 +67,39 @@ impl ScrollState {
     /// Move *immediately*: direct manipulation — a finger on the glass, a
     /// scrollbar thumb, a caret being followed, drag auto-scroll — has to track
     /// the input exactly. Putting a glide in the way of a finger would read as
-    /// lag. Any glide in flight is abandoned at the current position.
+    /// lag. Any glide *and any coast* in flight ends here: the finger owns the
+    /// view, and a coast that kept going hands-off would ignore it.
     pub fn scroll_by(&mut self, dy: f32) {
+        self.coast = 0.0;
         self.offset = (self.offset + dy).clamp(0.0, self.max());
         self.target = self.offset;
+    }
+
+    /// The finger let go at `v` px/ms: keep the motion it had, decaying.
+    /// Near-zero velocities start nothing (a release after the finger held
+    /// still simply stops, like any other direct manipulation). Any glide in
+    /// flight is abandoned — the finger's momentum replaces it.
+    pub fn coast_from(&mut self, v: f32) {
+        self.target = self.offset;
+        self.coast = v.clamp(-COAST_MAX_PX_PER_MS, COAST_MAX_PX_PER_MS);
+        if self.coast.abs() <= COAST_MIN_PX_PER_MS {
+            self.coast = 0.0;
+        }
     }
 
     /// Move *and glide there*: for coarse, discrete steps — a wheel notch, a
     /// PageUp/PageDown. The distance accumulates, so spinning the wheel builds
     /// one continuous glide instead of a glide per notch.
+    ///
+    /// A coast in flight is **replaced**, not extended: its stale `target` is
+    /// nowhere the ride is any more, so gliding there after the notch would
+    /// yank the view backwards. Re-anchor the target to where the coast has
+    /// actually got to and let the wheel have the view from here.
     pub fn scroll_smooth(&mut self, dy: f32) {
+        if self.coast != 0.0 {
+            self.coast = 0.0;
+            self.target = self.offset;
+        }
         self.target = (self.target + dy).clamp(0.0, self.max());
         // A resize (or a shorter document) can leave the offset outside the
         // range the target is clamped to; keep the view inside it too.
@@ -67,14 +115,28 @@ impl ScrollState {
     /// fraction onto the target, and the caller has to call it once more after
     /// this returns false for that to happen. Stopping with a sub-pixel gap
     /// would leave the view a fraction off the position every later scroll is
-    /// measured from, and never quite on the end of the document.
+    /// measured from, and never quite on the end of the document. A coast in
+    /// flight counts too: something is moving either way.
     pub fn animating(&self) -> bool {
-        self.offset != self.target
+        self.coast != 0.0 || self.offset != self.target
     }
 
-    /// Advance the glide by `dt_ms` of real time. Returns whether the view
+    /// Advance the animation by `dt_ms` of real time. Returns whether the view
     /// moved, i.e. whether a repaint is worth it.
     pub fn step(&mut self, dt_ms: f32) -> bool {
+        if self.coast != 0.0 {
+            // `powf` once covers the whole interval; splitting `dt` into
+            // simulated sub-steps would be indistinguishable from this at
+            // animation frame sizes and four times the work.
+            let decay = COAST_DECAY_PER_MS.powf(dt_ms);
+            self.offset = (self.offset + self.coast * dt_ms).clamp(0.0, self.max());
+            self.coast *= decay;
+            if self.coast.abs() <= COAST_MIN_PX_PER_MS || self.offset == self.target {
+                self.coast = 0.0;
+                self.target = self.offset;
+            }
+            return true;
+        }
         let d = self.target - self.offset;
         if d.abs() <= GLIDE_SETTLED {
             let was = self.offset;
@@ -104,6 +166,7 @@ mod tests {
         ScrollState {
             offset,
             target: offset,
+            coast: 0.0,
             content_height: 10_000.0,
             viewport_height: 800.0,
         }
@@ -275,5 +338,160 @@ mod tests {
         s.scroll_smooth(100_000.0);
         run(&mut s, FAST_FRAME_MS);
         assert_eq!(s.offset, s.max());
+    }
+
+    #[test]
+    fn a_flick_coasts_and_bleeds_off() {
+        // The report: touch scrolling should "coast a little after scroll".
+        // The release velocity is the state: the view keeps moving the way the
+        // finger was moving, decaying geometrically — never reversing, never
+        // overshooting a destination it does not have.
+        let mut s = scroller(0.0);
+        s.coast_from(3.0); // a solid 3000 px/s flick
+        assert!(s.coast != 0.0 && s.animating());
+        let mut prev = 0.0;
+        let mut last_move = 0.0;
+        let mut ms = 0.0;
+        while s.animating() {
+            s.step(FAST_FRAME_MS);
+            ms += FAST_FRAME_MS;
+            assert!(s.offset >= prev, "a coast never reverses: {ms} ms in");
+            prev = s.offset;
+            last_move = ms;
+        }
+        assert_eq!(s.offset, prev, "the last frame moved too");
+        // Seconds of ride for a hard flick: the long tail IS the feel
+        // (decay 0.9985/ms keeps ~22% of the speed after 1 s).
+        assert!(
+            last_move >= 2400.0,
+            "a hard flick should coast for seconds, coasted {last_move} ms"
+        );
+        // The whole coast is the geometric sum: v₀/(1 − decay per ms) =
+        // 3 / 0.0015 = 2000 px of total travel, one long rolodex bleed-off.
+        assert!(
+            prev > 1900.0 && prev < 2100.0,
+            "counter-integral of a decaying 3 px/ms velocity, landed at {prev}"
+        );
+    }
+
+    #[test]
+    fn a_soft_push_coasts_briefly() {
+        // The decay is slow by design, so "brief" still means a comfortable
+        // second and ~160 px for a soft nudge — never a dead stop.
+        let mut s = scroller(0.0);
+        s.coast_from(0.3);
+        assert!(s.coast != 0.0);
+        let (_, ms) = run(&mut s, FAST_FRAME_MS);
+        assert!(
+            (900.0..1300.0).contains(&ms),
+            "a soft push coasts about a second: {ms} ms"
+        );
+        assert!(
+            (100.0..220.0).contains(&s.offset),
+            "and travels its little sum: {}",
+            s.offset
+        );
+    }
+
+    #[test]
+    fn a_release_that_held_still_starts_nothing() {
+        // The finger arrived and stopped for a beat before lifting: no
+        // velocity, no coast — the ride just ends where the hand is.
+        let mut s = scroller(5.0);
+        s.coast_from(0.04);
+        assert!(s.coast == 0.0);
+        assert!(!s.animating());
+        assert!(!s.step(FAST_FRAME_MS));
+    }
+
+    #[test]
+    fn a_violent_fling_is_clamped() {
+        let mut s = scroller(0.0);
+        s.coast_from(900.0);
+        assert_eq!(s.coast, COAST_MAX_PX_PER_MS);
+    }
+
+    #[test]
+    fn the_coast_stops_at_the_edges() {
+        // A coast toward the top of the document stops there, cleanly —
+        // hitting the end is a stop, not a wall that launches it backwards.
+        let mut s = scroller(300.0);
+        s.coast_from(-3.0);
+        while s.animating() {
+            s.step(FAST_FRAME_MS);
+            assert!(s.offset >= 0.0);
+        }
+        assert_eq!(s.offset, 0.0);
+        // And the `target` follows, so `animating` is a reliable stop signal.
+        assert_eq!(s.target, 0.0);
+    }
+
+    #[test]
+    fn a_finger_takes_over_from_a_coast() {
+        // Touch down mid-coast: the ride is over, the finger owns the view,
+        // exactly as it takes over from a wheel glide.
+        let mut s = scroller(0.0);
+        s.coast_from(3.0);
+        s.step(FAST_FRAME_MS);
+        let coasting_at = s.offset;
+        assert!(coasting_at > 0.0);
+        s.scroll_by(5.0);
+        assert_eq!(s.offset, coasting_at + 5.0);
+        assert!(s.coast == 0.0);
+        assert!(!s.animating());
+    }
+
+    #[test]
+    fn a_wheel_notch_replaces_a_coast() {
+        // The coast and the glide are separate states — and a wheel notch
+        // arriving mid-coast must *replace* the ride, not glide to the old
+        // target afterwards, which would yank the view back to where the
+        // coast was heading before the wheel spoke. So `scroll_smooth`
+        // re-anchors the target to where the coast has actually got to; that
+        // is also what makes `gliding()` tell the truth for callers that
+        // re-target.
+        let mut s = scroller(0.0);
+        s.coast_from(2.0);
+        assert!(s.coast != 0.0, "a coast is not a glide");
+        // Spin the coast for a moment so the offset and the stale target part.
+        s.step(FAST_FRAME_MS);
+        assert!(s.coast != 0.0, "still riding");
+        s.scroll_smooth(480.0);
+        assert!(s.coast == 0.0 && s.animating(), "the wheel wins the view");
+        assert_eq!(s.target, s.offset + 480.0, "aimed from where we now are");
+        // And the whole of the rest of the motion is that glide: the coast
+        // velocity is gone, so repeated steps close on the target and never
+        // run past it.
+        let (seen, _) = run(&mut s, FAST_FRAME_MS);
+        for w in seen.windows(2) {
+            assert!(w[1] <= s.target + 0.001);
+        }
+        assert_eq!(s.offset, s.target);
+    }
+
+    #[test]
+    fn a_slow_frame_rate_stretches_no_coast() {
+        // Time-based like the glide: 8 frames of 20 ms = 5 frames of 32 ms.
+        let mut slow = scroller(0.0);
+        let mut fast = scroller(0.0);
+        slow.coast_from(-1.0);
+        fast.coast_from(-1.0);
+        slow.step(20.0);
+        slow.step(20.0);
+        slow.step(20.0);
+        slow.step(20.0);
+        slow.step(20.0);
+        slow.step(20.0);
+        slow.step(20.0);
+        slow.step(20.0);
+        for _ in 0..5 {
+            fast.step(32.0);
+        }
+        assert!(
+            (slow.offset - fast.offset).abs() < 1.0,
+            "the frame rate must not change the feel: {} vs {}",
+            slow.offset,
+            fast.offset
+        );
     }
 }

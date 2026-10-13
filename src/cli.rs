@@ -84,6 +84,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
 
     let mut app = App::new(o.file.clone())?;
+    // A file argument opens by construction (`App::new`), not through
+    // `open_path`, so it would otherwise never reach the recent list.
+    if let Some(f) = &o.file {
+        app.note_recent(f);
+    }
     let session = settings::load();
     // --dark wins, then the user's saved manual pick, then the OS theme.
     if o.dark {
@@ -102,10 +107,26 @@ pub fn run(args: Vec<String>) -> Result<()> {
         };
         app.restore(&session.files, session.active, mode);
     }
+    // The recent list crosses sessions whether or not tabs were restored.
+    app.restore_recent(&session.recent);
+    // No file argument and no restored tabs: offer the recent list as the way
+    // back in — the most recent still-existing file becomes the session's tab.
+    if o.file.is_none() && session.files.is_empty() {
+        if let Some(path) = session.recent.iter().find(|p| p.is_file()) {
+            let mut host = crate::platform::NullHost::default();
+            app.open_path(path.clone(), &mut host);
+        }
+    }
     // Reopen where the window was left — with or without a file argument, and
     // maximized if that is how it was closed. The platform reads this back
     // while creating the window.
     app.restore_window(session.window, session.maximized);
+    // The recent-files list outlives the tabs it came from; a file given on
+    // the command line is as recent as one picked in a dialog.
+    app.restore_recent(&session.recent);
+    if let Some(f) = &o.file {
+        app.note_recent(f);
+    }
     if o.pretty {
         return pretty_print(o.file.as_deref());
     }

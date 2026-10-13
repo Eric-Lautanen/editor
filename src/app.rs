@@ -190,6 +190,10 @@ pub struct App {
     /// A glide is in flight, so the host is currently running its fast frame
     /// clock (and must be told when it can stop).
     scrolling: bool,
+    /// Recently opened files, most recent first, per [`settings::RECENT_MAX`].
+    /// Restored from the session at startup and re-noted on every open, so the
+    /// next start can offer the way back in.
+    recent: Vec<PathBuf>,
     /// When the last animation frame was handled. The glide is eased over
     /// *time*, so each frame needs to know how much of it passed — a host that
     /// stalls, or one that only has the 40 ms heartbeat, still advances by the
@@ -266,6 +270,7 @@ impl App {
             window: None,
             window_maximized: false,
             scrolling: false,
+            recent: Vec::new(),
             last_frame: Instant::now(),
             geometry_dirty: false,
             geometry_idle: 0,
@@ -304,6 +309,20 @@ impl App {
         self.layout_dirty = true;
     }
 
+    /// Take over the recent-files list the previous session kept. Called from
+    /// `cli` startup alongside [`Self::restore`]; an app constructed later in
+    /// a test keeps an empty list unless it restores.
+    pub fn restore_recent(&mut self, recent: &[PathBuf]) {
+        self.recent = recent.to_vec();
+    }
+
+    /// Remember `path` as recently opened. `open_path` and save-as do this on
+    /// their own; the CLI's file argument goes through here, because it is
+    /// opened by `App::new` rather than `open_path`.
+    pub fn note_recent(&mut self, path: &std::path::Path) {
+        settings::note_recent(&mut self.recent, path);
+    }
+
     /// Adopt the window rect the last session closed at. Called before
     /// `platform::run`, because the window does not exist yet: the platform
     /// reads it back through [`Handler::initial_window`] while creating it, and
@@ -332,6 +351,7 @@ impl App {
                 Mode::Split => 2,
             },
             files: self.tabs.iter().filter_map(|t| t.path.clone()).collect(),
+            recent: self.recent.clone(),
             active: self.active,
             // The *normal* rect, not the maximized one: reopening at the work
             // area's size would leave a window that is the size of the screen
@@ -365,17 +385,25 @@ impl App {
         }
     }
 
+    /// Start (or refresh) the animation clock: the glide or coast needs
+    /// frames, and on a host without one the 40 ms heartbeat steps it.
+    fn start_glide_clock(&mut self, host: &mut dyn Host) {
+        if self.scroll.animating() && !self.scrolling {
+            // A zero-velocity release leaves nothing to animate; don't start
+            // the host's frame clock for it.
+            self.scrolling = true;
+            self.last_frame = Instant::now();
+            host.set_animating(true);
+        }
+    }
+
     /// Scroll to a coarse step's distance *over the next few frames* rather
     /// than in one jump, which is what removes the stepping from wheel and
     /// paging input, and start the host's fast frame clock if it is not
     /// already running.
     fn scroll_glide(&mut self, dy: f32, host: &mut dyn Host) {
         self.scroll.scroll_smooth(dy);
-        if self.scroll.animating() && !self.scrolling {
-            self.scrolling = true;
-            self.last_frame = Instant::now();
-            host.set_animating(true);
-        }
+        self.start_glide_clock(host);
         host.request_redraw();
     }
 
@@ -387,6 +415,20 @@ impl App {
         } else {
             self.scroll_direct(dy, host);
         }
+    }
+
+    /// The finger let go: hand the ride to momentum. A flick keeps the view
+    /// moving the way it was moving and bleeds off — the rolodex feel — and a
+    /// release after the finger held still coasts zero and stays put. Pan's
+    /// sign flips like every other vertical input: dragging up the screen
+    /// moves the content down the document, so the velocity does too.
+    fn coast(&mut self, _vx: f32, vy: f32, host: &mut dyn Host) {
+        // Horizontal momentum is dropped on purpose: the coast state lives on
+        // the vertical scroller, preview panes have nothing to pan sideways,
+        // and a flick is vertical by nature. Only the vertical ride continues.
+        self.scroll.coast_from(-vy);
+        self.start_glide_clock(host);
+        host.request_redraw();
     }
 
     /// Move the view *now*, because the pointer is driving it — a scrollbar
@@ -438,6 +480,7 @@ impl App {
     /// it as a new one. Read failures land in the status bar, never a crash.
     pub fn open_path(&mut self, path: PathBuf, host: &mut dyn Host) {
         self.close_armed = false;
+        settings::note_recent(&mut self.recent, &path);
         if let Some(i) = self
             .tabs
             .iter()
@@ -1021,8 +1064,8 @@ impl App {
                 x,
                 y,
                 can_edit,
-                self.size.0 as f32,
-                self.size.1 as f32,
+                &self.recent,
+                Rect::new(0.0, 0.0, self.size.0 as f32, self.size.1 as f32),
                 self.scale,
             ));
             host.request_redraw();
@@ -1130,6 +1173,16 @@ impl App {
             menu::Action::CloseTab => self.close_tab(host),
             menu::Action::Help => self.help_open = true,
             menu::Action::About => self.about_open = true,
+            // A recent-file entry: open it as a tab, bumping it to the front
+            // of the list (open_path notes it).
+            menu::Action::Recent(i) => {
+                if let Some(p) = self.recent.get(i).cloned() {
+                    self.open_path(p, host);
+                }
+            }
+            // Painted section label between the clipboard items and the
+            // recent list; clicking it does nothing.
+            menu::Action::Header => {}
             menu::Action::CopyAll => host.clipboard_set(&self.buffer.text()),
             menu::Action::Copy => {
                 if let Some(text) = self.editor.copy(&self.buffer) {
@@ -1438,6 +1491,8 @@ impl App {
                 self.tabs[self.active].kind = FileKind::from_path(&p);
                 self.mtime = None;
                 self.layout_dirty = true;
+                // A brand-new file is as recent as an opened one.
+                settings::note_recent(&mut self.recent, &p);
                 self.persist();
                 p
             }
@@ -1818,6 +1873,7 @@ impl Handler for App {
                 self.pan_horizontal(dx);
                 self.scroll_direct(-dy, host);
             }
+            Event::PanEnd { vx, vy } => self.coast(vx, vy, host),
             Event::KeyDown { key, mods } => self.on_key(key, mods, host),
             Event::Frame => self.on_frame(host),
             Event::MouseDown { x, y, button } => self.on_mouse_down(x, y, button, host),
@@ -2053,6 +2109,39 @@ mod tests {
                 shift: false,
             },
         }
+    }
+
+    #[test]
+    fn recent_files_track_opens_and_the_menu_reopens_them() {
+        let a = std::env::temp_dir().join("readitor_test_recent_a.md");
+        std::fs::write(&a, "a\n").unwrap();
+        let b = std::env::temp_dir().join("readitor_test_recent_b.md");
+        std::fs::write(&b, "b\n").unwrap();
+        let mut app = App::new(None).unwrap();
+        let mut host = NullHost::default();
+        // Opening notes the file; re-opening moves it back to the front.
+        app.open_path(b.clone(), &mut host);
+        assert_eq!(app.settings().recent, vec![b.clone()]);
+        app.open_path(a.clone(), &mut host);
+        assert_eq!(app.settings().recent, vec![a.clone(), b.clone()]);
+        // The context menu lists them under a caption that does not click.
+        let menu = menu::open(
+            &app.fonts,
+            10.0,
+            10.0,
+            false,
+            &app.recent,
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            1.0,
+        );
+        assert_eq!(menu.items[6].0, menu::Action::Header);
+        assert_eq!(menu.items[7].0, menu::Action::Recent(0));
+        assert_eq!(menu.items[7].1, "readitor_test_recent_a.md");
+        // Picking the second recent focuses that file's tab…
+        app.run_menu_action(menu::Action::Recent(1), &mut host);
+        assert_eq!(app.path.as_deref(), Some(b.as_path()));
+        // …and bumps it back to the front of the list.
+        assert_eq!(app.settings().recent, vec![b.clone(), a.clone()]);
     }
 
     #[test]
@@ -3751,6 +3840,92 @@ mod tests {
         );
         assert!(!app.scrolling);
         assert!(!host.animating, "the frame clock goes with the glide");
+    }
+
+    #[test]
+    fn a_flick_coasts_past_the_finger() {
+        // The report: touch scrolling should "coast a little after scroll".
+        // PanEnd carries the finger's release velocity; the app hands it to
+        // the scroller and runs the frame clock, and the view keeps moving
+        // with no further input until the momentum is spent.
+        let mut app = open("readitor_test_fling.txt", &"line\n".repeat(400));
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        // Drag down (dy < 0 → content down … see Pan's sign) then lift with
+        // the motion still going: a solid 1.5 px/ms upward flick.
+        for _ in 0..5 {
+            app.on_event(Event::Pan { dx: 0.0, dy: -30.0 }, &mut host);
+        }
+        assert_eq!(app.scroll.offset, 150.0);
+        app.on_event(Event::PanEnd { vx: 0.0, vy: -1.5 }, &mut host);
+        assert!(app.scrolling, "a flick needs the frame clock");
+        assert!(host.animating);
+        assert!(app.scroll.coast != 0.0);
+        assert_eq!(app.scroll.target, 150.0, "a coast has no destination");
+        // Frames keep the ride moving past the finger's last touch, in the
+        // same direction, decaying — never reversing, never snapping to a
+        // destination.
+        let mut prev = app.scroll.offset;
+        assert!(prev > 0.0);
+        for _ in 0..12 {
+            app.on_event(Event::Frame, &mut host);
+            assert!(
+                app.scroll.offset >= prev,
+                "a coast never reverses: {} after {}",
+                app.scroll.offset,
+                prev
+            );
+            prev = app.scroll.offset;
+        }
+        assert!(prev > 160.0, "the coast travelled past the finger: {prev}");
+        // The clock stops when the ride is over, and the last frame lands.
+        while app.scrolling {
+            app.on_event(Event::Frame, &mut host);
+        }
+        assert!(!host.animating);
+        assert_eq!(app.scroll.offset, app.scroll.target);
+    }
+
+    #[test]
+    fn a_release_that_held_still_stops_the_ride() {
+        // The finger arrived, paused, then lifted: ~0 velocity, no coast. The
+        // clock ends and the view stays exactly where the finger left it.
+        let mut app = open("readitor_test_stop.txt", &"line\n".repeat(400));
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        app.on_event(Event::Pan { dx: 0.0, dy: -30.0 }, &mut host);
+        assert_eq!(app.scroll.offset, 30.0);
+        app.on_event(Event::PanEnd { vx: 0.0, vy: 0.0 }, &mut host);
+        assert!(!app.scrolling);
+        assert!(app.scroll.coast == 0.0);
+        assert_eq!(app.scroll.offset, 30.0);
+    }
+
+    #[test]
+    fn a_wheel_notch_ends_a_coast_rather_than_fighting_it() {
+        // Mid-coast, the wheel speaks: the ride must end and the glide start
+        // *from where the view now is* — a glide to the coast's stale target
+        // would yank the view backwards under the user's hand.
+        let mut app = open("readitor_test_wc.txt", &"line\n".repeat(400));
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        app.on_event(Event::PanEnd { vx: 0.0, vy: -2.0 }, &mut host);
+        assert!(app.scroll.coast != 0.0);
+        app.on_event(Event::Frame, &mut host);
+        let mid_coast = app.scroll.offset;
+        assert!(mid_coast > 0.0);
+        app.on_event(Event::Scroll { dx: 0.0, dy: -48.0 }, &mut host);
+        assert!(app.scroll.coast == 0.0, "the wheel ends the ride");
+        assert!(app.scrolling, "and runs its own clock");
+        assert_eq!(app.scroll.target, mid_coast + 48.0);
+        while app.scrolling {
+            app.on_event(Event::Frame, &mut host);
+        }
+        assert_eq!(
+            app.scroll.offset,
+            mid_coast + 48.0,
+            "landed ahead, not back"
+        );
     }
 
     #[test]

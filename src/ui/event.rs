@@ -98,10 +98,17 @@ pub enum Event {
     },
     /// Continuous manipulation: a finger (or pen) dragging the content. This
     /// tracks the input exactly — a glide in the way of a finger reads as lag
-    /// — and is what carries inertia when a release adds it.
+    /// — and on release hands over to [`Event::PanEnd`].
     Pan {
         dx: f32,
         dy: f32,
+    },
+    /// The finger came up, with its velocity across the last ~100 ms in client
+    /// px/ms. A quick flick coasts from there; a release after the finger held
+    /// still reports ~0 and stops dead.
+    PanEnd {
+        vx: f32,
+        vy: f32,
     },
     /// A file opened by the host: drag-and-drop (anywhere on the window) or a
     /// macOS open-file message. The app opens it as a tab.

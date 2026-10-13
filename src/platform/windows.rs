@@ -27,6 +27,7 @@ use std::{
     ffi::c_void,
     mem,
     ptr::{null, null_mut},
+    time::Instant,
 };
 
 /// Raw Win32/GDI types and imports. Rust-style names are used throughout; each
@@ -291,10 +292,27 @@ mod ffi {
     pub const WM_DROPFILES: u32 = 0x0233;
     pub const WM_TIMER: u32 = 0x0113;
     /// `WM_TIMER` ids. `TIMER_TICK` is the app's slow heartbeat (caret blink,
-    /// drag auto-scroll); `TIMER_FRAME` only runs while something is animating,
-    /// which is what a glide needs and what 40 ms cannot give it.
+    /// drag auto-scroll). Frame pacing is a waitable timer, not a user timer,
+    /// so no `WM_TIMER` id exists for it.
     pub const TIMER_TICK: usize = 1;
-    pub const TIMER_FRAME: usize = 2;
+    /// `TIMER_ALL_ACCESS` for waitable timers: STANDARD_RIGHTS_REQUIRED
+    /// (0x000F0000) + SYNCHRONIZE (0x00100000) — *needed*: a wait without it
+    /// fails with WAIT_FAILED — + the timer-specific rights (0xF).
+    pub const TIMER_ALL_ACCESS: u32 = 0x001F_000F;
+    /// A signed 64-bit value for waitable-timer due times (a `LARGE_INTEGER`).
+    #[repr(C)]
+    pub struct LargeInteger {
+        pub quad: i64,
+    }
+    /// `WM_APP` — the base for application-private messages.
+    pub const WM_APP: u32 = 0x8000;
+    /// `PM_NOREMOVE` for `PeekMessageW`: look, do not take.
+    pub const PM_NOREMOVE: u32 = 0x0000;
+    /// Ask the window proc to start (wParam 1) or stop (0) the animation
+    /// frame timer. `set_animating` is called from inside `dispatch` — under
+    /// `&mut State` — so the request has to come back through the message
+    /// queue rather than touch `State` from the host side.
+    pub const WM_APP_ANIMATION: u32 = WM_APP + 1;
     pub const WM_TOUCH: u32 = 0x0240;
     pub const WM_DPICHANGED: u32 = 0x02E0;
     pub const WM_SETICON: u32 = 0x0080;
@@ -512,6 +530,8 @@ mod ffi {
         pub fn destroy_window(hwnd: Hwnd) -> i32;
         #[link_name = "PostQuitMessage"]
         pub fn post_quit_message(code: i32);
+        #[link_name = "PeekMessageW"]
+        pub fn peek_message_w(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> i32;
         #[link_name = "GetMessageW"]
         pub fn get_message_w(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
         #[link_name = "TranslateMessage"]
@@ -585,8 +605,24 @@ mod ffi {
         pub fn get_cursor_pos(pt: *mut Point) -> i32;
         #[link_name = "SetTimer"]
         pub fn set_timer(hwnd: Hwnd, id: usize, ms: u32, proc: *const c_void) -> usize;
-        #[link_name = "KillTimer"]
-        pub fn kill_timer(hwnd: Hwnd, id: usize) -> i32;
+        #[link_name = "CreateWaitableTimerExW"]
+        pub fn create_waitable_timer_ex_w(
+            attrs: *const c_void,
+            name: *const u16,
+            flags: u32,
+            access: u32,
+        ) -> Handle;
+        #[link_name = "SetWaitableTimer"]
+        pub fn set_waitable_timer(
+            timer: Handle,
+            due: *const c_void,
+            period_ms: i32,
+            completion: *const c_void,
+            arg: *mut c_void,
+            resume: i32,
+        ) -> i32;
+        #[link_name = "WaitForSingleObject"]
+        pub fn wait_for_single_object(handle: Handle, ms: u32) -> u32;
         #[link_name = "RegisterTouchWindow"]
         pub fn register_touch_window(hwnd: Hwnd, flags: u32) -> i32;
         #[link_name = "GetTouchInputInfo"]
@@ -710,6 +746,60 @@ use ffi::*;
 /// Touch travel (client px) under which a contact is a tap rather than a pan.
 const TAP_SLOP: f32 = 8.0;
 
+/// Window of past contact positions (client px) from which the release
+/// velocity is estimated. A fixed window straddles the last few `WM_TOUCH`
+/// batches (which can be 16–32 ms apart), so the estimate is about a flick's
+/// *last* ~100 ms rather than its whole history.
+const VELOCITY_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One past touch position, kept while a contact is live so its release
+/// velocity can be estimated: `(when, x, y)`.
+struct TouchSample {
+    t: std::time::Instant,
+    x: f32,
+    y: f32,
+}
+
+/// Estimate a velocity (px/ms per axis) from samples within the window.
+///
+/// A plain (first - last) / dt is noise: it uses the window's endpoints, and
+/// both of those can be zero-motion batches (the finger pausing) around real
+/// movement, or two samples of a slow beat. An ordinary least-squares slope
+/// over the whole window uses every sample, which is what keeps a stuttery
+/// digitizer stream from producing a spurious flick.
+fn velocity(samples: &[TouchSample]) -> (f32, f32) {
+    if samples.len() < 2 {
+        return (0.0, 0.0);
+    }
+    let t0 = samples[0].t;
+    // x = (t in ms since the first sample), y = the axis. Σt is in units of
+    // ms, f32 has plenty of headroom for it.
+    let mut n = 0.0f32;
+    let mut st = 0.0;
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    let mut stt = 0.0;
+    let mut stx = 0.0;
+    let mut sty = 0.0;
+    for s in samples {
+        let t = s.t.duration_since(t0).as_secs_f32() * 1000.0;
+        n += 1.0;
+        st += t;
+        sx += s.x;
+        sy += s.y;
+        stt += t * t;
+        stx += t * s.x;
+        sty += t * s.y;
+    }
+    let denom = n * stt - st * st;
+    if denom <= f32::EPSILON * f32::EPSILON || n < 2.0 {
+        return (0.0, 0.0);
+    }
+    let vx = (n * stx - st * sx) / denom;
+    let vy = (n * sty - st * sy) / denom;
+    (vx, vy)
+}
+
 /// What one `TOUCHINPUT` contact is asking for, decoded from its flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TouchAction {
@@ -718,6 +808,38 @@ enum TouchAction {
     Down,
     Move,
     Up,
+}
+
+/// Simulation interval of the animation frame timer, in ms: ~100 Hz, well past
+/// any display here (a 240 Hz tablet would still get one step per beat, and
+/// the app's easing is time-based, so extra beats cost ~nothing but redraws).
+const FRAME_PERIOD_MS: u32 = 10;
+
+/// A high-resolution waitable timer for the animation clock, or null if the
+/// OS (pre-1703 Windows 10) cannot make one.
+unsafe fn create_frame_timer() -> Option<Handle> {
+    // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | manual-reset (so an unwaited
+    // pulse is never lost while the pump drains a message burst).
+    let t = create_waitable_timer_ex_w(null(), null(), 0x0000_0002 | 0x0000_0001, TIMER_ALL_ACCESS);
+    if t.is_null() {
+        return None;
+    }
+    // Period: negative = relative time, in 100 ns units.
+    let period = (-10_000i64).wrapping_mul(FRAME_PERIOD_MS as i64);
+    let li = LargeInteger { quad: period };
+    if set_waitable_timer(
+        t,
+        core::ptr::addr_of!(li).cast::<core::ffi::c_void>(),
+        0,
+        null(),
+        null_mut(),
+        0,
+    ) == 0
+    {
+        close_handle(t);
+        return None;
+    }
+    Some(t)
 }
 
 /// Decode a touch contact's flags.
@@ -749,6 +871,8 @@ struct State {
     last_title: String,
     /// Pending UTF-16 high surrogate from WM_CHAR (emoji etc. arrive as two messages).
     high_surrogate: Option<u16>,
+    /// The animation frame timer, live only while something is animating.
+    frame_timer: Option<Handle>,
     /// Last touch contact (client px) while a touch drag pans the view.
     touch: Option<(f32, f32)>,
     /// Touch travel since the contact began: a tap barely moves.
@@ -756,6 +880,9 @@ struct State {
     /// A mouse message arrived while a touch was live (Windows promotes touch
     /// to mouse input). A tap then needs no synthetic click — the OS sent one.
     touch_promoted: bool,
+    /// Past positions of the live contact, for estimating its release
+    /// velocity. Pruned to `VELOCITY_WINDOW` on every move.
+    touch_history: Vec<TouchSample>,
     /// Left button held inside the client area. The app's drags last exactly
     /// that long and end only on `MouseUp`, so this is the platform's record of
     /// the gesture the app believes is in flight: `end_gesture` needs it to
@@ -782,18 +909,13 @@ impl Host for WinHost {
     fn request_redraw(&mut self) {
         unsafe { invalidate_rect(self.hwnd, null(), 0) };
     }
-    /// Start (or stop) the fast frame clock. `WM_TIMER` is coalesced to the
-    /// system tick — 15.6 ms by default, whatever period is asked for — so this
-    /// runs at ~64 Hz, which is at or above a typical display's refresh and far
-    /// off the 25 Hz heartbeat a glide would otherwise advance on. The timer is
-    /// killed again the moment nothing is moving, so it costs nothing at rest.
+    /// Ask for animation frames. The timer itself is owned by the window's
+    /// `State` — it must outlive this event — so the request goes back through
+    /// a `WM_APP` message to the window proc, the same way a released capture
+    /// re-enters it synchronously.
     fn set_animating(&mut self, on: bool) {
         unsafe {
-            if on {
-                set_timer(self.hwnd, TIMER_FRAME, 1, null());
-            } else {
-                kill_timer(self.hwnd, TIMER_FRAME);
-            }
+            send_message_w(self.hwnd, WM_APP_ANIMATION, if on { 1 } else { 0 }, 0);
         }
     }
     fn set_title(&mut self, title: &str) {
@@ -1282,15 +1404,13 @@ fn map_key(vk: u32, mods: Modifiers) -> Option<Key> {
 
 // ---------------------------------------------------------------- window proc
 
-/// Which event a `WM_TIMER` id means. Two clocks share the one message, so the
-/// id is the whole routing: the frame timer is a glide's clock, and the other
-/// one is the app's heartbeat (caret blink, drag auto-scroll).
+/// The one `WM_TIMER` the app owns: its heartbeat (caret blink, drag
+/// auto-scroll). Frame pacing is a waitable timer signalled in `run`, so it
+/// never shares this message — a user timer could not pace it anyway (a 1 ms
+/// request coalesces to the 15.6 ms system tick).
 fn timer_event(id: usize) -> Event {
-    if id == TIMER_FRAME {
-        Event::Frame
-    } else {
-        Event::Tick
-    }
+    let _ = id; // one id today; the function is the seam for a second one
+    Event::Tick
 }
 
 /// Deliver an event, then sync the window title if the app's title changed.
@@ -1574,10 +1694,12 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                     };
                     screen_to_client(hwnd, &mut pt);
                     let (x, y) = (pt.x as f32, pt.y as f32);
+                    let now = Instant::now();
                     if touch_action(t.flags) == TouchAction::Down && st.touch.is_none() {
                         st.touch = Some((x, y));
                         st.touch_travel = 0.0;
                         st.touch_promoted = false;
+                        st.touch_history = vec![TouchSample { t: now, x, y }];
                     } else if touch_action(t.flags) == TouchAction::Move {
                         if let Some((lx, ly)) = st.touch {
                             let (dx, dy) = (x - lx, y - ly);
@@ -1587,9 +1709,21 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                                 // wheel-like step the app may glide to.
                                 dispatch(st, hwnd, Event::Pan { dx, dy });
                             }
+                            // One instant stamps the new sample and prunes the
+                            // old: two `now()`s would compare different clocks.
+                            st.touch_history.push(TouchSample { t: now, x, y });
+                            st.touch_history.retain(|s| s.t >= now - VELOCITY_WINDOW);
                         }
                         st.touch = Some((x, y));
                     } else if touch_action(t.flags) == TouchAction::Up {
+                        // The finger lifted. Estimate the flick velocity from
+                        // the last ~100 ms of the contact so the app can coast;
+                        // a held-still finger's OLS slope is ~0 and starts
+                        // nothing. Clear the history too, so a stray second
+                        // `Up` cannot report a stale gesture.
+                        let (vx, vy) = velocity(&st.touch_history);
+                        st.touch_history.clear();
+                        dispatch(st, hwnd, Event::PanEnd { vx, vy });
                         // A tap's promoted click was swallowed above, so issue
                         // one here. (When the OS did promote, it already
                         // delivered the click and we must not double it.)
@@ -1634,6 +1768,21 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
         }
         WM_TIMER => {
             dispatch(st, hwnd, timer_event(wp));
+            0
+        }
+        WM_APP_ANIMATION => {
+            // Start (1) or stop (0) the animation frame timer. Arrives from
+            // `WinHost::set_animating`, which runs under `&mut State` and so
+            // cannot touch it — the request comes back through the queue.
+            if wp == 1 {
+                // A live clock re-arms only: stopping and recreating the timer
+                // on every gliding wheel notch would drop a beat.
+                if st.frame_timer.is_none() {
+                    st.frame_timer = create_frame_timer();
+                }
+            } else if let Some(t) = st.frame_timer.take() {
+                close_handle(t);
+            }
             0
         }
         WM_DROPFILES => {
@@ -1911,9 +2060,11 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             canvas: Canvas::new(0, 0),
             last_title: title,
             high_surrogate: None,
+            frame_timer: None,
             touch: None,
             touch_travel: 0.0,
             touch_promoted: false,
+            touch_history: Vec::new(),
             left_down: false,
             last_mouse: (0.0, 0.0),
             handler_dark: system_prefers_dark(),
@@ -1955,9 +2106,31 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         update_window(hwnd);
 
         let mut msg: Msg = mem::zeroed();
-        while get_message_w(&mut msg, null_mut(), 0, 0) > 0 {
+        loop {
+            // The animation frame: signalled here, before anything else, so a
+            // stall in a handler can never push a *later* frame off the beat.
+            // The timeout does double duty as the frame pacing: a signal that
+            // has not arrived yet costs one timeout, and a whole interval is
+            // one wait either way. The pulse itself delivers an `Event::Frame`
+            // directly — the timer is a kernel object, not a window message,
+            // so without this nothing would consume the signal.
+            if let Some(t) = (*state).frame_timer {
+                // Wait only when the queue is empty: the pump must never sit
+                // on a timer beat with a click waiting behind it (up to one
+                // period of added input latency otherwise).
+                if peek_message_w(&mut msg, null_mut(), 0, 0, PM_NOREMOVE) == 0 {
+                    wait_for_single_object(t, FRAME_PERIOD_MS);
+                }
+                dispatch(&mut *state, hwnd, Event::Frame);
+            }
+            if get_message_w(&mut msg, null_mut(), 0, 0) <= 0 {
+                break;
+            }
             translate_message(&msg);
             dispatch_message_w(&msg);
+        }
+        if let Some(t) = (*state).frame_timer.take() {
+            close_handle(t);
         }
         drop(Box::from_raw(state));
         Ok(())
@@ -1968,8 +2141,8 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
 mod tests {
     use super::ffi::*;
     use super::{
-        end_gesture, maximize_metrics, timer_event, touch_action, State, TouchAction, TIMER_FRAME,
-        TIMER_TICK,
+        create_frame_timer, end_gesture, maximize_metrics, timer_event, touch_action, State,
+        TouchAction, TIMER_TICK,
     };
     use crate::platform::{Handler, Host};
     use crate::ui::event::{CursorShape, Event, MouseButton};
@@ -2030,9 +2203,11 @@ mod tests {
             canvas: crate::gfx::canvas::Canvas::new(8, 8),
             last_title: String::new(),
             high_surrogate: None,
+            frame_timer: None,
             touch: None,
             touch_travel: 0.0,
             touch_promoted: false,
+            touch_history: Vec::new(),
             left_down: false,
             last_mouse: (0.0, 0.0),
             handler_dark: false,
@@ -2075,18 +2250,39 @@ mod tests {
     }
 
     #[test]
-    fn the_two_timers_stay_told_apart() {
-        // Two clocks share `WM_TIMER`: the app's 40 ms heartbeat and the fast
-        // frame clock a glide runs on. Routing them by id is the whole of it,
-        // and crossing them would either stop a glide dead (frames arriving as
-        // ticks, which the app only advances at 25 Hz) or run the caret blink
-        // and drag auto-scroll at 64 Hz.
+    fn wm_timer_means_heartbeat_only() {
+        // Frame pacing is a waitable timer signalled in `run`, never a user
+        // timer: a `WM_TIMER` with a 1 ms request coalesces to the 15.6 ms
+        // system tick, which is half a display frame late per beat. So the one
+        // user timer is the app's 40 ms heartbeat, and every id of it means
+        // `Tick`.
         assert!(matches!(timer_event(TIMER_TICK), Event::Tick));
-        assert!(matches!(timer_event(TIMER_FRAME), Event::Frame));
-        assert_ne!(
-            TIMER_TICK, TIMER_FRAME,
-            "one id for both means one timer cancels the other"
-        );
+        assert!(matches!(timer_event(99), Event::Tick));
+    }
+
+    #[test]
+    fn the_frame_timer_is_a_high_resolution_waitable() {
+        // The animation clock must exist and be periodic: created on demand,
+        // pulsed every FRAME_PERIOD_MS, and closed again when the coast ends.
+        unsafe {
+            let t = create_frame_timer().expect("waitable timers exist on this Windows");
+            // One beat arrives within a couple of periods.
+            let t0 = std::time::Instant::now();
+            assert_eq!(
+                wait_for_single_object(t, 500),
+                0u32 /* WAIT_OBJECT_0 */
+            );
+            let dt = t0.elapsed();
+            close_handle(t);
+            assert!(
+                dt >= std::time::Duration::from_millis(1),
+                "the first pulse waits for the period, not 0 ms: {dt:?}"
+            );
+            assert!(
+                dt < std::time::Duration::from_millis(200),
+                "the first pulse arrives near the period: {dt:?}"
+            );
+        }
     }
 
     #[test]

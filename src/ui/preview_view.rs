@@ -118,8 +118,10 @@ pub fn v_geom(area: Rect, content: f32, scroll: f32, m: PaneMetrics) -> Option<S
 }
 
 /// Horizontal bar for the no-wrap editor lines. `None` when they fit.
+/// Callers pass the gutter-inset area (see [`PreviewView::h_sb`]): the bar
+/// lives right of the line-number rail so the gutter never paints over it.
 pub fn h_geom(area: Rect, h_max: f32, h_offset: f32, m: PaneMetrics) -> Option<SbGeom> {
-    if h_max <= 0.0 {
+    if h_max <= 0.0 || area.w <= 0.0 {
         return None;
     }
     let scale = m.scale;
@@ -332,8 +334,9 @@ impl PreviewView {
             }
         }
         self.paint_scrollbar(canvas, theme, area, scroll.y, m);
-        // Horizontal scrollbar for the no-wrap editor lines.
-        if let Some(g) = h_geom(area, scroll.h_max, scroll.h_offset, m) {
+        // Horizontal scrollbar for the no-wrap editor lines, inset right of
+        // the gutter rail (content_x) so the rail never paints over it.
+        if let Some(g) = self.h_sb(area, scroll, m) {
             let c = Color::rgba(theme.muted.r, theme.muted.g, theme.muted.b, 110);
             canvas.fill_rounded_rect(g.thumb, g.thumb.h / 2.0, c);
         }
@@ -362,8 +365,16 @@ impl PreviewView {
     }
 
     /// Horizontal scrollbar geometry (no-wrap editor lines), if scrollable.
+    /// Inset right of the gutter rail (`scroll.content_x`, 0 for previews)
+    /// so the rail — painted after the bar — never covers the thumb.
     pub fn h_sb(&self, area: Rect, scroll: PaneScroll, m: PaneMetrics) -> Option<SbGeom> {
-        h_geom(area, scroll.h_max, scroll.h_offset, m)
+        let bar = Rect::new(
+            area.x + scroll.content_x,
+            area.y,
+            (area.w - scroll.content_x).max(0.0),
+            area.h,
+        );
+        h_geom(bar, scroll.h_max, scroll.h_offset, m)
     }
 
     /// Hit zones of the overlay scrollbars for `area`, mirroring what
