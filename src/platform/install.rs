@@ -9,7 +9,8 @@ use crate::error::{Error, Result};
 
 #[cfg(all(
     any(target_os = "windows", readitor_check_win),
-    not(readitor_check_linux)
+    not(readitor_check_linux),
+    not(readitor_check_macos)
 ))]
 mod win {
     use super::*;
@@ -180,21 +181,24 @@ mod win {
 /// The exe path on Windows (FFI lives in the backend module).
 #[cfg(all(
     any(target_os = "windows", readitor_check_win),
-    not(readitor_check_linux)
+    not(readitor_check_linux),
+    not(readitor_check_macos)
 ))]
 use super::windows::exe_path;
 
 pub fn install() -> Result<()> {
     #[cfg(all(
         any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux)
+        not(readitor_check_linux),
+        not(readitor_check_macos)
     ))]
     {
         win::install()
     }
     #[cfg(not(all(
         any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux)
+        not(readitor_check_linux),
+        not(readitor_check_macos)
     )))]
     {
         Err(Error::Platform(
@@ -206,14 +210,16 @@ pub fn install() -> Result<()> {
 pub fn uninstall() -> Result<()> {
     #[cfg(all(
         any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux)
+        not(readitor_check_linux),
+        not(readitor_check_macos)
     ))]
     {
         win::uninstall()
     }
     #[cfg(not(all(
         any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux)
+        not(readitor_check_linux),
+        not(readitor_check_macos)
     )))]
     {
         Err(Error::Platform(

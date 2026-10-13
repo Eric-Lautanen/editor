@@ -102,6 +102,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
         };
         app.restore(&session.files, session.active, mode);
     }
+    // Reopen where the window was left — with or without a file argument, and
+    // maximized if that is how it was closed. The platform reads this back
+    // while creating the window.
+    app.restore_window(session.window, session.maximized);
     if o.pretty {
         return pretty_print(o.file.as_deref());
     }

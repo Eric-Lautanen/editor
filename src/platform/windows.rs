@@ -19,7 +19,7 @@ use crate::{
     error::{Error, Result},
     gfx::canvas::Canvas,
     ui::{
-        event::{CursorShape, Event, Key, Modifiers, MouseButton},
+        event::{CursorShape, Event, Key, Modifiers, MouseButton, WindowGeometry},
         titlebar::TitleHit,
     },
 };
@@ -254,7 +254,12 @@ mod ffi {
 
     // Window messages
     pub const WM_DESTROY: u32 = 0x0002;
+    /// The window moved; the app's remembered rect follows it.
+    pub const WM_MOVE: u32 = 0x0003;
     pub const WM_SIZE: u32 = 0x0005;
+    /// Focus loss (Alt+Tab, another window activated). A client drag holds the
+    /// mouse, so losing focus means the release is no longer ours to receive.
+    pub const WM_KILLFOCUS: u32 = 0x0008;
     /// Sent before a size/position change; the hook for clamping maximize to
     /// the monitor work area so a borderless window does not bury the taskbar.
     pub const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -280,8 +285,16 @@ mod ffi {
     pub const WM_MBUTTONUP: u32 = 0x0208;
     pub const WM_MOUSEWHEEL: u32 = 0x020A;
     pub const WM_MOUSEHWHEEL: u32 = 0x020E;
+    /// Capture changed hands, so the button-up now belongs to whoever holds it;
+    /// `end_gesture` is the reconciliation point for this and `WM_KILLFOCUS`.
+    pub const WM_CAPTURECHANGED: u32 = 0x0215;
     pub const WM_DROPFILES: u32 = 0x0233;
     pub const WM_TIMER: u32 = 0x0113;
+    /// `WM_TIMER` ids. `TIMER_TICK` is the app's slow heartbeat (caret blink,
+    /// drag auto-scroll); `TIMER_FRAME` only runs while something is animating,
+    /// which is what a glide needs and what 40 ms cannot give it.
+    pub const TIMER_TICK: usize = 1;
+    pub const TIMER_FRAME: usize = 2;
     pub const WM_TOUCH: u32 = 0x0240;
     pub const WM_DPICHANGED: u32 = 0x02E0;
     pub const WM_SETICON: u32 = 0x0080;
@@ -290,10 +303,16 @@ mod ffi {
     /// `ICON_BIG` wParam for `WM_SETICON`.
     pub const ICON_BIG: usize = 1;
 
-    // Touch input flags (TOUCHEVENTF_*)
-    pub const TOUCHEVENTF_DOWN: u32 = 0x0000_0001;
-    pub const TOUCHEVENTF_MOVE: u32 = 0x0000_0002;
+    // Touch input flags (TOUCHEVENTF_*). The values are Win32's, in the order
+    // Win32 declares them — MOVE is 0x1 and DOWN is 0x2, which is the opposite
+    // of what reading the names suggests. With them swapped a finger drag does
+    // nothing but end in a synthetic click at the release point (see
+    // [`touch_action`]).
+    pub const TOUCHEVENTF_MOVE: u32 = 0x0000_0001;
+    pub const TOUCHEVENTF_DOWN: u32 = 0x0000_0002;
     pub const TOUCHEVENTF_UP: u32 = 0x0000_0004;
+    /// The first contact of a gesture: the one a pan should follow.
+    pub const TOUCHEVENTF_PRIMARY: u32 = 0x0000_0010;
 
     // Theme detection (registry)
     pub const WM_SETTINGCHANGE: u32 = 0x001A;
@@ -349,6 +368,12 @@ mod ffi {
     // System metrics
     pub const SM_CXSCREEN: i32 = 0;
     pub const SM_CYSCREEN: i32 = 1;
+    /// Virtual screen (every monitor, which is the desktop a remembered rect
+    /// has to be reachable on).
+    pub const SM_XVIRTUALSCREEN: i32 = 76;
+    pub const SM_YVIRTUALSCREEN: i32 = 77;
+    pub const SM_CXVIRTUALSCREEN: i32 = 78;
+    pub const SM_CYVIRTUALSCREEN: i32 = 79;
     pub const SM_CXFRAME: i32 = 32;
     pub const SM_CYFRAME: i32 = 33;
     pub const SM_CXPADDEDBORDER: i32 = 92;
@@ -433,6 +458,25 @@ mod ffi {
             flags: u32,
             template: Handle,
         ) -> Handle;
+        #[link_name = "GetFileSizeEx"]
+        pub fn get_file_size_ex(handle: Handle, size: *mut i64) -> i32;
+        #[link_name = "CreateFileMappingW"]
+        pub fn create_file_mapping_w(
+            file: Handle,
+            attributes: *mut c_void,
+            protect: u32,
+            max_high: u32,
+            max_low: u32,
+            name: *const u16,
+        ) -> Handle;
+        #[link_name = "MapViewOfFile"]
+        pub fn map_view_of_file(
+            mapping: Handle,
+            access: u32,
+            high: u32,
+            low: u32,
+            bytes: usize,
+        ) -> *mut c_void;
     }
 
     #[link(name = "user32")]
@@ -488,6 +532,10 @@ mod ffi {
         pub fn set_window_long_ptr_w(hwnd: Hwnd, index: i32, value: isize) -> isize;
         #[link_name = "GetWindowLongPtrW"]
         pub fn get_window_long_ptr_w(hwnd: Hwnd, index: i32) -> isize;
+        /// The window's full rect (identical to the client rect here: the
+        /// borderless `WM_NCCALCSIZE` leaves no frame to subtract).
+        #[link_name = "GetWindowRect"]
+        pub fn get_window_rect(hwnd: Hwnd, rect: *mut Rect) -> i32;
         #[link_name = "SetWindowPos"]
         pub fn set_window_pos(
             hwnd: Hwnd,
@@ -514,6 +562,15 @@ mod ffi {
         pub fn is_clipboard_format_available(format: u32) -> i32;
         #[link_name = "SetCursor"]
         pub fn set_cursor(cursor: Handle) -> Handle;
+        /// Hold the mouse for as long as our own drag runs (a scrollbar thumb,
+        /// a text selection). A borderless window has no implicit capture: the
+        /// release is delivered to whatever is under the pointer, so letting
+        /// go outside the client area silently loses the `MouseUp` the app's
+        /// drags end on.
+        #[link_name = "SetCapture"]
+        pub fn set_capture(hwnd: Hwnd) -> Hwnd;
+        #[link_name = "ReleaseCapture"]
+        pub fn release_capture() -> i32;
         #[link_name = "ScreenToClient"]
         pub fn screen_to_client(hwnd: Hwnd, pt: *mut Point) -> i32;
         #[link_name = "IsZoomed"]
@@ -528,6 +585,8 @@ mod ffi {
         pub fn get_cursor_pos(pt: *mut Point) -> i32;
         #[link_name = "SetTimer"]
         pub fn set_timer(hwnd: Hwnd, id: usize, ms: u32, proc: *const c_void) -> usize;
+        #[link_name = "KillTimer"]
+        pub fn kill_timer(hwnd: Hwnd, id: usize) -> i32;
         #[link_name = "RegisterTouchWindow"]
         pub fn register_touch_window(hwnd: Hwnd, flags: u32) -> i32;
         #[link_name = "GetTouchInputInfo"]
@@ -651,6 +710,37 @@ use ffi::*;
 /// Touch travel (client px) under which a contact is a tap rather than a pan.
 const TAP_SLOP: f32 = 8.0;
 
+/// What one `TOUCHINPUT` contact is asking for, decoded from its flags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TouchAction {
+    /// Not a phase this handler acts on (a hover, a palm, a pen).
+    Ignore,
+    Down,
+    Move,
+    Up,
+}
+
+/// Decode a touch contact's flags.
+///
+/// This is split out from the message handler because the failure mode of
+/// getting the bits wrong is invisible: the flags arrive from the driver as
+/// `0x1A` on contact, `0x19` per move and `0x14` on lift-off, so reading
+/// `TOUCHEVENTF_DOWN` as `0x1` (its name order, not its value) makes every
+/// *down* look like a move — the pan never dispatches anything — and every
+/// *move* look like a down, which resets the travel counter and ends the
+/// gesture in a synthetic click where the finger came up.
+fn touch_action(flags: u32) -> TouchAction {
+    if flags & TOUCHEVENTF_DOWN != 0 {
+        TouchAction::Down
+    } else if flags & TOUCHEVENTF_MOVE != 0 {
+        TouchAction::Move
+    } else if flags & TOUCHEVENTF_UP != 0 {
+        TouchAction::Up
+    } else {
+        TouchAction::Ignore
+    }
+}
+
 // ---------------------------------------------------------------- state & host
 
 struct State {
@@ -666,6 +756,14 @@ struct State {
     /// A mouse message arrived while a touch was live (Windows promotes touch
     /// to mouse input). A tap then needs no synthetic click — the OS sent one.
     touch_promoted: bool,
+    /// Left button held inside the client area. The app's drags last exactly
+    /// that long and end only on `MouseUp`, so this is the platform's record of
+    /// the gesture the app believes is in flight: `end_gesture` needs it to
+    /// know whether a lost release still has to be delivered.
+    left_down: bool,
+    /// Last client-space pointer position, so a synthesized release lands
+    /// where the pointer was last seen rather than at the origin.
+    last_mouse: (f32, f32),
     /// OS dark preference as last seen; WM_SETTINGCHANGE compares against it.
     handler_dark: bool,
 }
@@ -683,6 +781,20 @@ struct WinHost {
 impl Host for WinHost {
     fn request_redraw(&mut self) {
         unsafe { invalidate_rect(self.hwnd, null(), 0) };
+    }
+    /// Start (or stop) the fast frame clock. `WM_TIMER` is coalesced to the
+    /// system tick — 15.6 ms by default, whatever period is asked for — so this
+    /// runs at ~64 Hz, which is at or above a typical display's refresh and far
+    /// off the 25 Hz heartbeat a glide would otherwise advance on. The timer is
+    /// killed again the moment nothing is moving, so it costs nothing at rest.
+    fn set_animating(&mut self, on: bool) {
+        unsafe {
+            if on {
+                set_timer(self.hwnd, TIMER_FRAME, 1, null());
+            } else {
+                kill_timer(self.hwnd, TIMER_FRAME);
+            }
+        }
     }
     fn set_title(&mut self, title: &str) {
         let w = wide(title);
@@ -873,6 +985,62 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Read-only view of a file that lives as long as the process (see
+/// `platform::map_file`): `None` for anything that cannot be mapped, which is
+/// the caller's cue to read the file instead.
+///
+/// The handle and the section are deliberately left open, because the slice
+/// handed out borrows the view for `'static`. Sharing is read/write/delete —
+/// the same choice the browsers' font loaders make — so mapping a font never
+/// locks it against an installer or another process; the price is that
+/// overwriting a mapped font in place is undefined for us, which for a
+/// system-installed font under a running viewer is not a real case.
+pub fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
+    // GENERIC_READ | share all | OPEN_EXISTING | FILE_ATTRIBUTE_NORMAL.
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const PAGE_READONLY: u32 = 0x02;
+    const FILE_MAP_READ: u32 = 0x0004;
+    /// `CreateFileW`'s failure value; the `HANDLE` type here is a raw pointer
+    /// (see `ffi`), so it is not `null`.
+    const INVALID_HANDLE_VALUE: Handle = usize::MAX as *mut c_void;
+    unsafe {
+        let name = wide(&path.to_string_lossy());
+        let file = create_file_w(
+            name.as_ptr(),
+            GENERIC_READ,
+            SHARE_ALL,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        );
+        if file == INVALID_HANDLE_VALUE || file.is_null() {
+            return None;
+        }
+        let mut size: i64 = 0;
+        if get_file_size_ex(file, &mut size) == 0 || size <= 0 {
+            close_handle(file);
+            return None;
+        }
+        // A zero-sized section is an error, hence the size check above.
+        let mapping = create_file_mapping_w(file, null_mut(), PAGE_READONLY, 0, 0, null());
+        if mapping.is_null() {
+            close_handle(file);
+            return None;
+        }
+        let view = map_view_of_file(mapping, FILE_MAP_READ, 0, 0, 0) as *const u8;
+        if view.is_null() {
+            close_handle(mapping);
+            close_handle(file);
+            return None;
+        }
+        Some(std::slice::from_raw_parts(view, size as usize))
+    }
+}
+
 /// The user's Documents folder as a NUL-terminated UTF-16 path, or `None`
 /// when the shell cannot resolve it (the dialog then uses its own default).
 fn documents_dir() -> Option<Vec<u16>> {
@@ -1023,12 +1191,16 @@ fn frame_inset_y() -> i32 {
     unsafe { (get_system_metrics(SM_CYFRAME) + get_system_metrics(SM_CXPADDEDBORDER)).max(4) }
 }
 
-/// Logical thickness (96-dpi px) of the strip along the window edge where a
-/// press starts a resize. Deliberately the classic sizing-border width and
-/// *not* the frame metric: `SM_CXFRAME` reports 8 px on current Windows, and a
-/// wide strip forces the overlay scrollbar to float away from the edge to stay
-/// clickable (strip and bar cannot share pixels).
-const EDGE_GRIP_LOGICAL: f32 = 4.0;
+/// Logical thickness (96-dpi px) of the widest strip along the window edge
+/// where a press starts a resize: the classic sizing border, matching what
+/// Windows itself gives a `WS_THICKFRAME` window (8 px on current Windows, and
+/// smaller where the theme or a user's accessibility settings say so).
+///
+/// This is the *maximum* the backend offers. A wide strip forces an overlay
+/// scrollbar to float away from the edge to stay clickable (strip and bar
+/// cannot share pixels), so the app narrows it to just the points where a bar
+/// needs the pixels — see `Handler::grip_at`.
+const EDGE_BAND_LOGICAL: f32 = 8.0;
 
 /// `hwnd`'s monitor DPI as a 96-dpi scale factor.
 fn dpi_scale(hwnd: Hwnd) -> f32 {
@@ -1042,14 +1214,14 @@ fn dpi_scale(hwnd: Hwnd) -> f32 {
 
 /// Physical resize strip width for `hwnd`'s monitor DPI.
 fn resize_band(hwnd: Hwnd) -> i32 {
-    (EDGE_GRIP_LOGICAL * dpi_scale(hwnd)).round().max(2.0) as i32
+    (EDGE_BAND_LOGICAL * dpi_scale(hwnd)).round().max(2.0) as i32
 }
 
-/// The window-edge strip this backend claims for resizing, in logical px.
-/// `App` scales it by the window DPI and keeps its overlay scrollbars clear of
-/// it (see `platform::edge_grip`).
+/// The widest window-edge strip this backend claims for resizing, in logical
+/// px. `App` scales it by the window DPI and keeps its overlay scrollbars clear
+/// of it (see `platform::edge_grip`).
 pub fn edge_grip() -> f32 {
-    EDGE_GRIP_LOGICAL
+    EDGE_BAND_LOGICAL
 }
 
 /// Maximize geometry for a borderless window, as `WM_GETMINMAXINFO` wants it:
@@ -1110,6 +1282,17 @@ fn map_key(vk: u32, mods: Modifiers) -> Option<Key> {
 
 // ---------------------------------------------------------------- window proc
 
+/// Which event a `WM_TIMER` id means. Two clocks share the one message, so the
+/// id is the whole routing: the frame timer is a glide's clock, and the other
+/// one is the app's heartbeat (caret blink, drag auto-scroll).
+fn timer_event(id: usize) -> Event {
+    if id == TIMER_FRAME {
+        Event::Frame
+    } else {
+        Event::Tick
+    }
+}
+
 /// Deliver an event, then sync the window title if the app's title changed.
 fn dispatch(st: &mut State, hwnd: Hwnd, ev: Event) {
     let mut host = WinHost { hwnd };
@@ -1119,6 +1302,60 @@ fn dispatch(st: &mut State, hwnd: Hwnd, ev: Event) {
         host.set_title(&t);
         st.last_title = t;
     }
+}
+
+/// Deliver the release that is not coming.
+///
+/// The app's drags — a scrollbar thumb, a text selection — end on `MouseUp` and
+/// on nothing else, so the platform has to produce that event on every path
+/// where the real one cannot arrive: capture taken away mid-drag, or the window
+/// deactivated (Alt+Tab) with the button still down. Without this the drag
+/// survives the release and keeps following the pointer, which is exactly what
+/// a bar does when the pointer is let go outside the client area and Windows
+/// hands the `WM_LBUTTONUP` to whatever is under it.
+///
+/// Idempotent, and only ever fires when a press is still on the books, so the
+/// normal path (release with the button down) must clear `left_down` first —
+/// `release_capture` re-enters this window proc with `WM_CAPTURECHANGED`.
+fn end_gesture(st: &mut State, hwnd: Hwnd) {
+    if !st.left_down {
+        return;
+    }
+    st.left_down = false;
+    let (x, y) = st.last_mouse;
+    dispatch(
+        st,
+        hwnd,
+        Event::MouseUp {
+            x,
+            y,
+            button: MouseButton::Left,
+        },
+    );
+}
+
+/// Tell the app where the window is and whether it is maximized.
+///
+/// The app remembers only the normal rect (the place to reopen at), so this
+/// fires for every OS-driven change — `WM_MOVE`, `WM_SIZE`, and the maximize
+/// the window manager does on its own (double-clicking the title bar, Aero
+/// Snap, a monitor coming back) — and not just for the ones the app asked for.
+unsafe fn report_geometry(st: &mut State, hwnd: Hwnd) {
+    let mut r: Rect = mem::zeroed();
+    if get_window_rect(hwnd, &mut r) == 0 {
+        return;
+    }
+    dispatch(
+        st,
+        hwnd,
+        Event::WindowGeometry(WindowGeometry {
+            x: r.left,
+            y: r.top,
+            width: (r.right - r.left).max(0) as u32,
+            height: (r.bottom - r.top).max(0) as u32,
+            maximized: is_zoomed(hwnd) != 0,
+        }),
+    );
 }
 
 unsafe fn paint(hwnd: Hwnd, st: &mut State) {
@@ -1249,10 +1486,17 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                 return HTCLIENT;
             }
             if is_zoomed(hwnd) == 0 {
-                let (fx, fy) = (resize_band(hwnd), resize_band(hwnd));
                 let (x, y) = (pt.x, pt.y);
-                let (w, h) = (st.canvas.width as i32, st.canvas.height as i32);
-                let edge = match (x < fx, x >= w - fx, y < fy, y >= h - fy) {
+                let (w, h) = (st.canvas.width, st.canvas.height);
+                // Self-tuning: the app gives the points it draws on back to
+                // itself (see `Handler::grip_at`), the rest of the edge keeps
+                // the full band. Evaluated per point, so a bar can hold the
+                // strip at its own pixels while the band widens around it.
+                let band = resize_band(hwnd) as f32;
+                let g = st.handler.grip_at(x as f32, y as f32, band);
+                let (px, py) = (x as f32, y as f32);
+                let (w, h) = (w as f32, h as f32);
+                let edge = match (px < g, px >= w - g, py < g, py >= h - g) {
                     (true, _, true, _) => HTTOPLEFT,
                     (true, _, _, true) => HTBOTTOMLEFT,
                     (_, true, true, _) => HTTOPRIGHT,
@@ -1314,7 +1558,14 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                 mem::size_of::<TouchInput>() as u32,
             ) != 0
             {
+                // A two-finger gesture reports both contacts: follow the
+                // primary one, or the pan would jump between fingers. A
+                // digitizer that marks none still pans.
+                let marked = inputs.iter().any(|t| t.flags & TOUCHEVENTF_PRIMARY != 0);
                 for t in &inputs {
+                    if marked && t.flags & TOUCHEVENTF_PRIMARY == 0 {
+                        continue;
+                    }
                     // TOUCHINPUT coordinates are screen px × 100; the app
                     // speaks client px.
                     let mut pt = Point {
@@ -1323,20 +1574,22 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                     };
                     screen_to_client(hwnd, &mut pt);
                     let (x, y) = (pt.x as f32, pt.y as f32);
-                    if t.flags & TOUCHEVENTF_DOWN != 0 {
+                    if touch_action(t.flags) == TouchAction::Down && st.touch.is_none() {
                         st.touch = Some((x, y));
                         st.touch_travel = 0.0;
                         st.touch_promoted = false;
-                    } else if t.flags & TOUCHEVENTF_MOVE != 0 {
+                    } else if touch_action(t.flags) == TouchAction::Move {
                         if let Some((lx, ly)) = st.touch {
                             let (dx, dy) = (x - lx, y - ly);
                             st.touch_travel += dx.abs() + dy.abs();
                             if dx != 0.0 || dy != 0.0 {
-                                dispatch(st, hwnd, Event::Scroll { dx, dy });
+                                // A finger is direct manipulation: `Pan`, not a
+                                // wheel-like step the app may glide to.
+                                dispatch(st, hwnd, Event::Pan { dx, dy });
                             }
                         }
                         st.touch = Some((x, y));
-                    } else if t.flags & TOUCHEVENTF_UP != 0 {
+                    } else if touch_action(t.flags) == TouchAction::Up {
                         // A tap's promoted click was swallowed above, so issue
                         // one here. (When the OS did promote, it already
                         // delivered the click and we must not double it.)
@@ -1380,8 +1633,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             def_window_proc_w(hwnd, msg, wp, lp)
         }
         WM_TIMER => {
-            // Heartbeat for drag auto-scroll at pane edges.
-            dispatch(st, hwnd, Event::Tick);
+            dispatch(st, hwnd, timer_event(wp));
             0
         }
         WM_DROPFILES => {
@@ -1407,6 +1659,9 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
         }
         WM_ERASEBKGND => 1, // we paint every pixel; avoids flicker
         WM_SIZE => {
+            // Anything but a minimize is a real geometry change — including a
+            // maximize the app never asked for — so `report_geometry` reads the
+            // rect and the maximized state back off the window.
             if wp != SIZE_MINIMIZED {
                 let (w, h) = (loword(lp) as usize, hiword(lp) as usize);
                 if w > 0 && h > 0 {
@@ -1423,7 +1678,12 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                     );
                     invalidate_rect(hwnd, null(), 0);
                 }
+                report_geometry(st, hwnd);
             }
+            0
+        }
+        WM_MOVE => {
+            report_geometry(st, hwnd);
             0
         }
         WM_DPICHANGED => {
@@ -1473,6 +1733,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
         }
         WM_MOUSEMOVE => {
             let (x, y) = xy(lp);
+            st.last_mouse = (x, y);
             dispatch(st, hwnd, Event::MouseMove { x, y });
             0
         }
@@ -1483,6 +1744,15 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                 WM_RBUTTONDOWN => MouseButton::Right,
                 _ => MouseButton::Middle,
             };
+            st.last_mouse = (x, y);
+            if button == MouseButton::Left {
+                // Hold the mouse for the gesture. A borderless window gets no
+                // implicit capture, so without this a drag that leaves the
+                // client area loses its release and the app's thumb stays
+                // glued to the pointer (see `end_gesture`).
+                st.left_down = true;
+                set_capture(hwnd);
+            }
             dispatch(st, hwnd, Event::MouseDown { x, y, button });
             0
         }
@@ -1493,8 +1763,35 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                 WM_RBUTTONUP => MouseButton::Right,
                 _ => MouseButton::Middle,
             };
+            st.last_mouse = (x, y);
+            if button == MouseButton::Left {
+                // The real release: off the books before capture goes back, or
+                // the `WM_CAPTURECHANGED` that follows would fulfil the
+                // gesture a second time.
+                st.left_down = false;
+            }
             dispatch(st, hwnd, Event::MouseUp { x, y, button });
+            if button == MouseButton::Left {
+                release_capture();
+            }
             0
+        }
+        WM_CAPTURECHANGED => {
+            // The release will be delivered elsewhere: fulfil it now so the
+            // app is not left holding a thumb.
+            end_gesture(st, hwnd);
+            def_window_proc_w(hwnd, msg, wp, lp)
+        }
+        WM_KILLFOCUS => {
+            // A touch stream that never saw its `TOUCHEVENTF_UP` (contact lost,
+            // window deactivated mid-touch) would hold `st.touch` forever, and
+            // with it swallow every mouse message — the mouse is dead until the
+            // app is restarted. Losing focus cancels the stream, so the same
+            // applies to the button it is holding.
+            st.touch = None;
+            st.touch_promoted = false;
+            end_gesture(st, hwnd);
+            def_window_proc_w(hwnd, msg, wp, lp)
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             // HIWORD(wParam) is a signed delta in multiples of 120 (WHEEL_DELTA).
@@ -1583,6 +1880,30 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             return Err(Error::Platform("RegisterClassExW failed".into()));
         }
 
+        // Where to open: the rect the last session was closed at when the
+        // monitors we have now can still show it, else centered on the primary
+        // screen (CW_USEDEFAULT parks a WS_POPUP window in the top-left
+        // corner). Read before the handler moves into `State`.
+        let asked = handler.initial_window();
+        let maximized = asked.is_some_and(|g| g.maximized);
+        let (win_w, win_h) = (1100, 800);
+        let (sx, sy) = (
+            get_system_metrics(SM_CXSCREEN),
+            get_system_metrics(SM_CYSCREEN),
+        );
+        let centered = if sx > 0 && sy > 0 {
+            ((sx - win_w) / 2, (sy - win_h) / 2, win_w, win_h)
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT, win_w, win_h)
+        };
+        let desktop = (
+            get_system_metrics(SM_XVIRTUALSCREEN),
+            get_system_metrics(SM_YVIRTUALSCREEN),
+            get_system_metrics(SM_CXVIRTUALSCREEN),
+            get_system_metrics(SM_CYVIRTUALSCREEN),
+        );
+        let (x, y, win_w, win_h) = super::open_at(asked, desktop, centered);
+
         let title = handler.title();
         let title_w = wide(&title);
         let state = Box::into_raw(Box::new(State {
@@ -1593,21 +1914,11 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             touch: None,
             touch_travel: 0.0,
             touch_promoted: false,
+            left_down: false,
+            last_mouse: (0.0, 0.0),
             handler_dark: system_prefers_dark(),
         }));
 
-        // Center the window on the primary monitor (CW_USEDEFAULT parks a
-        // WS_POPUP window in the top-left corner).
-        let (win_w, win_h) = (1100, 800);
-        let (sx, sy) = (
-            get_system_metrics(SM_CXSCREEN),
-            get_system_metrics(SM_CYSCREEN),
-        );
-        let (x, y) = if sx > 0 && sy > 0 {
-            ((sx - win_w) / 2, (sy - win_h) / 2)
-        } else {
-            (CW_USEDEFAULT, CW_USEDEFAULT)
-        };
         let hwnd = create_window_ex_w(
             0,
             class.as_ptr(),
@@ -1630,14 +1941,17 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         }
         drag_accept_files(hwnd, 1);
         register_touch_window(hwnd, 0);
-        set_timer(hwnd, 1, 40, null());
+        set_timer(hwnd, TIMER_TICK, 40, null());
         if !icon.is_null() {
             // The class icon covers most of the shell; WM_SETICON is what the
             // taskbar and Alt-Tab actually read.
             send_message_w(hwnd, WM_SETICON, ICON_SMALL, icon as isize);
             send_message_w(hwnd, WM_SETICON, ICON_BIG, icon as isize);
         }
-        show_window(hwnd, SW_SHOW);
+        // A session that ended maximized opens maximized — at the normal rect,
+        // so un-maximizing lands where the user left it (and the rect the app
+        // keeps for the next restore is never the work area).
+        show_window(hwnd, if maximized { SW_MAXIMIZE } else { SW_SHOW });
         update_window(hwnd);
 
         let mut msg: Msg = mem::zeroed();
@@ -1653,8 +1967,127 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::ffi::*;
-    use super::maximize_metrics;
+    use super::{
+        end_gesture, maximize_metrics, timer_event, touch_action, State, TouchAction, TIMER_FRAME,
+        TIMER_TICK,
+    };
+    use crate::platform::{Handler, Host};
+    use crate::ui::event::{CursorShape, Event, MouseButton};
+    use crate::ui::titlebar::TitleHit;
     use std::ptr::null_mut;
+
+    /// Stands in for `App`: records what the platform hands over, and never
+    /// touches a window (the tests below pass a null handle, which a real
+    /// `WinHost` call would choke on).
+    #[derive(Clone, Default)]
+    struct Recorder(std::rc::Rc<std::cell::RefCell<Vec<Event>>>);
+
+    impl Handler for Recorder {
+        fn on_event(&mut self, ev: Event, _host: &mut dyn Host) {
+            self.0.borrow_mut().push(ev);
+        }
+        fn paint(&mut self, _canvas: &mut crate::gfx::canvas::Canvas) {}
+        fn title(&self) -> String {
+            // Matches `State::last_title`, so `dispatch` never calls
+            // `SetWindowTextW` on the null handle.
+            String::new()
+        }
+        fn title_hit(&self, _x: f32, _y: f32) -> TitleHit {
+            TitleHit::Client
+        }
+        fn cursor_at(&self, _x: f32, _y: f32) -> CursorShape {
+            CursorShape::Arrow
+        }
+    }
+
+    #[test]
+    fn touch_contacts_decode_to_the_phase_they_are() {
+        // The flags a real touchscreen sends, captured from a live window: a
+        // contact arrives as `0x1A` (PRIMARY|INRANGE|DOWN), each move as
+        // `0x19` (PRIMARY|INRANGE|MOVE) and lift-off as `0x14` (PRIMARY|UP).
+        // With DOWN and MOVE swapped a finger drag dispatched nothing and
+        // ended in a click, which is how this was found.
+        assert_eq!(touch_action(0x1A), TouchAction::Down);
+        assert_eq!(touch_action(0x19), TouchAction::Move);
+        assert_eq!(touch_action(0x14), TouchAction::Up);
+        // Contact geometry without a phase (a hover, a palm) is not a gesture.
+        assert_eq!(touch_action(0x8), TouchAction::Ignore);
+        assert_eq!(touch_action(0x10), TouchAction::Ignore);
+        assert_eq!(touch_action(0), TouchAction::Ignore);
+        // A down that also carries other bits is still the start of a gesture.
+        assert_eq!(touch_action(0x1A | 0x8), TouchAction::Down);
+        // The values are Win32's, not the order the names read in.
+        assert_eq!(TOUCHEVENTF_MOVE, 0x1);
+        assert_eq!(TOUCHEVENTF_DOWN, 0x2);
+        assert_eq!(TOUCHEVENTF_UP, 0x4);
+        assert_eq!(TOUCHEVENTF_PRIMARY, 0x10);
+    }
+
+    fn state() -> (State, Recorder) {
+        let rec = Recorder::default();
+        let st = State {
+            handler: Box::new(rec.clone()),
+            canvas: crate::gfx::canvas::Canvas::new(8, 8),
+            last_title: String::new(),
+            high_surrogate: None,
+            touch: None,
+            touch_travel: 0.0,
+            touch_promoted: false,
+            left_down: false,
+            last_mouse: (0.0, 0.0),
+            handler_dark: false,
+        };
+        (st, rec)
+    }
+
+    #[test]
+    fn a_lost_release_is_delivered_exactly_once() {
+        // A press on the scrollbar holds the mouse, so a `WM_LBUTTONUP` that
+        // changes hands (another window grabs capture) or never comes (the
+        // window is deactivated mid-drag) has to be fulfilled here: the app's
+        // drags end on `MouseUp` and on nothing else, and a stranded thumb
+        // then follows the pointer for the rest of the session.
+        let (mut st, log) = state();
+        st.left_down = true;
+        st.last_mouse = (12.0, 34.0);
+        end_gesture(&mut st, null_mut());
+        let seen = log.0.borrow().clone();
+        assert_eq!(seen.len(), 1, "one release for one press: {seen:?}");
+        match seen[0] {
+            Event::MouseUp { x, y, button } => {
+                assert_eq!(
+                    (x, y, button),
+                    (12.0, 34.0, MouseButton::Left),
+                    "the release lands where the pointer was last seen"
+                );
+            }
+            ref other => panic!("expected the release, got {other:?}"),
+        }
+        // Both WM_KILLFOCUS and WM_CAPTURECHANGED fire for one Alt+Tab, and
+        // `release_capture` re-enters the window proc: the app must not have to
+        // defend against a second release for the same press.
+        end_gesture(&mut st, null_mut());
+        assert_eq!(log.0.borrow().len(), 1, "the release is owed only once");
+        // Nothing is owed when no press is on the books — an ordinary click
+        // ends on its own `WM_LBUTTONUP`.
+        end_gesture(&mut st, null_mut());
+        assert_eq!(log.0.borrow().len(), 1, "idle: nothing to deliver");
+    }
+
+    #[test]
+    fn the_two_timers_stay_told_apart() {
+        // Two clocks share `WM_TIMER`: the app's 40 ms heartbeat and the fast
+        // frame clock a glide runs on. Routing them by id is the whole of it,
+        // and crossing them would either stop a glide dead (frames arriving as
+        // ticks, which the app only advances at 25 Hz) or run the caret blink
+        // and drag auto-scroll at 64 Hz.
+        assert!(matches!(timer_event(TIMER_TICK), Event::Tick));
+        assert!(matches!(timer_event(TIMER_FRAME), Event::Frame));
+        assert_ne!(
+            TIMER_TICK, TIMER_FRAME,
+            "one id for both means one timer cancels the other"
+        );
+    }
 
     #[test]
     fn predefined_cursors_load() {

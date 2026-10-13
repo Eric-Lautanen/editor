@@ -21,12 +21,13 @@ panic = "abort"
 strip = true
 
 [lints.rust]
-# `--cfg readitor_check_win` (RUSTFLAGS) type-checks the Win32 backend from
-# Linux/macOS, and `--cfg readitor_check_linux` the X11 backend from
-# Windows/macOS; declare both so `cargo clippy` stays warning-free everywhere.
+# `--cfg readitor_check_win` / `readitor_check_linux` / `readitor_check_macos`
+# (RUSTFLAGS) type-check one platform backend from another OS — one per OS
+# backend, declared here so `cargo clippy` stays warning-free everywhere.
 # `feature = "mem-census"` gates the allocation-count allocator (src/mem.rs).
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(readitor_check_win)",
     "cfg(readitor_check_linux)",
+    "cfg(readitor_check_macos)",
     "cfg(feature, values(\"mem-census\"))",
 ] }

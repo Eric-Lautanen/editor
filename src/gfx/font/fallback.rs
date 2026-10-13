@@ -203,8 +203,41 @@ enum Want {
 /// order, and reading stops as soon as one of them carries the codepoint being
 /// asked about. A miss is remembered too, so a document full of CJK does not
 /// re-scan the symbol faces for every glyph.
+/// One face slot: where its bytes are, which directory in them describes it,
+/// and the parsed face once something has needed it.
+///
+/// A `.ttc` collection (Microsoft YaHei, PingFang, NotoSansCJK) holds several
+/// faces, and each parse copies per-face tables — so parsing every member of
+/// every candidate file eagerly buys nothing: a lookup stops at the first face
+/// that carries the codepoint, and faces past that point are never consulted.
+/// They are therefore parsed on demand here, which is safe because a face either
+/// carries a codepoint or it does not — the answer never depends on when it was
+/// parsed, only the cost does.
+struct Slot {
+    data: &'static [u8],
+    dir: u32,
+    face: Option<ttf::Face<'static>>,
+}
+
+impl Slot {
+    /// The parsed face, parsing it on first use. `None` for a member this
+    /// parser cannot read (CFF-flavoured, or malformed), cached as such so a
+    /// bad member is not re-parsed for every glyph.
+    fn get(&mut self) -> Option<&ttf::Face<'static>> {
+        if self.face.is_none() {
+            self.face = ttf::Face::parse_at(self.data, self.dir).ok();
+        }
+        self.face.as_ref()
+    }
+}
+
 pub(crate) struct Chain {
-    faces: Vec<ttf::Face<'static>>,
+    faces: Vec<Slot>,
+    /// Files brought in so far, and how many of those were *mapped* rather than
+    /// read into private heap (see [`Chain::load`]) — the difference is the
+    /// whole point of the mapping, so the tests assert on it.
+    files: usize,
+    mapped: usize,
     /// Index of the next monochrome candidate to try; earlier ones are loaded.
     next: usize,
     /// The same, for the colour candidates.
@@ -223,6 +256,8 @@ impl Chain {
     pub(crate) fn new() -> Self {
         Self {
             faces: Vec::new(),
+            files: 0,
+            mapped: 0,
             next: 0,
             next_colour: 0,
             resolved: HashMap::new(),
@@ -233,6 +268,30 @@ impl Chain {
     #[cfg(test)]
     pub(crate) fn loaded(&self) -> usize {
         self.faces.len()
+    }
+
+    /// Files opened so far and how many of them were mapped instead of read.
+    /// Zero-length and unreadable candidates count as neither.
+    #[cfg(test)]
+    pub(crate) fn file_stats(&self) -> (usize, usize) {
+        (self.files, self.mapped)
+    }
+
+    /// The face at `i`, parsing its member if that has not happened yet — for
+    /// tests that want to look at the face a codepoint resolved to.
+    #[cfg(test)]
+    fn face(&mut self, i: usize) -> Option<&ttf::Face<'static>> {
+        self.faces.get_mut(i)?.get()
+    }
+
+    /// How many members of every loaded file have been parsed, against how
+    /// many were brought in — the measure of the lazy parse.
+    #[cfg(test)]
+    fn parsed_members(&self) -> (usize, usize) {
+        (
+            self.faces.iter().filter(|s| s.face.is_some()).count(),
+            self.faces.len(),
+        )
     }
 
     /// The face carrying `cp` in presentation `p`, and its glyph id, loading
@@ -246,22 +305,43 @@ impl Chain {
         hit
     }
 
-    /// Read one candidate file and append its faces, returning the index of
-    /// the first face added.
+    /// Bring one candidate file into the process and append its faces,
+    /// returning the index of the first face added.
+    ///
+    /// The bytes are *mapped*, not read: a fallback font is the single largest
+    /// thing this app can allocate (Segoe UI Emoji is ~13 MB, Microsoft YaHei
+    /// ~20 MB), and pulling one in for a handful of glyphs used to cost every
+    /// byte of the file in private memory for the rest of the run. A mapping
+    /// keeps the untouched pages out of the working set entirely, shares the
+    /// pages we do read with every other process using the same font, and is
+    /// evictable under pressure — see `platform::map_file`. Reading is the
+    /// fallback where the platform cannot map (a zero-length file, macOS until
+    /// M9), and the data then has to be leaked: `Face` borrows it for `'static`
+    /// because a font held for the life of the process is exactly that.
     fn load(&mut self, path: &Path) -> Option<usize> {
-        let bytes = std::fs::read(path).ok()?;
-        // Leak once: `Face` borrows `'static` bytes, and a font held for the
-        // life of the process is exactly that. Each file is read at most once,
-        // and only when it is actually needed.
-        let data: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mapped = crate::platform::map_file(path);
+        let lost = mapped.is_none();
+        let data: &'static [u8] = match mapped {
+            Some(d) => d,
+            None => Box::leak(std::fs::read(path).ok()?.into_boxed_slice()),
+        };
+        // The mapping is the whole point being that this is small, so keep the
+        // count honest for `loaded_bytes` and the diagnostics below.
+        self.files += 1;
+        self.mapped += usize::from(!lost);
         let dirs = ttf::faces(data).ok()?;
+        if dirs.is_empty() {
+            return None;
+        }
         let first = self.faces.len();
         for dir in dirs {
-            if let Ok(face) = ttf::Face::parse_at(data, dir) {
-                self.faces.push(face);
-            }
+            self.faces.push(Slot {
+                data,
+                dir,
+                face: None,
+            });
         }
-        (self.faces.len() > first).then_some(first)
+        Some(first)
     }
 
     fn search(&mut self, cp: u32, p: Presentation) -> Option<(usize, u16)> {
@@ -274,7 +354,7 @@ impl Chain {
 
         // Anything already loaded that draws it the way we want wins, before
         // more disk is touched.
-        if let Some(hit) = Self::scan(&self.faces, 0, cp, want) {
+        if let Some(hit) = self.scan(0, cp, want) {
             return Some(hit);
         }
 
@@ -286,7 +366,7 @@ impl Chain {
                 let Some(first) = self.load(&path) else {
                     continue;
                 };
-                if let Some(hit) = Self::scan(&self.faces, first, cp, Want::Colour) {
+                if let Some(hit) = self.scan(first, cp, Want::Colour) {
                     return Some(hit);
                 }
             }
@@ -299,54 +379,54 @@ impl Chain {
             let Some(first) = self.load(&path) else {
                 continue;
             };
-            if let Some(hit) = Self::scan(&self.faces, first, cp, want) {
+            if let Some(hit) = self.scan(first, cp, want) {
                 return Some(hit);
             }
         }
 
         // Nothing drew it the preferred way. Whatever covers it at all is
         // better than a tofu box.
-        Self::scan(&self.faces, 0, cp, Want::Any)
+        self.scan(0, cp, Want::Any)
     }
 
-    /// First face at or after `from` that carries `cp`, matching `want`.
-    fn scan(
-        faces: &[ttf::Face<'static>],
-        from: usize,
-        cp: u32,
-        want: Want,
-    ) -> Option<(usize, u16)> {
-        faces.iter().enumerate().skip(from).find_map(|(i, f)| {
+    /// First face at or after `from` that carries `cp`, matching `want`,
+    /// parsing the members it walks past (see [`Slot`]).
+    fn scan(&mut self, from: usize, cp: u32, want: Want) -> Option<(usize, u16)> {
+        for i in from..self.faces.len() {
+            let Some(f) = self.faces[i].get() else {
+                continue;
+            };
             let gid = f.glyph_id(cp);
             // A cmap entry pointing past `loca` is a corrupt font — and a
             // byte-swapped slot is exactly how that happens. Treat it as "this
             // face does not carry the codepoint" rather than indexing out of
             // bounds downstream.
             if gid == 0 || gid >= f.num_glyphs() {
-                return None;
+                continue;
             }
             // A face "draws it in colour" only when it has a paint graph for
             // this glyph: a cmap entry alone is not enough.
             match want {
                 Want::Any => {}
-                Want::Colour if !f.has_colour(gid) => return None,
-                Want::Plain if f.has_colour(gid) => return None,
+                Want::Colour if !f.has_colour(gid) => continue,
+                Want::Plain if f.has_colour(gid) => continue,
                 _ => {}
             }
-            Some((i, gid))
-        })
+            return Some((i, gid));
+        }
+        None
     }
 
     /// Rasterize `cp` from the first face that carries it in presentation `p`.
     pub(crate) fn glyph(&mut self, cp: u32, p: Presentation, size: f32) -> Option<Rc<Glyph>> {
         let (i, gid) = self.resolve(cp, p)?;
-        self.faces[i].glyph_by_id(gid, size)
+        self.faces[i].get()?.glyph_by_id(gid, size)
     }
 
     /// Advance width for `cp` in presentation `p`, in the face that carries it.
     pub(crate) fn advance(&mut self, cp: u32, p: Presentation, size: f32) -> Option<f32> {
         let (i, gid) = self.resolve(cp, p)?;
-        Some(self.faces[i].advance_px(gid, size))
+        Some(self.faces[i].get()?.advance_px(gid, size))
     }
 }
 
@@ -356,6 +436,80 @@ mod tests {
 
     /// The presentation a caller gets when it does not look ahead.
     const D: Presentation = Presentation::Default;
+
+    /// A fallback font's bytes must never become live heap: the file is mapped,
+    /// not read (see [`Chain::load`]). A whole file read is ~20 MB for the CJK
+    /// faces, so this is the regression guard for the app's memory profile.
+    #[test]
+    fn a_fallback_font_is_mapped_and_not_retained_as_heap() {
+        let path = candidates()
+            .into_iter()
+            .chain(colour_candidates())
+            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() >= 4 * 1024 * 1024));
+        let Some(path) = path else {
+            return; // nothing large enough installed (bare CI)
+        };
+        let size = std::fs::metadata(&path).expect("size").len();
+        let before = crate::mem::snapshot().global_live;
+        let mut chain = Chain::new();
+        if chain.load(&path).is_none() {
+            return; // unreadable by this parser (CFF, say)
+        }
+        let grew = crate::mem::snapshot().global_live.saturating_sub(before);
+        let (files, mapped) = chain.file_stats();
+        assert_eq!(files, 1, "one file loaded");
+        // Elsewhere in the process the fallback is a read; there the file's
+        // bytes are live heap by necessity, so only the mapped case is the
+        // strong statement (and it is the case on Windows and Linux).
+        if mapped == 1 {
+            assert!(
+                grew < size / 2,
+                "loading {} ({size} B) grew live heap by {grew} B",
+                path.display()
+            );
+        }
+    }
+
+    /// Bringing a file in must not parse any of its members: the parse happens
+    /// when a lookup reaches one, so the members of a `.ttc` behind the
+    /// answering face never pay for their per-face tables.
+    #[test]
+    fn loading_a_file_parses_nothing_until_a_lookup_asks() {
+        let Some(path) = candidates().into_iter().find(|p| p.exists()) else {
+            return; // nothing installed (bare CI)
+        };
+        let mut chain = Chain::new();
+        if chain.load(&path).is_none() {
+            return; // unreadable by this parser
+        }
+        let (parsed, slots) = chain.parsed_members();
+        assert!(slots >= 1, "load() registered no members");
+        assert_eq!(
+            parsed, 0,
+            "load() parsed {parsed} of {slots} members eagerly"
+        );
+    }
+
+    /// A lookup parses the members it walks and no others, and repeating it
+    /// neither parses more nor resolves differently.
+    #[test]
+    fn a_lookup_parses_only_what_it_walks() {
+        let mut chain = Chain::new();
+        let Some(cp) = [0x4E2Du32, 0x6587, 0x1F600, 0x2192]
+            .into_iter()
+            .find(|&cp| chain.resolve(cp, D).is_some())
+        else {
+            return; // no font on this machine covers any of them
+        };
+        let (parsed, slots) = chain.parsed_members();
+        assert!(parsed <= slots, "{parsed} parsed of {slots} members");
+        chain.resolve(cp, D);
+        assert_eq!(
+            chain.parsed_members(),
+            (parsed, slots),
+            "a memoized lookup parsed more members"
+        );
+    }
 
     #[test]
     fn every_platform_offers_candidates_in_preference_order() {
@@ -402,14 +556,15 @@ mod tests {
     fn a_resolved_glyph_is_consistent_with_its_advance() {
         let mut chain = Chain::new();
         for cp in [0x2192u32, 0x1F600, 0x4E2D, 0x2603, 0x0C05] {
-            if let Some((i, gid)) = chain.resolve(cp, D) {
-                let face = &chain.faces[i];
-                assert!(gid != 0 && gid < face.num_glyphs(), "U+{cp:04X} gid {gid}");
-                assert!(
-                    face.advance_px(gid, 16.0) > 0.0,
-                    "U+{cp:04X} has a glyph but no advance"
-                );
-            }
+            let Some((i, gid)) = chain.resolve(cp, D) else {
+                continue;
+            };
+            let face = chain.face(i).expect("the face a codepoint resolved to");
+            assert!(gid != 0 && gid < face.num_glyphs(), "U+{cp:04X} gid {gid}");
+            assert!(
+                face.advance_px(gid, 16.0) > 0.0,
+                "U+{cp:04X} has a glyph but no advance"
+            );
         }
     }
 
@@ -438,12 +593,14 @@ mod tests {
             return; // no emoji face on this machine
         }
         for cp in [0x2764u32, 0x2603, 0x2192] {
-            if let Some((i, gid)) = chain.resolve(cp, D) {
-                assert!(
-                    !chain.faces[i].has_colour(gid),
-                    "U+{cp:04X} turned colour only because an emoji came first"
-                );
-            }
+            let Some((i, gid)) = chain.resolve(cp, D) else {
+                continue;
+            };
+            let face = chain.face(i).expect("the face a codepoint resolved to");
+            assert!(
+                !face.has_colour(gid),
+                "U+{cp:04X} turned colour only because an emoji came first"
+            );
         }
     }
 
@@ -456,7 +613,7 @@ mod tests {
         let Some((i, gid)) = chain.resolve(0x1F600, D) else {
             return; // no font on this machine covers it
         };
-        if !chain.faces[i].has_colour(gid) {
+        if !chain.face(i).is_some_and(|f| f.has_colour(gid)) {
             return; // no colour face installed
         }
         let g = chain.glyph(0x1F600, D, 32.0).expect("colour glyph");
@@ -499,8 +656,9 @@ mod tests {
         assert_eq!(chain.resolve(0x2764, Presentation::Text), plain);
         assert_eq!(chain.resolve(0x2764, Presentation::Emoji), emoji);
         if let (Some((i, gid)), Some(_)) = (plain, emoji) {
+            let face = chain.face(i).expect("the face the heart resolved to");
             assert!(
-                !chain.faces[i].has_colour(gid),
+                !face.has_colour(gid),
                 "the text form of the heart resolved to colour art"
             );
         }

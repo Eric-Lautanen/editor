@@ -11,18 +11,38 @@ use crate::{
     },
 };
 
-/// DPI scale plus the platform's window-edge resize grip, in physical px.
+/// Thickness (logical 96-dpi px) of the overlay scrollbars.
+pub const BAR_W_LOGICAL: f32 = 8.0;
+
+/// Largest share of its own thickness a bar gives up to the platform's resize
+/// strip. Half is the most that can go before the bar stops reading as flush
+/// with the window edge, and it keeps the *outer* half of the edge band with
+/// the app: the strip then never contains a bar pixel.
+pub const GRIP_SHARE: f32 = 0.5;
+
+/// The bar-safe resize strip at `scale`: what a scrollbar keeps clear of, and
+/// what a press on a bar asks the platform to give back. Derived rather than
+/// chosen — the platform's own band (`band`, physical px, `0.0` where the
+/// backend claims no edge grip) capped by [`GRIP_SHARE`] of a bar's thickness,
+/// so widening the band on a machine that allows it can never reintroduce the
+/// overlap the strip exists to avoid.
+pub fn bar_grip(scale: f32, band: f32) -> f32 {
+    (BAR_W_LOGICAL * GRIP_SHARE * scale).min(band).max(0.0)
+}
+
+/// DPI scale plus the window-edge resize strip that applies where a bar is, in
+/// physical px.
 ///
-/// The grip is the strip along the window border the OS claims for resizing.
-/// On a borderless window the client area reaches the very edge, so the
-/// overlay scrollbar hugs the edge but stops at the strip's boundary: its
-/// outer edge lands on `edge`, keeping the whole bar clickable without making
-/// it float away from the window edge (the strip itself is kept narrow for
-/// exactly this reason — see `platform::edge_grip`).
+/// The platform's resize band is the strip along the window border the OS
+/// claims for resizing; on a borderless window the client area reaches the very
+/// edge, so the overlay scrollbar hugs the edge but stops at the *bar-safe*
+/// strip's boundary (see [`bar_grip`]): its outer edge lands on `edge`, keeping
+/// the whole bar clickable without making it float away from the window edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PaneMetrics {
     pub scale: f32,
-    /// Resize-grip thickness at the window edges (0 where there is none).
+    /// Bar-safe resize-grip thickness at the window edges (0 where there is
+    /// none). Not the platform's full band — see [`bar_grip`].
     pub edge: f32,
 }
 
@@ -80,15 +100,16 @@ pub fn v_geom(area: Rect, content: f32, scroll: f32, m: PaneMetrics) -> Option<S
     }
     let scale = m.scale;
     let outer = area.right() - m.margin(); // bar's outer edge
-    let w = 8.0 * scale;
-    let track = area.h - 8.0 * scale;
+    let w = BAR_W_LOGICAL * scale;
+    let track = area.h - BAR_W_LOGICAL * scale;
     let thumb_h = (area.h / content * track).max(32.0 * scale).min(track);
     let mut geom = SbGeom {
         thumb: Rect::new(outer - w, 0.0, w, thumb_h),
         // The zone is the thumb plus slack *inward*; it never reaches past the
-        // bar into the resize strip.
+        // bar into the resize strip. `sb_at` keys the per-point grip on this
+        // zone, so the strip stays clear of every pixel it covers.
         zone: Rect::new(outer - w - 6.0 * scale, area.y, w + 6.0 * scale, area.h),
-        start: area.y + 4.0 * scale,
+        start: area.y + BAR_W_LOGICAL * 0.5 * scale,
         travel: track - thumb_h,
         max: content - area.h,
     };
@@ -103,21 +124,21 @@ pub fn h_geom(area: Rect, h_max: f32, h_offset: f32, m: PaneMetrics) -> Option<S
     }
     let scale = m.scale;
     let outer = area.bottom() - m.margin(); // bar's outer edge
-    let hgt = 8.0 * scale;
-    let track = area.w - 8.0 * scale;
+    let hgt = BAR_W_LOGICAL * scale;
+    let track = area.w - BAR_W_LOGICAL * scale;
     let thumb_w = (area.w / (h_max + area.w) * track)
         .max(32.0 * scale)
         .min(track);
     let travel = track - thumb_w;
     Some(SbGeom {
         thumb: Rect::new(
-            area.x + 4.0 * scale + (h_offset / h_max).clamp(0.0, 1.0) * travel,
+            area.x + BAR_W_LOGICAL * 0.5 * scale + (h_offset / h_max).clamp(0.0, 1.0) * travel,
             outer - hgt,
             thumb_w,
             hgt,
         ),
         zone: Rect::new(area.x, outer - hgt - 6.0 * scale, area.w, hgt + 6.0 * scale),
-        start: area.x + 4.0 * scale,
+        start: area.x + BAR_W_LOGICAL * 0.5 * scale,
         travel,
         max: h_max,
     })
@@ -444,29 +465,53 @@ mod tests {
     }
 
     #[test]
+    fn bar_grip_is_a_share_of_the_bar_capped_by_the_platform_band() {
+        // Derived rather than chosen, so the two things that must never
+        // overlap are related by construction: half a bar's thickness, capped
+        // by whatever the platform claims, and zero where it claims nothing.
+        assert_eq!(bar_grip(1.0, 8.0), BAR_W_LOGICAL * GRIP_SHARE);
+        assert_eq!(bar_grip(2.0, 16.0), BAR_W_LOGICAL * GRIP_SHARE * 2.0);
+        assert_eq!(bar_grip(1.0, 3.0), 3.0, "a narrow band is not widened");
+        assert_eq!(bar_grip(1.0, 0.0), 0.0);
+        for band in [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0] {
+            for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+                let g = bar_grip(scale, band);
+                assert!(g <= band + 0.001, "grip {g} exceeds the band {band}");
+                assert!(
+                    g <= BAR_W_LOGICAL * GRIP_SHARE * scale + 0.001,
+                    "grip {g} at scale {scale} eats into the bar"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bars_clear_the_window_edge_resize_grip() {
         // Regression: a borderless window's client area reaches the very edge,
         // so a scrollbar flush with the border sat inside the OS resize strip
         // and its thumb was nearly impossible to press. The bar must end at
-        // least one grip inside the window edge, on both axes.
+        // least one grip inside the window edge, on both axes. A grip wider
+        // than the bar is included: the geometry honours whatever strip it is
+        // handed, which is what keeps paint and hit testing in agreement.
         let area = Rect::new(0.0, 40.0, 400.0, 300.0);
-        let grip = 12.0;
-        let m = PaneMetrics::new(1.0, grip);
-        let v = v_geom(area, 3000.0, 500.0, m).unwrap();
-        assert!(v.thumb.right() <= area.right() - grip);
-        assert!(v.zone.right() <= area.right() - grip + 0.001);
-        // ...and still hugs the edge: the gap is the strip, not a wide inset.
-        assert!(area.right() - v.thumb.right() <= grip + 0.001);
-        assert!(
-            v.zone.contains(Point {
-                x: v.thumb.x + 1.0,
-                y: v.thumb.y + 1.0
-            }),
-            "the whole thumb stays inside the live zone"
-        );
-        let h = h_geom(area, 1200.0, 300.0, m).unwrap();
-        assert!(h.thumb.bottom() <= area.bottom() - grip);
-        assert!(h.zone.bottom() <= area.bottom() - grip + 0.001);
-        assert!(area.bottom() - h.thumb.bottom() <= grip + 0.001);
+        for grip in [bar_grip(1.0, 8.0), 12.0] {
+            let m = PaneMetrics::new(1.0, grip);
+            let v = v_geom(area, 3000.0, 500.0, m).unwrap();
+            assert!(v.thumb.right() <= area.right() - grip);
+            assert!(v.zone.right() <= area.right() - grip + 0.001);
+            // ...and still hugs the edge: the gap is the strip, not a wide inset.
+            assert!(area.right() - v.thumb.right() <= grip + 0.001);
+            assert!(
+                v.zone.contains(Point {
+                    x: v.thumb.x + 1.0,
+                    y: v.thumb.y + 1.0
+                }),
+                "the whole thumb stays inside the live zone"
+            );
+            let h = h_geom(area, 1200.0, 300.0, m).unwrap();
+            assert!(h.thumb.bottom() <= area.bottom() - grip);
+            assert!(h.zone.bottom() <= area.bottom() - grip + 0.001);
+            assert!(area.bottom() - h.thumb.bottom() <= grip + 0.001);
+        }
     }
 }

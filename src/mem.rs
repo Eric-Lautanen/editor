@@ -40,7 +40,10 @@
 //!     AtomicU64 and CURRENT to an AtomicU8; the call sites do not change.
 //!   - No alloc inside alloc(): the wrapper only does integer math against
 //!     `System`, never touches strings, maps, or formatting.
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+};
 
 const MAX_COMPONENTS: usize = 16;
 
@@ -101,15 +104,68 @@ static mut TOTAL: [u64; MAX_COMPONENTS] = [0; MAX_COMPONENTS];
 static mut GLOBAL_LIVE: u64 = 0;
 static mut GLOBAL_TOTAL: u64 = 0;
 
-/// The thread's currently attributed component. Not a lock, not atomic (see
-/// module docs); a plain u8 store/load.
-static mut CURRENT: Component = Component::None;
+thread_local! {
+    /// The thread's currently attributed component. Not a lock, not atomic (see
+    /// module docs): a plain enum store/load.
+    ///
+    /// Genuinely thread-local, which the counters need because they are
+    /// process-wide: with one `CURRENT` shared by every thread, a parallel
+    /// test's allocation while another thread sat inside an instrumented
+    /// constructor was billed to that constructor's component. That is not
+    /// theoretical — it is what made `component_covers_glyph_cache` fail
+    /// intermittently, since its "live must go down after the drop" is only
+    /// true if no other thread is adding to the same row.
+    ///
+    /// `const`-initialised so the value lives in the thread's TLS image: there
+    /// is no lazy-init code and no destructor, so the allocator can read it
+    /// without allocating, re-entering itself, or racing teardown.
+    static CURRENT: Cell<Component> = const { Cell::new(Component::None) };
+}
+
+#[inline]
+fn current() -> Component {
+    CURRENT.with(|c| c.get())
+}
+
+#[inline]
+fn set_current(c: Component) {
+    CURRENT.with(|slot| slot.set(c));
+}
 
 pub struct Tracked;
 
+/// Live bytes and allocations per log2 size class.
+///
+/// The component table answers "which structure is the heap?"; this answers
+/// "and is that one huge buffer or fifty thousand small ones?" — the question
+/// that told us a single 19 MB allocation was a whole font file being read for
+/// two characters. Two adds per allocation, and (unlike a backtrace probe) no
+/// allocation of its own, so the tag table is not disturbed by measuring.
+pub static mut BUCKETS: [u64; 40] = [0; 40];
+pub static mut BCOUNT: [u64; 40] = [0; 40];
+
+#[inline]
+fn bucket(size: usize) -> usize {
+    (usize::BITS - size.leading_zeros()) as usize % 40
+}
+
+/// Live bytes and counts per size class, largest class first.
+pub fn buckets() -> Vec<(usize, u64, u64)> {
+    let mut v: Vec<(usize, u64, u64)> = Vec::new();
+    unsafe {
+        for i in 0..40 {
+            if BCOUNT[i] > 0 {
+                v.push((i, BUCKETS[i], BCOUNT[i]));
+            }
+        }
+    }
+    v.sort_by_key(|&(_, bytes, _)| std::cmp::Reverse(bytes));
+    v
+}
+
 unsafe impl GlobalAlloc for Tracked {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let c = unsafe { CURRENT };
+        let c = current();
         let idx = c as usize % MAX_COMPONENTS;
         let size = layout.size() as u64;
         let p = System.alloc(layout);
@@ -119,6 +175,9 @@ unsafe impl GlobalAlloc for Tracked {
                 TOTAL[idx] += size;
                 GLOBAL_LIVE += size;
                 GLOBAL_TOTAL += size;
+                let b = bucket(layout.size());
+                BUCKETS[b] += size;
+                BCOUNT[b] += 1;
                 tag_set(p as usize, layout.size() as u32, idx as u8);
             }
         }
@@ -128,21 +187,24 @@ unsafe impl GlobalAlloc for Tracked {
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         // Attribute by pointer (the component that allocated it), falling
         // back to CURRENT for pre-tagging allocations.
-        let cur = (unsafe { CURRENT }) as usize % MAX_COMPONENTS;
+        let cur = current() as usize % MAX_COMPONENTS;
         let idx = unsafe { tag_take(p as usize) }.unwrap_or(cur);
         unsafe {
             LIVE[idx] = LIVE[idx].saturating_sub(layout.size() as u64);
             GLOBAL_LIVE = GLOBAL_LIVE.saturating_sub(layout.size() as u64);
+            let b = bucket(layout.size());
+            BUCKETS[b] = BUCKETS[b].saturating_sub(layout.size() as u64);
+            BCOUNT[b] = BCOUNT[b].saturating_sub(1);
         }
         System.dealloc(p, layout)
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let old_idx = unsafe { tag_take(p as usize) }
-            .unwrap_or((unsafe { CURRENT }) as usize % MAX_COMPONENTS);
+        let old_idx =
+            unsafe { tag_take(p as usize) }.unwrap_or(current() as usize % MAX_COMPONENTS);
         let np = System.realloc(p, layout, new_size);
         if !np.is_null() {
-            let new_idx = (unsafe { CURRENT }) as usize % MAX_COMPONENTS;
+            let new_idx = current() as usize % MAX_COMPONENTS;
             unsafe {
                 let old = layout.size() as u64;
                 let new = new_size as u64;
@@ -198,11 +260,11 @@ unsafe fn tag_take(ptr: usize) -> Option<usize> {
 // -- component attribution ------------------------------------------------
 
 pub fn begin(c: Component) {
-    unsafe { CURRENT = c }
+    set_current(c);
 }
 
 pub fn end() {
-    unsafe { CURRENT = Component::None }
+    set_current(Component::None);
 }
 
 /// One accounting sample: global + per-component.
@@ -251,6 +313,14 @@ pub fn report() -> String {
             l = live,
             t = total,
             tmb = *total as f64 / 1024.0 / 1024.0,
+        ));
+    }
+    out.push_str("  -- live bytes by allocation size class --\n");
+    for (b, bytes, count) in buckets() {
+        let lo = 1usize << b.saturating_sub(1);
+        out.push_str(&format!(
+            "  up to {lo:>9} B live {bytes:10} B ({mb:.2} MB) count {count}\n",
+            mb = bytes as f64 / 1048576.0,
         ));
     }
     out

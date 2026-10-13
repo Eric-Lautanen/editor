@@ -1,11 +1,15 @@
-//! Session persistence: theme, view mode and the open tabs survive app
-//! restarts in one tiny text file under the user config dir. Written only
-//! when something changes; any read error falls back to defaults.
+//! Session persistence: theme, view mode, the open tabs and the window's size
+//! and place survive app restarts in one tiny text file under the user config
+//! dir. Written only when something changes, and replaced in a single step (see
+//! [`save_in`]) so a crash mid-write cannot leave a half session behind; any
+//! read error falls back to defaults.
 
 use std::path::{Path, PathBuf};
 
 /// Persisted session state. `mode` mirrors `app::Mode`'s discriminants
-/// (0 = Preview, 1 = Edit, 2 = Split) to keep this module app-agnostic.
+/// (0 = Preview, 1 = Edit, 2 = Split) to keep this module app-agnostic, and the
+/// window is kept as bare numbers for the same reason — this file knows nothing
+/// about `App`, the event types, or the window system.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     pub dark: bool,
@@ -14,6 +18,14 @@ pub struct Settings {
     pub mode: u8,
     pub files: Vec<PathBuf>,
     pub active: usize,
+    /// Last window rect `(x, y, width, height)` in physical px **as it was
+    /// before being maximized** — the size and place a restore should reopen
+    /// at, which is not what a maximized window reports. `None` until the app
+    /// has been told one (a first run, or a window that never reported).
+    pub window: Option<(i32, i32, u32, u32)>,
+    /// The window was maximized when the session ended, so the next one opens
+    /// the same way (at `window`, then maximized).
+    pub maximized: bool,
 }
 
 /// Per-user config directory (`%APPDATA%\\Readitor`, `~/.config/readitor`,
@@ -61,15 +73,25 @@ fn file_in(dir: &Path) -> PathBuf {
     dir.join("session.txt")
 }
 
+/// The file a session is written to *before* it replaces the real one. Same
+/// directory, so the rename that commits it is a same-volume move.
+fn temp_in(dir: &Path) -> PathBuf {
+    dir.join("session.tmp")
+}
+
 /// Render the settings as the tiny text file format.
 fn render(s: &Settings) -> String {
     let mut out = format!(
-        "theme {}\nmanual {}\nmode {}\nactive {}\n",
+        "theme {}\nmanual {}\nmode {}\nactive {}\nmaximized {}\n",
         if s.dark { "dark" } else { "light" },
         u8::from(s.manual),
         s.mode,
-        s.active
+        s.active,
+        u8::from(s.maximized)
     );
+    if let Some((x, y, w, h)) = s.window {
+        out.push_str(&format!("window {x} {y} {w} {h}\n"));
+    }
     for f in &s.files {
         // Paths cannot contain newlines, so one `open <path>` per line is
         // unambiguous even with spaces in the name.
@@ -89,6 +111,8 @@ fn parse(text: &str) -> Settings {
             "manual" => s.manual = val == "1",
             "mode" => s.mode = val.parse().unwrap_or(0),
             "active" => s.active = val.parse().unwrap_or(0),
+            "maximized" => s.maximized = val == "1",
+            "window" => s.window = parse_window(val),
             "open" => s.files.push(PathBuf::from(val)),
             _ => {}
         }
@@ -96,10 +120,32 @@ fn parse(text: &str) -> Settings {
     s
 }
 
+/// `x y w h`, all four required: a half-written or hand-edited line is dropped
+/// rather than applied as a partially-zeroed rect (which would place a window
+/// at the origin with no size).
+fn parse_window(val: &str) -> Option<(i32, i32, u32, u32)> {
+    let mut it = val.split_whitespace();
+    let x = it.next()?.parse().ok()?;
+    let y = it.next()?.parse().ok()?;
+    let w = it.next()?.parse().ok()?;
+    let h = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((x, y, w, h))
+}
+
 /// Load the persisted session; defaults when missing or unreadable.
 pub fn load() -> Settings {
-    config_dir()
-        .and_then(|d| std::fs::read_to_string(file_in(&d)).ok())
+    config_dir().map(|d| load_in(&d)).unwrap_or_default()
+}
+
+/// Read the session out of `dir`. Only the real file is read: a leftover temp
+/// file (a write that a crash interrupted before the rename) is ignored, which
+/// is the point of committing with a rename — the last complete session is what
+/// the next launch sees.
+fn load_in(dir: &Path) -> Settings {
+    std::fs::read_to_string(file_in(dir))
         .map(|t| parse(&t))
         .unwrap_or_default()
 }
@@ -109,9 +155,46 @@ pub fn save(s: &Settings) {
     let Some(dir) = config_dir() else {
         return;
     };
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(file_in(&dir), render(s));
+    save_in(&dir, s);
+}
+
+/// Write the session into `dir` in one step: the text goes to a temp file in
+/// the same directory, is flushed to the disk, and only then replaces the
+/// session file with a rename.
+///
+/// This matters most for the writes that happen *during* a session (the window
+/// geometry the heartbeat persists): a power cut or a kill landing inside a
+/// plain in-place write would leave a truncated file, and the next launch would
+/// come up with no session at all. With the rename it either sees the whole new
+/// session or the whole previous one.
+///
+/// The fallback is for the target that refuses to be replaced (a locked file, an
+/// unusual filesystem, another instance winning the race for the single temp
+/// name) — a session written in place is still better than none, and it is
+/// complete by then, so the only thing given up is the atomicity of that step.
+///
+/// Every failure is swallowed: persisting must never take the app down.
+fn save_in(dir: &Path, s: &Settings) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
     }
+    let path = file_in(dir);
+    let tmp = temp_in(dir);
+    let text = render(s);
+    use std::io::Write;
+    let written = std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            // A few hundred bytes, and the whole point: the new session is on
+            // the disk before the old one is replaced.
+            f.sync_all()
+        })
+        .is_ok();
+    if !written || std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::write(&path, &text);
+    }
+    // Gone after a successful rename; removes the leftovers when it was not.
+    let _ = std::fs::remove_file(&tmp);
 }
 
 #[cfg(test)]
@@ -129,6 +212,8 @@ mod tests {
                 PathBuf::from("/home/u/notes.txt"),
             ],
             active: 1,
+            window: Some((-1920, 40, 1100, 800)),
+            maximized: true,
         };
         let text = render(&s);
         assert_eq!(parse(&text), s);
@@ -141,6 +226,96 @@ mod tests {
     }
 
     #[test]
+    fn the_window_line_carries_the_whole_rect() {
+        // Negative origins are ordinary: a monitor left of or above the
+        // primary one, which is exactly the case a restore must not lose.
+        let s = parse("window -1920 -40 1100 800\nmaximized 1\n");
+        assert_eq!(s.window, Some((-1920, -40, 1100, 800)));
+        assert!(s.maximized);
+        assert_eq!(parse(&render(&s)).window, s.window);
+    }
+
+    #[test]
+    fn a_partial_window_line_is_dropped() {
+        // Apply only a complete rect: half a line would otherwise restore a
+        // window at the origin with no size.
+        for line in [
+            "window 120 80 1100",
+            "window 120 80",
+            "window",
+            "window a b c d",
+            "window 120 80 1100 800 3",
+        ] {
+            assert_eq!(parse(line).window, None, "{line:?} must be dropped");
+        }
+        // A missing window line means "never seen one", not the origin.
+        assert_eq!(parse("theme dark\n").window, None);
+    }
+
+    #[test]
+    fn a_save_replaces_the_session_in_one_step() {
+        // The file is written elsewhere and renamed over the old one, so the
+        // session on disk is always a complete one, and the scratch file it was
+        // staged in is gone afterwards.
+        let dir = std::env::temp_dir().join("readitor_settings_atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Settings {
+            dark: true,
+            mode: 1,
+            window: Some((260, 170, 900, 640)),
+            ..Settings::default()
+        };
+        save_in(&dir, &s);
+        assert_eq!(load_in(&dir), s);
+        assert!(!temp_in(&dir).exists(), "no scratch file is left behind");
+        // A later save updates the same file in place, minus the scratch.
+        s.window = Some((300, 200, 880, 620));
+        s.maximized = true;
+        save_in(&dir, &s);
+        assert_eq!(load_in(&dir), s);
+        assert!(!temp_in(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_interrupted_before_the_rename_keeps_the_previous_session() {
+        let dir = std::env::temp_dir().join("readitor_settings_interrupted");
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Settings {
+            dark: false,
+            manual: false,
+            mode: 2,
+            files: vec![PathBuf::from("/home/u/notes.md")],
+            active: 0,
+            window: Some((120, 80, 1100, 800)),
+            maximized: false,
+        };
+        save_in(&dir, &s);
+        // What a crash between the write and the rename leaves: a temp file with
+        // the new text that was never committed.
+        std::fs::write(temp_in(&dir), "window 999\ntheme dark\njunk").unwrap();
+        assert_eq!(load_in(&dir), s, "the committed session is the one read");
+        // And the next save cleans the leftover up.
+        save_in(&dir, &s);
+        assert!(!temp_in(&dir).exists());
+        assert_eq!(load_in(&dir), s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_dir_that_cannot_be_replaced_does_not_take_the_app_down() {
+        // Neither the rename nor the fallback can work when the session path is
+        // a directory, which stands in for a locked file or an unwritable spot:
+        // persisting is best effort, and reading falls back to defaults.
+        let dir = std::env::temp_dir().join("readitor_settings_unwritable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(file_in(&dir)).unwrap();
+        save_in(&dir, &Settings::default());
+        assert_eq!(load_in(&dir), Settings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_then_load() {
         let dir = std::env::temp_dir().join("readitor_settings_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -150,6 +325,8 @@ mod tests {
             mode: 1,
             files: vec![dir.join("x.json")],
             active: 0,
+            window: Some((10, 20, 900, 700)),
+            maximized: false,
         };
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(file_in(&dir), render(&s)).unwrap();

@@ -279,10 +279,8 @@ fn tree<'a>(width: f32, ctx: &'a Ctx, collapsed: &'a HashSet<usize>) -> Tree<'a>
     let m = ctx.fonts.metrics(FontStyle::Mono, size);
     let adv = ctx.fonts.advance(FontStyle::Mono, '0', size).max(1.0);
     let pad = ctx.px(32.0);
-    let col_w = (width - 2.0 * pad)
-        .min(ctx.px(t.content_max_width))
-        .max(ctx.px(120.0));
-    let x0 = ((width - col_w) / 2.0).max(pad.min(width / 4.0)).round();
+    // The reading column reflows with the window (see `layout::column`).
+    let (col_w, x0) = super::column(width, ctx);
     Tree {
         fonts: ctx.fonts,
         theme: t,

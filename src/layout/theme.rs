@@ -16,6 +16,10 @@ pub struct Theme {
     pub error: Color,
     pub sel: Color,
     pub base_size: f32,
+    /// Ceiling (logical px) for the centered reading column — the widest the
+    /// text is allowed to get on a very wide window, so a maximized ultrawide
+    /// screen does not end up with 250-character lines. The column itself is
+    /// responsive below this: see [`super::column`].
     pub content_max_width: f32,
 }
 
@@ -36,7 +40,7 @@ impl Theme {
             error: Color::hex(0xCF222E),
             sel: Color::rgba(9, 105, 218, 72),
             base_size: 16.0,
-            content_max_width: 820.0,
+            content_max_width: 1500.0,
         }
     }
     pub fn dark() -> Self {
@@ -55,7 +59,7 @@ impl Theme {
             error: Color::hex(0xFF7B72),
             sel: Color::rgba(88, 166, 255, 80),
             base_size: 16.0,
-            content_max_width: 820.0,
+            content_max_width: 1500.0,
         }
     }
 }

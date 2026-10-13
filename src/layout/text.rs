@@ -26,17 +26,11 @@ pub fn line_height(viewport_w: f32, ctx: &Ctx) -> f32 {
 /// (preview panes); otherwise one row per line, left-aligned, for the editor
 /// pane — long lines scroll horizontally instead of folding.
 pub fn plain_params(viewport_w: f32, ctx: &Ctx, wrap: bool) -> PlainParams {
-    let t = ctx.theme;
     let size = ctx.body_size() * 0.9;
     let pad = ctx.px(32.0);
     let (col_w, x0) = if wrap {
-        let col_w = (viewport_w - 2.0 * pad)
-            .min(ctx.px(t.content_max_width))
-            .max(ctx.px(120.0));
-        let x0 = ((viewport_w - col_w) / 2.0)
-            .max(pad.min(viewport_w / 4.0))
-            .round();
-        (col_w, x0)
+        // The reading column reflows with the window (see `layout::column`).
+        super::column(viewport_w, ctx)
     } else {
         (f32::INFINITY, pad)
     };

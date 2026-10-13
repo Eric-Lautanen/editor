@@ -243,7 +243,41 @@ fn parse_hhea(data: &[u8], dir: u32) -> Result<(f32, f32, u16), TtfError> {
     Ok((ascent as f32, descent as f32, nhm))
 }
 
-fn parse_loca(data: &[u8], dir: u32, short: bool, num_glyphs: u16) -> Result<Vec<u32>, TtfError> {
+/// The `loca` table: glyph → offset of its outline inside `glyf`.
+///
+/// Read *through* from the font bytes instead of copied into a `Vec<u32>`. A
+/// CJK face carries tens of thousands of glyphs, so the copy costs ~4 bytes per
+/// glyph per face (120 KB for Microsoft YaHei) to serve the few dozen a
+/// document actually draws — and the bytes are already in the address space
+/// (embedded faces live in the image, fallback fonts are mapped), so an entry
+/// is one bounds-checked big-endian load away. Same table, same answers, no
+/// per-face heap.
+#[derive(Clone, Copy)]
+struct Loca<'a> {
+    /// The `loca` table itself, as it appears in the file.
+    entries: &'a [u8],
+    /// Short entries are 2-byte *halves* of the offset; long ones are 4 bytes.
+    short: bool,
+}
+
+impl Loca<'_> {
+    /// Offset of `gid`'s outline within `glyf`; `0` for an out-of-range index,
+    /// which callers treat as an empty glyph rather than an error.
+    fn get(&self, gid: usize) -> u32 {
+        let width = if self.short { 2 } else { 4 };
+        let at = gid * width;
+        let Some(b) = self.entries.get(at..at + width) else {
+            return 0;
+        };
+        if self.short {
+            u16::from_be_bytes([b[0], b[1]]) as u32 * 2
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        }
+    }
+}
+
+fn parse_loca(data: &[u8], dir: u32, short: bool, num_glyphs: u16) -> Result<Loca<'_>, TtfError> {
     let (off, len) = table(data, dir, b"loca");
     let need = num_glyphs as usize + 1;
     // Short loca stores 2-byte entries, long stores 4.
@@ -251,35 +285,56 @@ fn parse_loca(data: &[u8], dir: u32, short: bool, num_glyphs: u16) -> Result<Vec
     if (len as usize) < need * entry {
         return Err(TtfError::Table("loca"));
     }
-    let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
-    let mut out = Vec::with_capacity(need);
-    for _ in 0..need {
-        out.push(if short { r.u16()? as u32 * 2 } else { r.u32()? });
-    }
-    Ok(out)
+    Ok(Loca {
+        entries: &data[off as usize..off as usize + len as usize],
+        short,
+    })
 }
 
-fn parse_hmtx(
-    data: &[u8],
-    dir: u32,
-    nhm: u16,
-    num_glyphs: u16,
-) -> Result<Vec<(u16, i16)>, TtfError> {
+/// The `hmtx` table: glyph → advance width, read through for the same reason as
+/// [`Loca`] (the left-side bearings in it are never used, only the advances).
+#[derive(Clone, Copy)]
+struct Hmtx<'a> {
+    entries: &'a [u8],
+    /// Glyphs with a full 4-byte long metric; anything past them reuses the
+    /// last one, which is what the format's trailing bearings mean.
+    nhm: usize,
+    num_glyphs: usize,
+}
+
+impl Hmtx<'_> {
+    /// Advance width in font units; `0` where the original copy had no entry
+    /// (an out-of-range glyph, or a face with no long metrics at all).
+    fn advance(&self, gid: u16) -> u16 {
+        let i = gid as usize;
+        if i >= self.num_glyphs || self.nhm == 0 {
+            return 0;
+        }
+        let idx = if i < self.nhm { i } else { self.nhm - 1 };
+        match self.entries.get(idx * 4..idx * 4 + 2) {
+            Some(b) => u16::from_be_bytes([b[0], b[1]]),
+            None => 0,
+        }
+    }
+}
+
+fn parse_hmtx(data: &[u8], dir: u32, nhm: u16, num_glyphs: u16) -> Result<Hmtx<'_>, TtfError> {
     let (off, len) = table(data, dir, b"hmtx");
-    let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
-    let mut out = Vec::with_capacity(num_glyphs as usize);
-    for _ in 0..nhm.min(num_glyphs) {
-        let aw = r.u16()?;
-        let lsb = r.i16()?;
-        out.push((aw, lsb));
+    let entries = &data[off as usize..off as usize + len as usize];
+    // `numberOfHMetrics` long metrics, then a bearing per remaining glyph.
+    // Validating the whole layout here keeps the on-demand reads below from
+    // ever having to fail: a table too short for its own glyph count is a
+    // malformed face, exactly as it was when the entries were copied out.
+    let long = nhm.min(num_glyphs) as usize;
+    let need = long * 4 + (num_glyphs as usize - long) * 2;
+    if entries.len() < need {
+        return Err(TtfError::Table("hmtx"));
     }
-    // Remaining glyphs inherit the last advance, each contributing an lsb.
-    let last = out.last().map_or(0, |e| e.0);
-    while out.len() < num_glyphs as usize {
-        out.push((last, r.i16()?));
-    }
-    let _ = len;
-    Ok(out)
+    Ok(Hmtx {
+        entries,
+        nhm: long,
+        num_glyphs: num_glyphs as usize,
+    })
 }
 
 // ============================================================== cmap =======
@@ -487,12 +542,12 @@ pub struct Face<'a> {
     /// Absolute file offset of the `glyf` table (loca entries index it).
     glyf_off: u32,
     cmap: Cmap<'a>,
-    loca: Vec<u32>,
+    loca: Loca<'a>,
     num_glyphs: u16,
     upem: f32,
     ascent: f32,
     descent: f32,
-    hmtx: Vec<(u16, i16)>,
+    hmtx: Hmtx<'a>,
     /// COLR v1 paint graphs, when this face has them. `None` for the common
     /// outline-only face, which is every face we embed.
     colr: Option<super::colr::Colr<'a>>,
@@ -614,7 +669,7 @@ impl Face<'_> {
 
     /// Advance width in font units.
     pub fn advance(&self, gid: u16) -> f32 {
-        self.hmtx.get(gid as usize).map_or(0.0, |&(a, _)| a as f32)
+        self.hmtx.advance(gid) as f32
     }
 
     /// Advance width in pixels at `size`, matching the atlas scaling.
@@ -631,8 +686,8 @@ impl Face<'_> {
         if depth > MAX_COMPONENT_DEPTH || gid >= self.num_glyphs {
             return Err(TtfError::Glyph(gid));
         }
-        let start = self.loca[gid as usize] as usize;
-        let end = self.loca[gid as usize + 1] as usize;
+        let start = self.loca.get(gid as usize) as usize;
+        let end = self.loca.get(gid as usize + 1) as usize;
         if end <= start {
             return Ok(vec![]);
         }

@@ -15,6 +15,11 @@ use crate::{
     parse::markdown::ast::{Align, Block, Document, Inline, ListItem},
 };
 
+/// Side padding (physical px) inside a code panel, and the indent a folded
+/// continuation row gets. Both are unscaled: they sit next to padded text.
+const CODE_PAD: f32 = 12.0;
+const CODE_HANG: &str = "  ";
+
 /// A run of uniformly styled text inside a paragraph or cell.
 #[derive(Clone)]
 struct Span {
@@ -430,7 +435,26 @@ impl Md<'_> {
                     let size = self.body * 0.9;
                     let lh = self.line_h(size);
                     let style = FontStyle::Mono;
-                    let rows: Vec<&str> = text.split('\n').collect();
+                    // Fold a line that is wider than the panel rather than
+                    // letting it run out of the column and off the pane: a
+                    // command wrapped onto its own row is readable, one that
+                    // disappears past the edge is not. A continuation is
+                    // indented so it cannot be mistaken for a new line.
+                    let inner = (max_w - 2.0 * CODE_PAD).max(40.0);
+                    let mut rows: Vec<String> = Vec::new();
+                    for line in text.split('\n') {
+                        let mut wrapped = false;
+                        for (s, e) in super::text::wrap_ranges(self.fonts, style, size, line, inner)
+                        {
+                            let piece: String = line.chars().skip(s).take(e - s).collect();
+                            rows.push(if wrapped {
+                                format!("{CODE_HANG}{piece}")
+                            } else {
+                                piece
+                            });
+                            wrapped = true;
+                        }
+                    }
                     let h = rows.len() as f32 * lh + 16.0;
                     self.ops.push(DrawOp::RoundedRect {
                         rect: Rect::new(x, self.y, max_w, h),
@@ -440,14 +464,7 @@ impl Md<'_> {
                     let mut cy = self.y + 8.0;
                     for row in rows {
                         let baseline = self.baseline(cy, style, size);
-                        self.text_op(
-                            x + 12.0,
-                            baseline,
-                            row.to_string(),
-                            style,
-                            size,
-                            self.theme.fg,
-                        );
+                        self.text_op(x + CODE_PAD, baseline, row, style, size, self.theme.fg);
                         cy += lh;
                     }
                     self.y += h;
@@ -657,10 +674,8 @@ pub fn layout(doc: &Document, width: f32, ctx: &Ctx) -> DisplayList {
     let t = ctx.theme;
     let body = ctx.body_size();
     let pad = ctx.px(32.0);
-    let col_w = (width - 2.0 * pad)
-        .min(ctx.px(t.content_max_width))
-        .max(ctx.px(120.0));
-    let x0 = ((width - col_w) / 2.0).max(pad.min(width / 4.0)).round();
+    // The reading column reflows with the window (see `layout::column`).
+    let (col_w, x0) = super::column(width, ctx);
     let mut md = Md {
         fonts: ctx.fonts,
         theme: t,
@@ -695,6 +710,71 @@ mod tests {
 
     fn doc(src: &str) -> Document {
         crate::parse::markdown::parse(src)
+    }
+
+    /// Every Text op in the list, with its measured right edge, so a test can
+    /// ask whether the content actually fits the column.
+    fn text_extents(list: &DisplayList, f: &FontSystem) -> Vec<(f32, f32)> {
+        list.ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text {
+                    x,
+                    text,
+                    size,
+                    style,
+                    ..
+                } => Some((*x, *x + f.measure(*style, text, *size))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_code_line_folds_inside_the_panel() {
+        // A command longer than the panel used to be drawn straight past it and
+        // off the pane edge, so the end of the line could not be read at all.
+        // It now folds onto continuation rows that stay inside the panel.
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let long = "x".repeat(800);
+        let src = format!("```\n{long}\nshort\n```\n");
+        let list = layout(&doc(&src), 1920.0, &c);
+        let (col_w, x0) = crate::layout::column(1920.0, &c);
+        let panel = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::RoundedRect { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("code panel");
+        assert_eq!(panel.w, col_w, "the panel spans the column");
+        let extents = text_extents(&list, &f);
+        assert!(
+            extents.len() >= 5,
+            "an 800-char line must fold into several rows (got {})",
+            extents.len()
+        );
+        for (x, right) in &extents {
+            assert!(*x >= x0, "text starts left of the column: {x} < {x0}");
+            assert!(
+                *right <= panel.right() + 0.5,
+                "text runs out of the panel: {right} > {}",
+                panel.right()
+            );
+        }
+        // The last row is the short line, still a single row of its own.
+        let heights: Vec<f32> = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::RoundedRect { rect, .. } => Some(rect.h),
+                _ => None,
+            })
+            .collect();
+        assert!(heights[0] > 60.0, "panel must grow with the folded rows");
     }
 
     #[test]

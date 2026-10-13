@@ -15,7 +15,7 @@ backends (M8/M9) in progress.** Custom title bar with one tab per open file,
 context menu, clickable mode buttons in the status bar, preview drag-selection
 with copy, working overlay scrollbars, line-number gutter, single/double/
 triple-click caret/word/line selection, session persistence (theme, mode,
-open tabs), `--install` file associations.
+open tabs, window size/place/maximized), `--install` file associations.
 
 ## Install & file associations
 

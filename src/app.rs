@@ -17,9 +17,9 @@ use crate::{
     ui::{
         about,
         editor_view::EditorView,
-        event::{CursorShape, Event, Key, Modifiers, MouseButton},
+        event::{CursorShape, Event, Key, Modifiers, MouseButton, WindowGeometry},
         gutter, help, menu,
-        preview_view::{PaneMetrics, PaneScroll, PreviewView, Row as PreviewRow, SbGeom},
+        preview_view::{self, PaneMetrics, PaneScroll, PreviewView, Row as PreviewRow, SbGeom},
         scroll::ScrollState,
         statusbar,
         titlebar::{self, TitleHit},
@@ -29,6 +29,7 @@ use std::{
     collections::HashSet,
     ops::{Deref, DerefMut},
     path::PathBuf,
+    time::Instant,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +39,10 @@ pub enum Mode {
     Split,
 }
 
-/// An in-progress overlay-scrollbar drag.
+/// An in-progress overlay-scrollbar drag: press to release, the thumb tracking
+/// the pointer in between. Held by [`App::sb_drag`], which `on_mouse_down`
+/// clears before it looks at where the new press landed and `on_mouse_up`
+/// clears on release — so a bar can never outlive its gesture.
 #[derive(Clone, Copy)]
 struct SbDrag {
     /// True for the editor pane's bar, false for the preview pane's.
@@ -51,6 +55,23 @@ struct SbDrag {
 
 /// Caret blink half-period, in 40 ms `Event::Tick`s (~0.5 s).
 const BLINK_TICKS: u32 = 12;
+
+/// Smallest scroll delta treated as a discrete step worth gliding to. A wheel
+/// notch is ~48 px and a PageDown a whole pane; a touchpad or a finger arrives
+/// in deltas of a few px, and those must be applied the instant they land or
+/// the input feels sticky.
+const GLIDE_MIN_STEP: f32 = 16.0;
+
+/// How long a reported window size/place has to hold still before it is
+/// written to the session file, in 40 ms `Event::Tick`s (~1 s).
+///
+/// The session is written on the way out anyway, but that only covers a clean
+/// exit: a killed process, a power cut or a crash never gets there, and a
+/// window that moved in that session would reopen at the rect it had at the
+/// last *clean* exit. So the write also happens from the heartbeat, once the
+/// reports stop — the delay being what keeps a drag (which reports every
+/// intermediate rect) to a single write at the end.
+const GEOMETRY_SAVE_TICKS: u32 = 25;
 
 /// One open file: everything that is per-document lives here.
 pub struct Tab {
@@ -123,9 +144,10 @@ pub struct App {
     /// Window size in physical px, and OS DPI scale.
     size: (usize, usize),
     scale: f32,
-    /// Window-edge strip the platform keeps for resizing (physical px).
-    /// Overlay scrollbars are inset by it so a press on the bar scrolls
-    /// instead of starting a window resize.
+    /// Full window-edge strip the platform claims for resizing (physical px).
+    /// Overlay scrollbars are inset by the *bar-safe* share of it
+    /// ([`App::bar_grip`]) so a press on the bar scrolls instead of starting a
+    /// window resize; `grip_at` hands the rest of it back to the OS.
     edge: f32,
     zoom: f32,
     layout_dirty: bool,
@@ -156,6 +178,31 @@ pub struct App {
     /// Caret blink phase: 40 ms ticks; the caret hides every other
     /// [`BLINK_TICKS`] window and any caret activity resets it to visible.
     blink: u32,
+    /// Last window geometry the platform reported while the window was *not*
+    /// maximized: the size and place the next session should reopen at, and the
+    /// answer to [`Handler::initial_window`]. `None` until the platform reports
+    /// one (a first run, or a headless one, which never has a window).
+    window: Option<WindowGeometry>,
+    /// Whether the window is maximized right now. The OS owns this — we only
+    /// remember it, so the next session opens the same way without losing the
+    /// rect above.
+    window_maximized: bool,
+    /// A glide is in flight, so the host is currently running its fast frame
+    /// clock (and must be told when it can stop).
+    scrolling: bool,
+    /// When the last animation frame was handled. The glide is eased over
+    /// *time*, so each frame needs to know how much of it passed — a host that
+    /// stalls, or one that only has the 40 ms heartbeat, still advances by the
+    /// time that actually went by.
+    last_frame: Instant,
+    /// A size/place/maximized change the platform reported that is not on disk
+    /// yet. Waiting for the window to hold still is what makes a drag — a
+    /// stream of reports, of which only the last matters — one write instead of
+    /// one per frame (see [`GEOMETRY_SAVE_TICKS`]).
+    geometry_dirty: bool,
+    /// Ticks of stillness left before that pending change is written; only
+    /// meaningful while `geometry_dirty`.
+    geometry_idle: u32,
     /// Live overlay-scrollbar drag, if any.
     sb_drag: Option<SbDrag>,
     /// Click counting for double/triple selection: the running count and
@@ -216,6 +263,12 @@ impl App {
             theme_manual: false,
             ticks: 0,
             blink: 0,
+            window: None,
+            window_maximized: false,
+            scrolling: false,
+            last_frame: Instant::now(),
+            geometry_dirty: false,
+            geometry_idle: 0,
             sb_drag: None,
             clicks: 0,
             last_click: None,
@@ -251,9 +304,26 @@ impl App {
         self.layout_dirty = true;
     }
 
-    /// Write the session (theme, view mode, open tabs) for the next start.
-    fn persist(&self) {
-        settings::save(&settings::Settings {
+    /// Adopt the window rect the last session closed at. Called before
+    /// `platform::run`, because the window does not exist yet: the platform
+    /// reads it back through [`Handler::initial_window`] while creating it, and
+    /// the OS stays the authority on where it actually ends up.
+    pub fn restore_window(&mut self, rect: Option<(i32, i32, u32, u32)>, maximized: bool) {
+        self.window = rect.map(|(x, y, width, height)| WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+            maximized: false,
+        });
+        self.window_maximized = maximized;
+    }
+
+    /// The session to write for the next start (theme, view mode, open tabs,
+    /// and where the window was) — split out from [`App::persist`] so what gets
+    /// written is testable without touching the config directory.
+    fn settings(&self) -> settings::Settings {
+        settings::Settings {
             dark: self.dark,
             manual: self.theme_manual,
             mode: match self.mode {
@@ -263,7 +333,98 @@ impl App {
             },
             files: self.tabs.iter().filter_map(|t| t.path.clone()).collect(),
             active: self.active,
-        });
+            // The *normal* rect, not the maximized one: reopening at the work
+            // area's size would leave a window that is the size of the screen
+            // as soon as it is un-maximized.
+            window: self.window.map(|g| (g.x, g.y, g.width, g.height)),
+            maximized: self.window_maximized,
+        }
+    }
+
+    /// Write the session (theme, view mode, open tabs, window) for the next
+    /// start.
+    fn persist(&self) {
+        settings::save(&self.settings());
+    }
+
+    /// Leave: remember the session first. Every way out goes through here — the
+    /// window's ×, Ctrl+Q, and the OS's close request — because where the window
+    /// *is* only exists while it does. Nothing else writes it on a move or a
+    /// resize: a drag produces a stream of those, and the next session only
+    /// needs the last one.
+    fn quit(&mut self, host: &mut dyn Host) {
+        self.persist();
+        host.quit();
+    }
+
+    /// Horizontal wheel/trackpad movement pans the no-wrap editor lines;
+    /// preview panes wrap, so they have nothing to pan.
+    fn pan_horizontal(&mut self, dx: f32) {
+        if self.mode != Mode::Preview {
+            self.h_scroll = (self.h_scroll - dx).clamp(0.0, self.h_max);
+        }
+    }
+
+    /// Scroll to a coarse step's distance *over the next few frames* rather
+    /// than in one jump, which is what removes the stepping from wheel and
+    /// paging input, and start the host's fast frame clock if it is not
+    /// already running.
+    fn scroll_glide(&mut self, dy: f32, host: &mut dyn Host) {
+        self.scroll.scroll_smooth(dy);
+        if self.scroll.animating() && !self.scrolling {
+            self.scrolling = true;
+            self.last_frame = Instant::now();
+            host.set_animating(true);
+        }
+        host.request_redraw();
+    }
+
+    /// Start a glide for input whose delta is a discrete step, and let anything
+    /// finer through unanimated (see [`GLIDE_MIN_STEP`]).
+    fn scroll_input(&mut self, dy: f32, host: &mut dyn Host) {
+        if dy.abs() >= GLIDE_MIN_STEP {
+            self.scroll_glide(dy, host);
+        } else {
+            self.scroll_direct(dy, host);
+        }
+    }
+
+    /// Move the view *now*, because the pointer is driving it — a scrollbar
+    /// drag, drag auto-scroll, a finger. Any glide in flight is over (the view
+    /// is where the pointer puts it), and the host's fast clock goes with it.
+    fn scroll_direct(&mut self, dy: f32, host: &mut dyn Host) {
+        self.scroll.scroll_by(dy);
+        self.end_glide(host);
+        host.request_redraw();
+    }
+
+    /// Stop the animation clock. Safe when nothing is animating.
+    fn end_glide(&mut self, host: &mut dyn Host) {
+        if self.scrolling {
+            self.scrolling = false;
+            host.set_animating(false);
+        }
+    }
+
+    /// One animation frame: advance an in-flight glide, and stop asking for
+    /// frames once it has arrived (the last frame is still painted).
+    fn on_frame(&mut self, host: &mut dyn Host) {
+        if !self.scrolling {
+            return;
+        }
+        let now = Instant::now();
+        let dt_ms = (now - self.last_frame).as_secs_f32() * 1000.0;
+        self.last_frame = now;
+        // A long gap (a stall, a host that only runs the heartbeat) is clamped:
+        // the easing must not jump the whole distance because a frame was late.
+        self.scroll.step(dt_ms.clamp(1.0, 100.0));
+        if self.scroll.animating() {
+            host.request_redraw();
+        } else {
+            self.scrolling = false;
+            host.set_animating(false);
+            host.request_redraw();
+        }
     }
 
     /// Window title. Unsaved state is *not* encoded here any more — the tab's
@@ -647,7 +808,7 @@ impl App {
                 self.about_open = !self.about_open;
                 self.help_open = false;
             }
-            Key::Char('q') if mods.ctrl => host.quit(),
+            Key::Char('q') if mods.ctrl => self.quit(host),
             Key::Char('w') if mods.ctrl => self.close_tab(host),
             Key::Char('o') if mods.ctrl => {
                 if let Some(p) = host.open_file_dialog() {
@@ -747,10 +908,12 @@ impl App {
                 }
             }
             // -- window scroll -----------------------------------------------
-            Key::Down => self.scroll.scroll_by(step),
-            Key::Up => self.scroll.scroll_by(-step),
-            Key::PageDown => self.scroll.scroll_by(page),
-            Key::PageUp => self.scroll.scroll_by(-page),
+            // Keyboard steps glide like wheel notches: they are the same kind
+            // of discrete jump, and holding a key then blends into one motion.
+            Key::Down => self.scroll_input(step, host),
+            Key::Up => self.scroll_input(-step, host),
+            Key::PageDown => self.scroll_input(page, host),
+            Key::PageUp => self.scroll_input(-page, host),
             Key::Home => self.scroll.offset = 0.0,
             Key::End => self.scroll.offset = self.scroll.max(),
             _ => return,
@@ -759,6 +922,16 @@ impl App {
     }
 
     fn on_mouse_down(&mut self, x: f32, y: f32, button: MouseButton, host: &mut dyn Host) {
+        // Every press ends the gesture before it. A drag lasts from its press
+        // until its release and nothing else ends it, so a release the platform
+        // could not deliver — the pointer let go outside the client area, the
+        // window deactivated mid-drag — would leave the thumb glued to the
+        // pointer (and text selection stuck) until some later click happened to
+        // end it. Starting fresh here bounds a stranded drag to one click
+        // rather than leaving the app waiting for a release that never comes.
+        self.drag_anchor = None;
+        self.preview_drag = false;
+        self.sb_drag = None;
         // A live menu consumes the click (item or dismiss).
         if let Some(m) = &self.menu {
             let action = m.hit(x, y);
@@ -796,7 +969,7 @@ impl App {
                 }
                 TitleHit::Minimize => host.minimize(),
                 TitleHit::Maximize => host.toggle_maximize(),
-                TitleHit::Close => host.quit(),
+                TitleHit::Close => self.quit(host),
                 TitleHit::Drag | TitleHit::Client => {}
             }
             host.request_redraw();
@@ -886,7 +1059,7 @@ impl App {
                 if horizontal {
                     self.h_scroll = (self.h_scroll + delta).clamp(0.0, self.h_max);
                 } else {
-                    self.scroll.scroll_by(delta);
+                    self.scroll_direct(delta, host);
                 }
                 self.sb_drag = Some(SbDrag {
                     editor,
@@ -1069,6 +1242,22 @@ impl App {
     /// drag is held near a pane edge; every ~2 s, watch for on-disk changes.
     fn on_tick(&mut self, host: &mut dyn Host) {
         self.ticks = self.ticks.wrapping_add(1);
+        // Keep an in-flight glide moving even on a host that cannot run a
+        // faster frame clock than this one; `Event::Frame` normally does it.
+        if self.scrolling {
+            self.on_frame(host);
+        }
+        // Write a window geometry the platform reported, once it has held
+        // still, so that a session which is killed rather than closed still
+        // reopens where it was left. Ahead of the drag branches below, which
+        // return early — this must not be skipped by a gesture.
+        if self.geometry_dirty {
+            self.geometry_idle = self.geometry_idle.saturating_sub(1);
+            if self.geometry_idle == 0 {
+                self.geometry_dirty = false;
+                self.persist();
+            }
+        }
         // Caret blink (Edit/Split only; Preview paints no caret).
         if self.mode != Mode::Preview {
             let was = self.caret_visible();
@@ -1092,7 +1281,7 @@ impl App {
             } else {
                 return;
             };
-            self.scroll.scroll_by(dy);
+            self.scroll_direct(dy, host);
             if let Some((dx, doc_y)) = self.editor_point(mx, my) {
                 let ctx = self.ctx();
                 let pos = self.editor.caret_for_point(
@@ -1118,7 +1307,7 @@ impl App {
             } else {
                 return;
             };
-            self.scroll.scroll_by(dy);
+            self.scroll_direct(dy, host);
             if let Some((_, doc_y)) = self.toggle_point(mx, my) {
                 if let Some(row) = self.preview.row_at(&self.preview_rows, doc_y) {
                     if let Some((anchor, _)) = self.preview_sel {
@@ -1453,9 +1642,17 @@ impl App {
         canvas
     }
 
-    /// DPI scale + window-edge grip for pane geometry and scrollbar hit tests.
+    /// DPI scale + bar-safe window-edge grip for pane geometry and scrollbar
+    /// hit tests.
     fn metrics(&self) -> PaneMetrics {
-        PaneMetrics::new(self.scale, self.edge)
+        PaneMetrics::new(self.scale, self.bar_grip())
+    }
+
+    /// The strip the overlay scrollbars keep clear of: the platform's band
+    /// capped by a share of a bar's own thickness ([`preview_view::bar_grip`]).
+    /// Derived, so a wider platform band can never grow into the bars.
+    fn bar_grip(&self) -> f32 {
+        preview_view::bar_grip(self.scale, self.edge)
     }
 
     /// Test/CLI helper: scroll to an absolute offset (physical px).
@@ -1595,7 +1792,7 @@ fn char_col(buf: &Buffer, p: Pos) -> usize {
 impl Handler for App {
     fn on_event(&mut self, ev: Event, host: &mut dyn Host) {
         match ev {
-            Event::CloseRequested => host.quit(),
+            Event::CloseRequested => self.quit(host),
             Event::Resized {
                 width,
                 height,
@@ -1611,15 +1808,18 @@ impl Handler for App {
                 host.request_redraw();
             }
             Event::Scroll { dx, dy } => {
-                // Horizontal wheel/trackpad pans the no-wrap editor lines;
-                // preview panes wrap, so they have nothing to pan.
-                if self.mode != Mode::Preview {
-                    self.h_scroll = (self.h_scroll - dx).clamp(0.0, self.h_max);
-                }
-                self.scroll.scroll_by(-dy);
-                host.request_redraw();
+                self.pan_horizontal(dx);
+                self.scroll_input(-dy, host);
+            }
+            Event::Pan { dx, dy } => {
+                // Direct manipulation: follow the finger exactly, no glide —
+                // and drop any glide that was in flight (its remaining
+                // distance belongs to the wheel, not to the finger).
+                self.pan_horizontal(dx);
+                self.scroll_direct(-dy, host);
             }
             Event::KeyDown { key, mods } => self.on_key(key, mods, host),
+            Event::Frame => self.on_frame(host),
             Event::MouseDown { x, y, button } => self.on_mouse_down(x, y, button, host),
             Event::MouseMove { x, y } => self.on_mouse_move(x, y, host),
             Event::MouseUp { x, y, button } => self.on_mouse_up(x, y, button, host),
@@ -1630,6 +1830,28 @@ impl Handler for App {
                 if !self.theme_manual {
                     self.set_dark(dark);
                     host.request_redraw();
+                }
+            }
+            Event::WindowGeometry(g) => {
+                // Only a *change* is worth writing, and each change restarts
+                // the wait: a platform that reports the same rect over and over
+                // must not be able to push the write out indefinitely, and a
+                // drag must still collapse to its last rect.
+                let changed = self.window_maximized != g.maximized
+                    || (!g.maximized && self.window != Some(g));
+                self.window_maximized = g.maximized;
+                // Only the normal rect is worth keeping: a maximized window
+                // reports the work area, and a restore that reopened at those
+                // dimensions would hand back a screen-sized window the moment
+                // it was un-maximized. No redraw either — the platform sends
+                // `Resized` for the canvas, and an OS-driven move repaints on
+                // its own.
+                if !g.maximized {
+                    self.window = Some(g);
+                }
+                if changed {
+                    self.geometry_dirty = true;
+                    self.geometry_idle = GEOMETRY_SAVE_TICKS;
                 }
             }
         }
@@ -1703,6 +1925,31 @@ impl Handler for App {
         let labels = self.tab_labels();
         let lay = titlebar::layout(&self.fonts, &labels, self.size.0 as f32, self.scale);
         titlebar::hit_test(&lay, x, y)
+    }
+
+    /// Self-tuning resize strip: the platform's full band (`band`) everywhere,
+    /// except over a scrollbar, where only the bar-safe share is claimed so a
+    /// press on the bar can never start a window resize. Kept per-point rather
+    /// than per-window because the bars are the only thing at the edge that
+    /// needs the pixels — everywhere else the edge stays as easy to grab as
+    /// the platform allows.
+    fn grip_at(&self, x: f32, y: f32, band: f32) -> f32 {
+        if self.sb_at(x, y).is_some() {
+            preview_view::bar_grip(self.scale, band)
+        } else {
+            band
+        }
+    }
+
+    /// Reopen where the last session was left. The geometry is a request: the
+    /// backend checks it against the screens it has (see
+    /// `platform::title_reachable`) and falls back to its own placement when the
+    /// remembered monitor is gone.
+    fn initial_window(&self) -> Option<WindowGeometry> {
+        self.window.map(|g| WindowGeometry {
+            maximized: self.window_maximized,
+            ..g
+        })
     }
 
     fn cursor_at(&self, x: f32, y: f32) -> CursorShape {
@@ -3029,6 +3276,99 @@ mod tests {
         );
     }
 
+    /// Leftmost and rightmost edge (physical px) of the preview's text.
+    fn preview_text_extent(app: &App) -> (f32, f32) {
+        let ctx = app.ctx();
+        let mut min = f32::MAX;
+        let mut max = f32::MIN;
+        for op in &app.preview.list.ops {
+            if let crate::layout::display_list::DrawOp::Text {
+                x,
+                text,
+                size,
+                style,
+                ..
+            } = op
+            {
+                min = min.min(*x);
+                max = max.max(*x + ctx.fonts.measure(*style, text, *size));
+            }
+        }
+        (min, max)
+    }
+
+    #[test]
+    fn a_wider_window_gets_a_wider_reading_column() {
+        // Regression for "maximizing doesn't readjust": the wrapped panes kept a
+        // fixed 820 px measure however wide the window got, so maximizing left
+        // most of the screen empty instead of reflowing the text into it.
+        let mut app = open(
+            "readitor_test_column.txt",
+            &format!("# Wide\n\n{}\n", "word ".repeat(400)),
+        );
+        let _ = app.render_headless(1100, 800, 1.0);
+        let (n_min, n_max) = preview_text_extent(&app);
+        let _ = app.render_headless(1920, 1168, 1.0);
+        let (w_min, w_max) = preview_text_extent(&app);
+        assert!(
+            w_max - w_min > (n_max - n_min) * 1.5,
+            "the column must reflow into a maximized window: {n_min}..{n_max} -> {w_min}..{w_max}"
+        );
+        // Centered, and inside the pane: a wider column must not run under the
+        // window edge or the overlay scrollbar.
+        let pane = app.viewport();
+        assert!(w_min > pane.x + 100.0 && w_max < pane.right() - 100.0);
+        // The right margin is a word short of the left one at most.
+        assert!(
+            (w_min - pane.x - (pane.right() - w_max)).abs() < 60.0,
+            "not centered: {w_min} .. {w_max} in {pane:?}"
+        );
+        // A first row of the document is still the heading, i.e. the whole page
+        // was laid out again for the new width rather than scaled or clipped.
+        assert!(w_max - w_min > 0.0);
+    }
+
+    /// How long one frame costs, for the scroll-smoothness work: run with
+    /// `cargo test --release -- --ignored --nocapture paint_cost`.
+    #[test]
+    #[ignore]
+    fn paint_cost() {
+        let body = "word ".repeat(60);
+        let doc = (0..1200)
+            .map(|i| format!("## Section {i}\n\n{body}\n"))
+            .collect::<String>();
+        let mut app = open("readitor_bench.md", &doc);
+        let mut host = NullHost::default();
+        for (w, h) in [(1100usize, 800usize), (1920, 1168)] {
+            let _ = app.render_headless(w, h, 1.0);
+            let n = 60;
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                app.set_scroll((i * 37) as f32);
+                app.on_event(Event::Tick, &mut host);
+                let _ = app.render_headless(w, h, 1.0);
+            }
+            let per = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            println!("paint {w}x{h}: {per:.2} ms/frame ({:.0} fps)", 1000.0 / per);
+            println!(
+                "  preview ops {}, status buttons {}, rows {}",
+                app.preview.list.ops.len(),
+                app.status_buttons.len(),
+                app.preview_rows.len()
+            );
+            // Split: canvas allocation vs the painted content.
+            let mut c = crate::gfx::canvas::Canvas::new(w, h);
+            let t_alloc = t.elapsed();
+            let t2 = std::time::Instant::now();
+            crate::platform::Handler::paint(&mut app, &mut c);
+            let one = t2.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "  one paint {one:.2} ms (loop total {:.2})",
+                t_alloc.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
     #[test]
     fn cursor_over_scrollbars_is_arrow_not_ibeam() {
         let mut app = open(
@@ -3151,7 +3491,7 @@ mod tests {
         // zone and thumb clear the grip, the pointer is an arrow there, a
         // press on the visible thumb starts a drag, and the painted bar never
         // shows up inside the strip.
-        let grip = platform::edge_grip();
+        let band = platform::edge_grip();
         let (w, h) = (800usize, 600usize);
         // One block per paragraph guarantees a document taller than any pane.
         let content = "a paragraph of text\n\n".repeat(120);
@@ -3164,8 +3504,20 @@ mod tests {
             assert_eq!(app.mode, mode, "setup: mode after {presses} Ctrl+E");
             assert_eq!(
                 app.edge,
-                grip * app.scale,
-                "{mode:?}: app tracks the edge grip (physical px)"
+                band * app.scale,
+                "{mode:?}: app tracks the platform band (physical px)"
+            );
+            // The strip the bars clear is derived from a bar's own thickness
+            // under the platform band, so it can never grow into the bar.
+            let grip = app.bar_grip();
+            assert_eq!(
+                grip,
+                preview_view::bar_grip(app.scale, app.edge),
+                "{mode:?}: bar-safe strip is derived, not chosen"
+            );
+            assert!(
+                grip <= preview_view::BAR_W_LOGICAL * preview_view::GRIP_SHARE * app.scale + 0.001,
+                "{mode:?}: strip {grip} eats into the bar"
             );
             // Lay out first: the bar exists only once the pane knows its
             // content height.
@@ -3214,17 +3566,27 @@ mod tests {
                 app.sb_drag.is_some(),
                 "{mode:?}: a press on the visible thumb must start a scroll drag"
             );
-            // Painted pixels agree with the geometry: the bar's own colour is
-            // absent from the strip and present just inside it.
+            // Painted pixels agree with the geometry *and* with the strip that
+            // applies at each of them: the strip is asked for per point, so a
+            // painted bar column must be a column the platform does not claim
+            // at that row — anywhere else the pixel would be unreachable.
             let bar = canvas.pixels[(py as usize) * w + px as usize];
-            let strip = (w - grip as usize)..w;
-            let in_strip = (40..h - 40)
-                .flat_map(|y| strip.clone().map(move |x| (x, y)))
+            let samples: Vec<(usize, usize)> = (48..h - 48)
+                .step_by(7)
+                .flat_map(|y| ((w - 24)..w).map(move |x| (x, y)))
                 .filter(|&(x, y)| canvas.pixels[y * w + x] == bar)
-                .count();
-            assert_eq!(
-                in_strip, 0,
-                "{mode:?}: bar colour painted inside the resize strip"
+                .collect();
+            for &(x, y) in &samples {
+                let g = app.grip_at(x as f32, y as f32, band);
+                assert!(
+                    x as f32 + g <= w as f32,
+                    "{mode:?}: bar pixel at ({x}, {y}) is inside the {g} px strip the platform claims there"
+                );
+            }
+            assert!(
+                samples.len() > 20,
+                "{mode:?}: sampled colour is not the bar ({} px)",
+                samples.len()
             );
             let inside = (40..h - 40)
                 .flat_map(|y| ((w - grip as usize - 20)..(w - grip as usize)).map(move |x| (x, y)))
@@ -3235,6 +3597,160 @@ mod tests {
                 "{mode:?}: sampled colour is not the bar ({inside} px)"
             );
         }
+    }
+
+    #[test]
+    fn resize_grip_self_tunes_to_what_is_at_the_edge() {
+        // The strip is asked for per point, not chosen once: the platform's full
+        // band wherever the app draws nothing, and only the bar-safe share over
+        // a bar. Both halves matter — widening an edge is only safe as long as
+        // the bars still get their pixels back — so each is asserted in every
+        // mode the bar is reachable through.
+        let band = platform::edge_grip();
+        let (w, h) = (800usize, 600usize);
+        let mid = h as f32 / 2.0;
+        let near_edge = w as f32 - 1.0;
+        // A document that fits: no bar at all, so the whole edge is resizable
+        // at the platform's full band rather than the bar-safe share.
+        let mut short = open("readitor_test_grip.txt", "one short line\n");
+        let _ = short.render_headless(w, h, 1.0);
+        assert!(
+            short.sb_geom(false, false).is_none(),
+            "setup: a short document needs no scrollbar"
+        );
+        assert_eq!(
+            short.grip_at(near_edge, mid, band),
+            band,
+            "no bar at the edge: it keeps the platform's full band"
+        );
+        let content = "a paragraph of text\n\n".repeat(120);
+        for (presses, mode) in [(0u8, Mode::Preview), (1, Mode::Edit), (2, Mode::Split)] {
+            let mut app = open("readitor_test_grip2.txt", &content);
+            let mut host = NullHost::default();
+            for _ in 0..presses {
+                app.on_event(ctrl('e'), &mut host); // Preview -> Edit -> Split
+            }
+            let _ = app.render_headless(w, h, 1.0);
+            let editor = mode != Mode::Preview;
+            let grip = app.bar_grip();
+            // Never wider than the band the platform claims, and strictly
+            // narrower over a bar — the second half only means something when
+            // there is a band at all: macOS reports `0.0` (no edge grip) until
+            // the AppKit backend lands (M9), and then there is nothing for a
+            // bar to hand back, which the `<=` pins exactly.
+            assert!(
+                grip <= band * app.scale,
+                "{mode:?}: the bar-safe strip is never wider than the platform's band"
+            );
+            if band > 0.0 {
+                assert!(
+                    grip < band * app.scale,
+                    "{mode:?}: the bar-safe strip must be the narrower one"
+                );
+            }
+            assert_eq!(
+                grip,
+                preview_view::bar_grip(app.scale, band),
+                "{mode:?}: the bar-safe strip follows the band it is given"
+            );
+            let g = app
+                .sb_geom(editor, false)
+                .unwrap_or_else(|| panic!("{mode:?}: expected a vertical scrollbar"));
+            // Over the bar the app keeps its pixels; the columns between the
+            // bar and the edge stay available for resizing, which is what the
+            // platform does with the band it gets back there.
+            for (name, x) in [
+                ("thumb", g.thumb.x + 1.0),
+                ("bar's outer column", g.thumb.right() - 1.0),
+            ] {
+                assert_eq!(
+                    app.grip_at(x, mid, band),
+                    grip,
+                    "{mode:?}: {name} must be handed back to the app"
+                );
+            }
+            assert_eq!(
+                app.grip_at(near_edge, mid, band),
+                band,
+                "{mode:?}: the outermost columns stay the platform's to resize"
+            );
+            // Away from the bar the whole band is available: a point on the far
+            // edge is inside the band's width but nothing the app draws on.
+            assert_eq!(
+                app.grip_at(1.0, mid, band),
+                band,
+                "{mode:?}: the far edge is untouched by the bar"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wheel_notch_glides_over_frames_instead_of_jumping() {
+        // The choppiness is the *step*, not the speed: a notch that lands in
+        // one frame is four or five visible jumps. Nothing moves on the
+        // notch's own frame, the host is asked for a clock fast enough to
+        // animate on, and the travel arrives over several frames.
+        let mut app = open("readitor_test_glide.txt", &"line\n".repeat(400));
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        assert_eq!(app.scroll.offset, 0.0);
+        app.on_event(Event::Scroll { dx: 0.0, dy: -48.0 }, &mut host);
+        assert_eq!(app.scroll.offset, 0.0, "a notch must not land in one jump");
+        assert!(
+            host.animating,
+            "a glide needs frames the heartbeat cannot give"
+        );
+        let mut seen = vec![app.scroll.offset];
+        for _ in 0..600 {
+            if !app.scrolling {
+                break;
+            }
+            app.on_event(Event::Frame, &mut host);
+            seen.push(app.scroll.offset);
+        }
+        assert!(
+            seen.len() > 5,
+            "a notch should arrive over several frames, not {}: {seen:?}",
+            seen.len()
+        );
+        for w in seen.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "each frame must move a little, and never backwards: {seen:?}"
+            );
+        }
+        // It lands exactly where the notch pointed, and the clock stops with
+        // it — a host left animating forever is a host repainting forever.
+        assert_eq!(app.scroll.offset, 48.0);
+        assert!(!app.scrolling);
+        assert!(!host.animating);
+    }
+
+    #[test]
+    fn a_finger_pan_follows_the_input_and_drops_a_glide() {
+        let mut app = open("readitor_test_pan.txt", &"line\n".repeat(400));
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        // Direct manipulation tracks the input exactly: gliding a finger's own
+        // movement would read as lag, not as smoothness.
+        app.on_event(Event::Pan { dx: 0.0, dy: -17.0 }, &mut host);
+        assert_eq!(app.scroll.offset, 17.0);
+        assert!(
+            !app.scrolling,
+            "no glide stands between the finger and the view"
+        );
+        // A finger landing mid-glide takes the view over: the notch's leftover
+        // travel is dropped rather than resumed under the finger.
+        app.on_event(Event::Scroll { dx: 0.0, dy: -48.0 }, &mut host);
+        assert!(app.scrolling);
+        app.on_event(Event::Pan { dx: 0.0, dy: -5.0 }, &mut host);
+        assert_eq!(app.scroll.offset, 22.0);
+        assert_eq!(
+            app.scroll.target, 22.0,
+            "the glide is abandoned, not pending"
+        );
+        assert!(!app.scrolling);
+        assert!(!host.animating, "the frame clock goes with the glide");
     }
 
     #[test]
@@ -3294,6 +3810,309 @@ mod tests {
         );
         assert!(app.scroll.offset > 100.0, "track click pages down");
         assert!(app.sb_drag.is_some(), "track click grabs the thumb");
+    }
+
+    #[test]
+    fn a_maximized_window_keeps_the_rect_it_restores_to() {
+        // The window the user reopens wants the size and place they were using
+        // *before* maximizing: a maximized report carries the work area, and
+        // restoring that would hand back a screen-sized window as soon as it
+        // was un-maximized.
+        let mut app = open("readitor_test_win.txt", "hello\n");
+        let mut host = NullHost::default();
+        let normal = WindowGeometry {
+            x: -1200,
+            y: 60,
+            width: 1100,
+            height: 800,
+            maximized: false,
+        };
+        app.on_event(Event::WindowGeometry(normal), &mut host);
+        assert_eq!(app.settings().window, Some((-1200, 60, 1100, 800)));
+        assert!(!app.settings().maximized);
+        app.on_event(
+            Event::WindowGeometry(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1040,
+                maximized: true,
+            }),
+            &mut host,
+        );
+        assert_eq!(
+            app.settings().window,
+            Some((-1200, 60, 1100, 800)),
+            "maximizing must not overwrite the rect to restore at"
+        );
+        assert!(app.settings().maximized);
+        // Un-maximizing reports the real rect again, and a later move updates
+        // it — the layout the OS restored is authoritative either way.
+        let moved = WindowGeometry {
+            x: 300,
+            y: 200,
+            width: 900,
+            height: 700,
+            maximized: false,
+        };
+        app.on_event(Event::WindowGeometry(moved), &mut host);
+        assert_eq!(app.settings().window, Some((300, 200, 900, 700)));
+        assert!(!app.settings().maximized);
+    }
+
+    #[test]
+    fn leaving_remembers_the_window() {
+        // `persist` runs from many places, but the window's rect is only
+        // readable while the window exists, so the way *out* is the one that
+        // has to write the last one.
+        let mut app = open("readitor_test_quit.txt", "hello\n");
+        let mut host = NullHost::default();
+        app.on_event(
+            Event::WindowGeometry(WindowGeometry {
+                x: 300,
+                y: 200,
+                width: 900,
+                height: 700,
+                maximized: false,
+            }),
+            &mut host,
+        );
+        app.quit(&mut host);
+        assert!(host.quit_requested, "quitting still asks the host to quit");
+        assert_eq!(app.settings().window, Some((300, 200, 900, 700)));
+    }
+
+    /// The rect a test's window is reported at, normal (not maximized).
+    fn geometry(x: i32, y: i32, width: u32, height: u32) -> WindowGeometry {
+        WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+            maximized: false,
+        }
+    }
+
+    #[test]
+    fn a_moved_window_is_written_without_a_clean_exit() {
+        // The session is written on the way out, but a killed process, a crash
+        // or a power cut never gets there — so the heartbeat has to write a
+        // reported geometry on its own, or the next launch reopens at the rect
+        // of the last *clean* exit.
+        let mut app = open("readitor_test_geom_beat.txt", "hello\n");
+        let mut host = NullHost::default();
+        app.on_event(
+            Event::WindowGeometry(geometry(300, 200, 900, 700)),
+            &mut host,
+        );
+        assert!(app.geometry_dirty, "a report is queued for writing");
+        for _ in 0..GEOMETRY_SAVE_TICKS - 1 {
+            app.on_event(Event::Tick, &mut host);
+        }
+        assert!(
+            app.geometry_dirty,
+            "not written while the window is still settling"
+        );
+        app.on_event(Event::Tick, &mut host);
+        assert!(!app.geometry_dirty, "written once the window held still");
+        assert_eq!(app.settings().window, Some((300, 200, 900, 700)));
+    }
+
+    #[test]
+    fn a_repeated_report_cannot_starve_the_write() {
+        // Some platforms re-report a rect they have already reported (a state
+        // change the window manager echoes back). If every report restarted
+        // the wait, a window that only ever re-reported would never reach the
+        // file at all.
+        let mut app = open("readitor_test_geom_repeat.txt", "hello\n");
+        let mut host = NullHost::default();
+        let g = geometry(10, 20, 800, 600);
+        app.on_event(Event::WindowGeometry(g), &mut host);
+        for _ in 0..GEOMETRY_SAVE_TICKS {
+            app.on_event(Event::WindowGeometry(g), &mut host);
+            app.on_event(Event::Tick, &mut host);
+        }
+        assert!(
+            !app.geometry_dirty,
+            "the same rect re-reported is still one pending write"
+        );
+        assert_eq!(app.settings().window, Some((10, 20, 800, 600)));
+    }
+
+    #[test]
+    fn a_drag_writes_once_at_the_rect_it_ended_on() {
+        // A move reports every intermediate rect. Each one defers the write
+        // (so a long drag is not a write per frame), and the one that lands is
+        // the rect the gesture ended on.
+        let mut app = open("readitor_test_geom_drag.txt", "hello\n");
+        let mut host = NullHost::default();
+        for i in 0..6 {
+            app.on_event(
+                Event::WindowGeometry(geometry(100 + i * 40, 150 + i * 10, 900, 700)),
+                &mut host,
+            );
+            for _ in 0..5 {
+                app.on_event(Event::Tick, &mut host);
+            }
+            assert!(app.geometry_dirty, "mid-drag the write is still pending");
+        }
+        for _ in 0..GEOMETRY_SAVE_TICKS {
+            app.on_event(Event::Tick, &mut host);
+        }
+        assert_eq!(
+            app.settings().window,
+            Some((300, 200, 900, 700)),
+            "the rect the drag ended on is the one remembered"
+        );
+    }
+
+    #[test]
+    fn a_maximized_window_is_written_even_though_its_rect_is_not() {
+        // Maximizing changes what the next session does (open maximized)
+        // without changing the rect it reopens at, so the change has to be
+        // queued on its own — the rect of a maximized report is the work area,
+        // which must not replace the one to restore.
+        let mut app = open("readitor_test_geom_max.txt", "hello\n");
+        let mut host = NullHost::default();
+        app.restore_window(Some((120, 80, 1100, 800)), false);
+        app.on_event(
+            Event::WindowGeometry(WindowGeometry {
+                maximized: true,
+                ..geometry(0, 0, 1920, 1040)
+            }),
+            &mut host,
+        );
+        assert!(app.geometry_dirty, "the maximize is queued for writing");
+        for _ in 0..GEOMETRY_SAVE_TICKS {
+            app.on_event(Event::Tick, &mut host);
+        }
+        assert!(!app.geometry_dirty);
+        assert_eq!(app.settings().window, Some((120, 80, 1100, 800)));
+        assert!(app.settings().maximized);
+        // A first report that only confirms the restored state is not a change,
+        // so a session reopened maximized does not rewrite itself on launch.
+        let mut again = open("readitor_test_geom_max2.txt", "hello\n");
+        again.restore_window(Some((120, 80, 1100, 800)), true);
+        again.on_event(
+            Event::WindowGeometry(WindowGeometry {
+                maximized: true,
+                ..geometry(0, 0, 1920, 1040)
+            }),
+            &mut host,
+        );
+        assert!(!again.geometry_dirty);
+    }
+
+    #[test]
+    fn a_saved_window_is_what_the_platform_is_asked_to_open_at() {
+        let mut app = open("readitor_test_win2.txt", "hello\n");
+        let mut host = NullHost::default();
+        // Nothing saved yet (a first run): the platform places the window.
+        assert_eq!(app.initial_window(), None);
+        app.restore_window(Some((120, 80, 1100, 800)), true);
+        assert_eq!(
+            app.initial_window(),
+            Some(WindowGeometry {
+                x: 120,
+                y: 80,
+                width: 1100,
+                height: 800,
+                maximized: true,
+            })
+        );
+        // And the whole thing survives a settings round trip, which is what
+        // the next launch reads.
+        let round_tripped = app.settings();
+        assert_eq!(round_tripped.window, Some((120, 80, 1100, 800)));
+        assert!(round_tripped.maximized);
+        let mut next = open("readitor_test_win3.txt", "hello\n");
+        next.restore_window(round_tripped.window, round_tripped.maximized);
+        next.on_event(
+            Event::WindowGeometry(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1400,
+                maximized: true,
+            }),
+            &mut host,
+        );
+        assert_eq!(
+            next.initial_window(),
+            Some(WindowGeometry {
+                x: 120,
+                y: 80,
+                width: 1100,
+                height: 800,
+                maximized: true,
+            }),
+            "a maximized first report must not lose the saved rect"
+        );
+    }
+
+    #[test]
+    fn a_stranded_scroll_drag_ends_on_the_next_press() {
+        // Regression: the thumb follows the pointer for as long as a drag is
+        // live, and only `MouseUp` ends it. A release the platform cannot
+        // deliver — the pointer let go outside the client area, the window
+        // deactivated mid-drag — used to leave the bar glued to the pointer,
+        // scrolling on every move with no button held, until a later click
+        // happened to free it. The click that starts the next gesture is where
+        // that has to end, so a stranded drag can never outlive one press.
+        let mut app = open("readitor_test_stranded.txt", &"line\n".repeat(200));
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        let area = app.viewport();
+        let g = app
+            .preview
+            .v_sb(area, app.scroll.offset, app.metrics())
+            .unwrap();
+        app.on_event(
+            Event::MouseDown {
+                x: g.thumb.x + 2.0,
+                y: g.thumb.y + 4.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(
+            app.sb_drag.is_some(),
+            "setup: the press starts a thumb drag"
+        );
+        app.on_event(
+            Event::MouseMove {
+                x: g.thumb.x + 2.0,
+                y: g.start + g.travel,
+            },
+            &mut host,
+        );
+        let dragged = app.scroll.offset;
+        assert!(dragged > 100.0, "setup: the drag scrolls to the bottom");
+        // The release never arrives. The user presses a line of text instead.
+        app.on_event(
+            Event::MouseDown {
+                x: 40.0,
+                y: 200.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(
+            app.sb_drag.is_none(),
+            "the next press must free a drag whose release was lost"
+        );
+        // ...and from there the pointer moves without touching the bar.
+        app.on_event(
+            Event::MouseMove {
+                x: g.thumb.x + 2.0,
+                y: g.start,
+            },
+            &mut host,
+        );
+        assert_eq!(
+            app.scroll.offset, dragged,
+            "a pointer with no button on it must not drag the bar"
+        );
     }
 
     #[test]

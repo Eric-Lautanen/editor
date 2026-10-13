@@ -15,7 +15,7 @@ use crate::{
     gfx::canvas::Canvas,
     platform::Host,
     ui::{
-        event::{CursorShape, Event, Key, Modifiers, MouseButton},
+        event::{CursorShape, Event, Key, Modifiers, MouseButton, WindowGeometry},
         titlebar::TitleHit,
     },
 };
@@ -25,6 +25,28 @@ use std::{
 };
 
 // ---------------------------------------------------------------- FFI
+
+// libc, for the font mapping only (`font::fallback` maps system fonts rather
+// than reading them, see `platform::map_file`). No libc crate: one link
+// attribute and the four calls needed.
+#[link(name = "c")]
+extern "C" {
+    fn open(path: *const c_char, flags: c_int) -> c_int;
+    fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        off: i64,
+    ) -> *mut c_void;
+}
+
+/// `O_RDONLY`; the value is Linux's, which is what this backend targets.
+const O_RDONLY: c_int = 0;
+const PROT_READ: c_int = 1;
+const MAP_PRIVATE: c_int = 2;
+const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 
 type Display = c_void;
 type Window = c_ulong;
@@ -319,6 +341,7 @@ const KEY_PRESS: i32 = 2;
 const BUTTON_PRESS: i32 = 4;
 const BUTTON_RELEASE: i32 = 5;
 const MOTION_NOTIFY: i32 = 6;
+const FOCUS_OUT: i32 = 10;
 const EXPOSE: i32 = 12;
 const CONFIGURE_NOTIFY: i32 = 22;
 const PROPERTY_NOTIFY: i32 = 28;
@@ -335,6 +358,9 @@ const BUTTON_RELEASE_MASK: c_long = 1 << 3;
 const POINTER_MOTION_MASK: c_long = 1 << 6;
 const EXPOSURE_MASK: c_long = 1 << 15;
 const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
+/// Focus changes: a grab or activation change mid-press means the release is
+/// no longer ours (`cancel_gesture`).
+const FOCUS_CHANGE_MASK: c_long = 1 << 21;
 const PROPERTY_CHANGE_MASK: c_long = 1 << 22;
 const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
 const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
@@ -384,8 +410,18 @@ const CURRENT_TIME: Time = 0;
 
 const WIN_W: c_uint = 1100;
 const WIN_H: c_uint = 800;
-/// Edge band (px) that starts a manual resize, matching the old thick frame.
+/// `_NET_WM_STATE` client-message actions (`_NET_WM_STATE_ADD` / `_TOGGLE`).
+const WM_STATE_ADD: i32 = 1;
+const WM_STATE_TOGGLE: i32 = 2;
+/// Widest edge band (px) that starts a manual resize, matching the old thick
+/// frame. X11 hands the client no sizing-border metric, so this is the backend's
+/// own maximum; `App` narrows it to just the points where a scrollbar needs the
+/// pixels, and the rest of the edge keeps the full band (see `Handler::grip_at`).
 const RESIZE_BAND: i32 = 6;
+/// Animation frame interval while the app is moving something: ~120 Hz, which
+/// is above any display this renders on, and the poll loop is already awake
+/// every 1 ms so no timer is needed to produce it.
+const FRAME_MS: u64 = 8;
 
 // ---------------------------------------------------------------- state
 
@@ -405,6 +441,10 @@ struct X {
     last_title: String,
     /// Set by `request_redraw`; the poll loop paints when it sees it.
     dirty: bool,
+    /// The app has something animating and wants frames (see
+    /// `Host::set_animating`): the poll loop then emits `Event::Frame` on its
+    /// own `FRAME_MS` cadence instead of only the 40 ms heartbeat.
+    animating: bool,
     /// True once the loop should exit (window destroyed / host quit).
     done: bool,
     /// Text we own as the CLIPBOARD/PRIMARY selection, if any.
@@ -416,8 +456,12 @@ struct X {
     size_drag: Option<(i32, i32, i32, i32, i32, i32, u8)>,
     /// Last known window geometry (for move/resize math).
     geom: (i32, i32, i32, i32),
-    /// Last mouse position (client px), for cursor updates.
+    /// Last mouse position (client px), for cursor updates and for the release
+    /// synthesized when focus leaves mid-press.
     mouse: (f32, f32),
+    /// Left button held with the app told about it. The app's drags end only on
+    /// `MouseUp`, so this is what `FOCUS_OUT` consults.
+    left_down: bool,
     /// Root depth of the window (for the XImage header).
     depth: i32,
     /// Events swallowed while waiting for a SelectionNotify, replayed later.
@@ -507,10 +551,45 @@ pub fn system_prefers_dark() -> bool {
     out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("dark"))
 }
 
-/// The manual edge-resize band (px) this backend claims, exposed through
+/// The widest manual edge-resize band (px) this backend claims, exposed through
 /// `platform::edge_grip` so `App` keeps its overlay scrollbars clear of it.
 pub fn edge_grip() -> f32 {
     RESIZE_BAND as f32
+}
+
+/// Read-only `MAP_PRIVATE` view of a file for the life of the process (see
+/// `platform::map_file`). `None` when the file is empty or cannot be mapped, so
+/// the caller reads it instead.
+///
+/// `MAP_PRIVATE` rather than `MAP_SHARED`: writes by another process must never
+/// reach our view of a font, and the kernel then keeps the pages copy-on-write
+/// and file-backed. The descriptor is deliberately left open (the view is
+/// borrowed for `'static`); the path is used only to open it.
+pub fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len == 0 || len > usize::MAX as u64 {
+        return None;
+    }
+    let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    unsafe {
+        let fd = open(c.as_ptr(), O_RDONLY);
+        if fd < 0 {
+            return None;
+        }
+        let p = mmap(null_mut(), len as usize, PROT_READ, MAP_PRIVATE, fd, 0);
+        if p == MAP_FAILED || p.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(p as *const u8, len as usize))
+    }
+}
+
+/// Whether the poll loop should hand the app an animation frame now. The loop
+/// wakes every millisecond, so without the interval a glide would be stepped
+/// as fast as the machine can go — thousands of pointless repaints a second
+/// instead of the ~120 the eye can use.
+fn frame_due(animating: bool, since_last: std::time::Duration) -> bool {
+    animating && since_last >= std::time::Duration::from_millis(FRAME_MS)
 }
 
 pub fn exe_path() -> Option<std::path::PathBuf> {
@@ -526,6 +605,11 @@ struct XHost {
 impl Host for XHost {
     fn request_redraw(&mut self) {
         unsafe { (*self.x).dirty = true };
+    }
+    /// Frames come from the poll loop's own clock (see `FRAME_MS`); this just
+    /// says whether the app still wants them.
+    fn set_animating(&mut self, on: bool) {
+        unsafe { (*self.x).animating = on };
     }
     fn set_title(&mut self, title: &str) {
         unsafe {
@@ -568,26 +652,7 @@ impl Host for XHost {
         }
     }
     fn toggle_maximize(&mut self) {
-        unsafe {
-            let x = &*self.x;
-            let mut ev: XClientMessageEvent = std::mem::zeroed();
-            ev.kind = CLIENT_MESSAGE;
-            ev.window = x.win;
-            ev.message_type = x.atoms.net_wm_state;
-            ev.format = 32;
-            ev.data[0] = 2; // _NET_WM_STATE_TOGGLE
-            ev.data[1] = x.atoms.net_wm_state_maximized_vert as c_long;
-            ev.data[2] = x.atoms.net_wm_state_maximized_horz as c_long;
-            let raw = &ev as *const XClientMessageEvent as *const XEvent;
-            XSendEvent(
-                x.d,
-                x.root,
-                1,
-                SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
-                raw,
-            );
-            XFlush(x.d);
-        }
+        unsafe { wm_state(&*self.x, WM_STATE_TOGGLE) }
     }
     fn quit(&mut self) {
         unsafe {
@@ -599,6 +664,48 @@ impl Host for XHost {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// Ask the WM to add or toggle both maximized states on our window. The WM
+/// owns maximize, so this is a request either way — `run` uses it to reopen a
+/// session that ended maximized, `Host::toggle_maximize` for Ctrl+↑ and the
+/// title-bar button.
+unsafe fn wm_state(x: &X, action: i32) {
+    let mut ev: XClientMessageEvent = std::mem::zeroed();
+    ev.kind = CLIENT_MESSAGE;
+    ev.window = x.win;
+    ev.message_type = x.atoms.net_wm_state;
+    ev.format = 32;
+    ev.data[0] = action;
+    ev.data[1] = x.atoms.net_wm_state_maximized_vert as c_long;
+    ev.data[2] = x.atoms.net_wm_state_maximized_horz as c_long;
+    let raw = &ev as *const XClientMessageEvent as *const XEvent;
+    XSendEvent(
+        x.d,
+        x.root,
+        1,
+        SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
+        raw,
+    );
+    XFlush(x.d);
+}
+
+/// Tell the app where the window is and whether it is maximized — the X11
+/// counterpart of the Win32 `report_geometry`, sent on every configure and on
+/// every maximize the WM decides on its own. Only `ConfigureNotify` knows a
+/// move, and only `_NET_WM_STATE` knows the maximize, so both call this.
+unsafe fn report_geometry(x: &mut X) {
+    let (wx, wy, ww, wh) = x.geom;
+    dispatch(
+        x,
+        Event::WindowGeometry(WindowGeometry {
+            x: wx,
+            y: wy,
+            width: ww.max(0) as u32,
+            height: wh.max(0) as u32,
+            maximized: x.maximized,
+        }),
+    );
+}
 
 /// Modal file dialog by shelling out to `zenity`, falling back to
 /// `kdialog`. `None` = cancelled or no dialog helper installed.
@@ -939,16 +1046,23 @@ unsafe fn handle_event(x: *mut X, ev: &XEvent) {
             let control = !matches!(hit, TitleHit::Drag | TitleHit::Client);
             let mut edges = 0u8;
             if !control && !x.maximized {
-                if bx < RESIZE_BAND {
+                // The band is the backend's maximum; the app hands back the
+                // pixels its overlay scrollbars draw on so a press on a bar
+                // scrolls instead of resizing (see `Handler::grip_at`).
+                let band = x
+                    .handler
+                    .grip_at(bx as f32, by as f32, RESIZE_BAND as f32)
+                    .round() as i32;
+                if bx < band {
                     edges |= 1;
                 }
-                if bx > w - RESIZE_BAND {
+                if bx > w - band {
                     edges |= 2;
                 }
-                if by < RESIZE_BAND {
+                if by < band {
                     edges |= 4;
                 }
-                if by > h - RESIZE_BAND {
+                if by > h - band {
                     edges |= 8;
                 }
             }
@@ -987,6 +1101,11 @@ unsafe fn handle_event(x: *mut X, ev: &XEvent) {
                 TILT_RIGHT => dispatch(x, Event::Scroll { dx: 120.0, dy: 0.0 }),
                 b => {
                     if let Some(button) = button_of(b) {
+                        if button == MouseButton::Left {
+                            // Held for the gesture: FOCUS_OUT is where a
+                            // release that went to someone else is fulfilled.
+                            x.left_down = true;
+                        }
                         dispatch(
                             x,
                             Event::MouseDown {
@@ -1003,6 +1122,9 @@ unsafe fn handle_event(x: *mut X, ev: &XEvent) {
             let bev = ev as *const XEvent as *const XButtonEvent;
             x.move_drag = None;
             x.size_drag = None;
+            if (*bev).button == BUTTON_LEFT {
+                x.left_down = false;
+            }
             if let Some(button) = button_of((*bev).button) {
                 dispatch(
                     x,
@@ -1010,6 +1132,28 @@ unsafe fn handle_event(x: *mut X, ev: &XEvent) {
                         x: (*bev).x as f32,
                         y: (*bev).y as f32,
                         button,
+                    },
+                );
+            }
+        }
+        FOCUS_OUT => {
+            // A press keeps the pointer grabbed (X hands us the release
+            // implicitly), but focus leaving takes that grab with it — the WM's
+            // own Alt+drag, another client's popup, Alt+Tab. The release is then
+            // someone else's message, and a gesture left running strands
+            // exactly the things the app's drags touch: the thumb keeps
+            // following the pointer, the selection keeps growing.
+            x.move_drag = None;
+            x.size_drag = None;
+            if x.left_down {
+                x.left_down = false;
+                let (mx, my) = x.mouse;
+                dispatch(
+                    x,
+                    Event::MouseUp {
+                        x: mx,
+                        y: my,
+                        button: MouseButton::Left,
                     },
                 );
             }
@@ -1071,6 +1215,7 @@ unsafe fn handle_event(x: *mut X, ev: &XEvent) {
             let cev = ev as *const XEvent as *const XConfigureEvent;
             let (w, h) = ((*cev).width, (*cev).height);
             x.geom = ((*cev).x, (*cev).y, w, h);
+            report_geometry(x);
             if w != x.canvas.width as i32 || h != x.canvas.height as i32 {
                 x.canvas.resize(w.max(1) as usize, h.max(1) as usize);
                 x.dirty = true;
@@ -1087,7 +1232,14 @@ unsafe fn handle_event(x: *mut X, ev: &XEvent) {
         PROPERTY_NOTIFY => {
             let pev = ev as *const XEvent as *const XPropertyEvent;
             if (*pev).atom == x.atoms.net_wm_state {
+                let was = x.maximized;
                 read_maximized(x);
+                // The WM owns maximize: a state change we did not ask for (a
+                // tile/snap key, a session manager) is how the app hears about
+                // it, and it is also what a restore has to survive.
+                if x.maximized != was {
+                    report_geometry(x);
+                }
             }
         }
         CLIENT_MESSAGE => {
@@ -1125,13 +1277,30 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         let screen = XDefaultScreen(d);
         let root = XDefaultRootWindow(d);
         let depth = XDefaultDepth(d, screen);
-        // Center on the screen, like the Windows backend.
+        // Where to open: the rect the last session was closed at when this
+        // screen still shows it, else centered, like the Windows backend. Read
+        // before the handler moves into `X`.
+        let asked = handler.initial_window();
+        let maximized = asked.is_some_and(|g| g.maximized);
         let (sw, sh) = (XDisplayWidth(d, screen), XDisplayHeight(d, screen));
-        let (x0, y0) = (
+        let centered = (
             ((sw - WIN_W as i32) / 2).max(0),
             ((sh - WIN_H as i32) / 2).max(0),
+            WIN_W as i32,
+            WIN_H as i32,
         );
-        let win = XCreateSimpleWindow(d, root, x0, y0, WIN_W, WIN_H, 0, 0, 0);
+        let (x0, y0, win_w, win_h) = super::open_at(asked, (0, 0, sw, sh), centered);
+        let win = XCreateSimpleWindow(
+            d,
+            root,
+            x0,
+            y0,
+            win_w.max(1) as c_uint,
+            win_h.max(1) as c_uint,
+            0,
+            0,
+            0,
+        );
         if win == 0 {
             XCloseDisplay(d);
             return Err(Error::Platform("XCreateSimpleWindow failed".into()));
@@ -1159,6 +1328,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
                 | BUTTON_RELEASE_MASK
                 | POINTER_MOTION_MASK
                 | EXPOSURE_MASK
+                | FOCUS_CHANGE_MASK
                 | STRUCTURE_NOTIFY_MASK
                 | PROPERTY_CHANGE_MASK,
         );
@@ -1178,15 +1348,17 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             cursors,
             atoms,
             handler,
-            canvas: Canvas::new(WIN_W as usize, WIN_H as usize),
+            canvas: Canvas::new(win_w.max(1) as usize, win_h.max(1) as usize),
             last_title: title,
             dirty: true,
+            animating: false,
             done: false,
             clip_text: String::new(),
             move_drag: None,
             size_drag: None,
-            geom: (x0, y0, WIN_W as i32, WIN_H as i32),
+            geom: (x0, y0, win_w, win_h),
             mouse: (0.0, 0.0),
+            left_down: false,
             depth,
             deferred: Vec::new(),
             cursor_idx: 0,
@@ -1203,18 +1375,28 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             host.set_title(&t);
         }
         XMapWindow(d, win);
+        // The rect we opened at, before the WM has had a say.
+        report_geometry(x.as_mut());
+        if maximized {
+            // A session that ended maximized opens maximized — at the normal
+            // rect, so un-maximizing lands where the user left it. The WM owns
+            // the state, so this is a request; the change comes back to the app
+            // as geometry (`_NET_WM_STATE` → `PROPERTY_NOTIFY`).
+            wm_state(&x, WM_STATE_ADD);
+        }
         // Tell the app its initial size so the first paint lays out correctly.
         dispatch(
             x.as_mut() as *mut X,
             Event::Resized {
-                width: WIN_W as usize,
-                height: WIN_H as usize,
+                width: win_w.max(1) as usize,
+                height: win_h.max(1) as usize,
                 scale: 1.0,
             },
         );
 
         let mut ev: XEvent = std::mem::zeroed();
         let mut last_tick = std::time::Instant::now();
+        let mut last_frame = std::time::Instant::now();
         while !x.done {
             let mut handled = false;
             while XPending(d) > 0 {
@@ -1233,6 +1415,12 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             if last_tick.elapsed() >= std::time::Duration::from_millis(40) {
                 last_tick = std::time::Instant::now();
                 dispatch(x.as_mut() as *mut X, Event::Tick);
+            }
+            // A glide needs far more than 25 Hz; the app asks for frames only
+            // while something is actually moving.
+            if frame_due(x.animating, last_frame.elapsed()) {
+                last_frame = std::time::Instant::now();
+                dispatch(x.as_mut() as *mut X, Event::Frame);
             }
             if !handled {
                 std::thread::sleep(std::time::Duration::from_millis(1));

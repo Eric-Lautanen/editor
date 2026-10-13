@@ -26,6 +26,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # See ci.yml: the X11 backend links libX11, and the `libX11.so` linker
+      # symlink is not in the runner image.
+      - name: install X11 development files
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev
       - run: cargo test
       - run: cargo build --release
 
@@ -39,17 +46,24 @@ jobs:
       - name: package (linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          mkdir -p dist
+          mkdir -p dist/packaging
           cp target/release/readitor dist/
-          cp -r packaging/linux dist/packaging
+          # Keep the repo-relative path: `cp -r packaging/linux dist/packaging`
+          # would flatten the script to `packaging/install.sh`, giving the
+          # tarball a path that matches neither the README nor a checkout.
+          cp -r packaging/linux dist/packaging/linux
           tar -czf ${{ matrix.artifact }} -C dist .
 
       - name: package (macos)
         if: matrix.os == 'macos-latest'
         run: |
           sh packaging/macos/bundle.sh
-          # ditto keeps the .app bundle resource forks/permissions intact.
-          ditto -c -k --sequesterRsrc target/Readitor.app ${{ matrix.artifact }}
+          # `--keepParent` is what puts `Readitor.app` itself at the root of the
+          # zip; without it `ditto -c -k` archives the bundle's *contents*, and
+          # the download unzips to a stray `Contents/` folder that cannot be
+          # dragged to /Applications. `--sequesterRsrc` keeps the bundle's
+          # resource forks/extended attributes.
+          ditto -c -k --sequesterRsrc --keepParent target/Readitor.app ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -78,7 +92,7 @@ jobs:
             | File | OS | Install |
             |---|---|---|
             | `*-windows-x86_64.zip` | Windows 10/11 | Unzip anywhere, run `readitor.exe --install` once to claim file associations (HKCU, no admin). |
-            | `*-linux-x86_64.tar.gz` | Linux (X11/XWayland) | Unpack, run `packaging/install.sh` (~/.local install + MIME defaults). |
+            | `*-linux-x86_64.tar.gz` | Linux (X11/XWayland) | Unpack, run `packaging/linux/install.sh` (~/.local install + MIME defaults). |
             | `*-macos.zip` | macOS | Unzip, drag `Readitor.app` to /Applications. |
 
             **Updating**: replace the binary (or the whole `.app` / zip
