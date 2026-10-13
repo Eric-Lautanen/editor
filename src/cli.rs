@@ -1,9 +1,9 @@
 use crate::{
-    app::App,
+    app::{App, Mode},
     core::file_kind::FileKind,
     error::{Error, Result},
     parse::{json, jsonl},
-    platform,
+    platform, settings,
 };
 use std::path::PathBuf;
 
@@ -84,13 +84,31 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
 
     let mut app = App::new(o.file.clone())?;
+    let session = settings::load();
+    // --dark wins, then the user's saved manual pick, then the OS theme.
     if o.dark {
         app.set_dark_manual(true);
+    } else if session.manual {
+        app.set_dark_manual(session.dark);
     } else {
         app.set_dark(platform::system_prefers_dark());
     }
-    // Follow the OS theme unless --dark was passed; Ctrl+T detaches live.
-    app.set_dark(o.dark || platform::system_prefers_dark());
+    // Restore the last session's tabs and view unless a file was given.
+    if o.file.is_none() && !session.files.is_empty() {
+        let mut host = platform::NullHost::default();
+        for path in &session.files {
+            if path.is_file() {
+                app.open_path(path.clone(), &mut host);
+            }
+        }
+        app.active = session.active.min(app.tabs.len().saturating_sub(1));
+        app.mode = match session.mode {
+            1 => Mode::Edit,
+            2 => Mode::Split,
+            _ => Mode::Preview,
+        };
+        app.mark_dirty();
+    }
     if o.pretty {
         return pretty_print(o.file.as_deref());
     }

@@ -13,11 +13,12 @@ use crate::{
     },
     parse::{json, jsonl, markdown},
     platform::{Handler, Host, NullHost},
+    settings,
     ui::{
         editor_view::EditorView,
         event::{CursorShape, Event, Key, Modifiers, MouseButton},
         gutter, help, menu,
-        preview_view::{PaneScroll, PreviewView, Row as PreviewRow},
+        preview_view::{PaneScroll, PreviewView, Row as PreviewRow, SbGeom},
         scroll::ScrollState,
         statusbar,
         titlebar::{self, TitleHit},
@@ -34,6 +35,17 @@ pub enum Mode {
     Preview,
     Edit,
     Split,
+}
+
+/// An in-progress overlay-scrollbar drag.
+#[derive(Clone, Copy)]
+struct SbDrag {
+    /// True for the editor pane's bar, false for the preview pane's.
+    editor: bool,
+    /// True for the horizontal bar, false for the vertical one.
+    horizontal: bool,
+    /// Pointer minus the thumb's leading edge, along the bar's axis.
+    grab: f32,
 }
 
 /// Caret blink half-period, in 40 ms `Event::Tick`s (~0.5 s).
@@ -137,6 +149,8 @@ pub struct App {
     /// Caret blink phase: 40 ms ticks; the caret hides every other
     /// [`BLINK_TICKS`] window and any caret activity resets it to visible.
     blink: u32,
+    /// Live overlay-scrollbar drag, if any.
+    sb_drag: Option<SbDrag>,
 }
 
 /// The active tab is what all the existing per-document code touches.
@@ -183,6 +197,7 @@ impl App {
             theme_manual: false,
             ticks: 0,
             blink: 0,
+            sb_drag: None,
         })
     }
 
@@ -197,6 +212,26 @@ impl App {
     pub fn set_dark_manual(&mut self, dark: bool) {
         self.theme_manual = true;
         self.set_dark(dark);
+    }
+
+    /// Write the session (theme, view mode, open tabs) for the next start.
+    fn persist(&self) {
+        settings::save(&settings::Settings {
+            dark: self.dark,
+            manual: self.theme_manual,
+            mode: match self.mode {
+                Mode::Preview => 0,
+                Mode::Edit => 1,
+                Mode::Split => 2,
+            },
+            files: self.tabs.iter().filter_map(|t| t.path.clone()).collect(),
+            active: self.active,
+        });
+    }
+
+    /// Force a relayout on the next paint (session restore, external callers).
+    pub fn mark_dirty(&mut self) {
+        self.layout_dirty = true;
     }
 
     pub fn title(&self) -> String {
@@ -235,6 +270,7 @@ impl App {
                     }
                     self.clear_preview_sel();
                     self.layout_dirty = true;
+                    self.persist();
                 }
                 Err(e) => self.status_extra = format!("open failed: {e}"),
             }
@@ -250,6 +286,7 @@ impl App {
         self.close_armed = false;
         self.clear_preview_sel();
         self.layout_dirty = true;
+        self.persist();
     }
 
     /// Close the active tab. A dirty tab warns once; the second press (or a
@@ -269,6 +306,7 @@ impl App {
         self.close_armed = false;
         self.clear_preview_sel();
         self.layout_dirty = true;
+        self.persist();
         host.request_redraw();
     }
 
@@ -285,6 +323,7 @@ impl App {
         self.close_armed = false;
         self.clear_preview_sel();
         self.layout_dirty = true;
+        self.persist();
     }
 
     /// `(name, dirty)` per tab, for the title bar.
@@ -378,6 +417,59 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    /// Current geometry of one pane's scrollbar (editor pane?, horizontal?).
+    fn sb_geom(&self, editor: bool, horizontal: bool) -> Option<SbGeom> {
+        let ps = PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max);
+        match (self.mode, editor, horizontal) {
+            (Mode::Preview, _, false) => {
+                self.preview
+                    .v_sb(self.viewport(), self.scroll.offset, self.scale)
+            }
+            (Mode::Edit, true, true) => self.editor_pane.h_sb(self.viewport(), ps, self.scale),
+            (Mode::Edit, _, false) => self.editor_pane.v_sb(self.viewport(), ps.y, self.scale),
+            (Mode::Split, false, false) => {
+                self.preview
+                    .v_sb(self.split_panes().0, self.scroll.offset, self.scale)
+            }
+            (Mode::Split, true, true) => {
+                self.editor_pane.h_sb(self.split_panes().1, ps, self.scale)
+            }
+            (Mode::Split, true, false) => {
+                self.editor_pane
+                    .v_sb(self.split_panes().1, ps.y, self.scale)
+            }
+            _ => None,
+        }
+    }
+
+    /// The overlay scrollbar under a client-space point, if any.
+    fn sb_at(&self, x: f32, y: f32) -> Option<(bool, bool, SbGeom)> {
+        let p = Point { x, y };
+        let bars: &[(bool, bool)] = match self.mode {
+            Mode::Preview => &[(false, false)],
+            Mode::Edit => &[(true, true), (true, false)],
+            Mode::Split => &[(false, false), (true, true), (true, false)],
+        };
+        bars.iter().find_map(|&(e, h)| {
+            self.sb_geom(e, h)
+                .filter(|g| g.zone.contains(p))
+                .map(|g| (e, h, g))
+        })
+    }
+
+    /// True when (x, y) is over the editor pane's line-number rail: clicks
+    /// there must not place the caret, and the pointer stays an arrow.
+    fn over_gutter(&self, x: f32, y: f32) -> bool {
+        if self.mode == Mode::Preview {
+            return false;
+        }
+        let area = self.editor_area();
+        if x < area.x || x >= area.right() || y < area.y || y > area.bottom() {
+            return false;
+        }
+        x < area.x + gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count())
     }
 
     fn relayout(&mut self) {
@@ -497,8 +589,8 @@ impl App {
                 self.layout_dirty = true;
             }
             Key::Char('t') if mods.ctrl => {
-                self.theme_manual = true;
-                self.set_dark(!self.dark);
+                self.set_dark_manual(!self.dark);
+                self.persist();
             }
             Key::Char('s') if mods.ctrl => self.save(host),
             Key::Char('r') if mods.ctrl => self.reload_file(host),
@@ -510,6 +602,7 @@ impl App {
                 };
                 self.clear_preview_sel();
                 self.layout_dirty = true;
+                self.persist();
             }
             // -- editing chords (need the editor pane) -----------------------
             Key::Char('a') if mods.ctrl && self.mode != Mode::Preview => {
@@ -642,12 +735,12 @@ impl App {
                     3 => self.help_open = !self.help_open,
                     // Same as Ctrl+T: manual toggle, stops following the OS.
                     _ => {
-                        self.theme_manual = true;
-                        self.set_dark(!self.dark);
+                        self.set_dark_manual(!self.dark);
                     }
                 }
                 self.clear_preview_sel();
                 self.layout_dirty = true;
+                self.persist();
             }
             host.request_redraw();
             return;
@@ -673,9 +766,50 @@ impl App {
         if self.layout_dirty {
             self.relayout();
         }
+        // Overlay scrollbars: a thumb press starts a drag; a track click
+        // pages toward the pointer and grabs the thumb there.
+        if let Some((editor, horizontal, geom)) = self.sb_at(x, y) {
+            let p = Point { x, y };
+            let (pointer, lead, len) = if horizontal {
+                (x, geom.thumb.x, geom.thumb.w)
+            } else {
+                (y, geom.thumb.y, geom.thumb.h)
+            };
+            if geom.thumb.contains(p) {
+                self.sb_drag = Some(SbDrag {
+                    editor,
+                    horizontal,
+                    grab: pointer - lead,
+                });
+            } else {
+                let page = if horizontal {
+                    self.editor_area().w * 0.9
+                } else {
+                    self.scroll.viewport_height * 0.9
+                };
+                let delta = if lead > pointer { -page } else { page };
+                if horizontal {
+                    self.h_scroll = (self.h_scroll + delta).clamp(0.0, self.h_max);
+                } else {
+                    self.scroll.scroll_by(delta);
+                }
+                self.sb_drag = Some(SbDrag {
+                    editor,
+                    horizontal,
+                    grab: len / 2.0,
+                });
+            }
+            host.request_redraw();
+            return;
+        }
         // Editor panes take precedence in Edit/Split; Preview and the Split top
         // pane stay read-only hit targets (toggles, links).
         if let Some((dx, doc_y)) = self.editor_point(x, y) {
+            if self.over_gutter(x, y) {
+                // The line-number rail is not text: no caret placement.
+                host.request_redraw();
+                return;
+            }
             let ctx = self.ctx();
             let pos =
                 self.editor
@@ -768,6 +902,21 @@ impl App {
             self.hover_title = hit;
             host.request_redraw();
         }
+        // Overlay-scrollbar drag: the thumb follows the pointer.
+        if let Some(drag) = self.sb_drag.as_ref().copied() {
+            if let Some(g) = self.sb_geom(drag.editor, drag.horizontal) {
+                let pointer = if drag.horizontal { x } else { y };
+                let offset = g.offset_for(pointer - drag.grab);
+                if drag.horizontal {
+                    self.h_scroll = offset;
+                } else {
+                    self.scroll.offset = offset;
+                    self.scroll.scroll_by(0.0);
+                }
+                host.request_redraw();
+            }
+            return;
+        }
         // Preview drag: extend the row selection.
         if self.preview_drag {
             if let Some((_, dy)) = self.toggle_point(x, y) {
@@ -795,11 +944,11 @@ impl App {
         }
     }
 
-    fn on_mouse_up(&mut self, x: f32, y: f32, button: MouseButton, host: &mut dyn Host) {
-        let _ = (x, y);
+    fn on_mouse_up(&mut self, _x: f32, _y: f32, button: MouseButton, host: &mut dyn Host) {
         if button == MouseButton::Left {
             self.drag_anchor = None;
             self.preview_drag = false;
+            self.sb_drag = None;
         }
         host.request_redraw();
     }
@@ -1453,6 +1602,9 @@ impl Handler for App {
                     return CursorShape::Arrow;
                 }
             }
+        }
+        if self.over_gutter(x, y) {
+            return CursorShape::Arrow;
         }
         if self.editor_point(x, y).is_some() {
             return CursorShape::IBeam;

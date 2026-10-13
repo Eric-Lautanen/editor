@@ -48,6 +48,17 @@ fn left(buf: &Buffer, p: Pos) -> Pos {
     }
 }
 
+/// Character class for word selection: whitespace, word, punctuation.
+fn word_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if c.is_alphanumeric() || c == '_' {
+        1
+    } else {
+        2
+    }
+}
+
 /// One character to the right (wrapping down at end of line), or `p` itself
 /// at the end of the buffer.
 fn right(buf: &Buffer, p: Pos) -> Pos {
@@ -65,6 +76,18 @@ fn right(buf: &Buffer, p: Pos) -> Pos {
     Pos {
         line: p.line,
         col: p.col + c.len_utf8(),
+    }
+}
+
+/// Character class for word boundaries: whitespace, word chars
+/// (`alphanumeric` + `_`), everything else is punctuation.
+fn word_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if c.is_alphanumeric() || c == '_' {
+        1
+    } else {
+        2
     }
 }
 
@@ -175,6 +198,55 @@ impl EditorView {
     pub fn select_all(&mut self, buf: &Buffer) {
         self.anchor = Some(Pos { line: 0, col: 0 });
         self.caret = buf.end();
+        self.goal = None;
+    }
+
+    /// Select the run of same-class characters around `at` (double-click).
+    /// Classes: whitespace, word (`alphanumeric` + `_`), punctuation.
+    pub fn select_word(&mut self, buf: &Buffer, at: Pos) {
+        let line = buf.line(at.line);
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        let (start, end) = match chars
+            .iter()
+            .position(|(i, _)| *i >= at.col)
+            .unwrap_or(chars.len())
+            .checked_sub(1)
+        {
+            Some(k) => {
+                let cls = word_class(chars[k].1);
+                let mut a = k;
+                let mut b = k;
+                while a > 0 && word_class(chars[a - 1].1) == cls {
+                    a -= 1;
+                }
+                while b + 1 < chars.len() && word_class(chars[b + 1].1) == cls {
+                    b += 1;
+                }
+                (chars[a].0, chars[b + 1].0)
+            }
+            // Empty line or a click before the first char: collapse.
+            None => (0, 0),
+        };
+        self.anchor = Some(Pos {
+            line: at.line,
+            col: start,
+        });
+        self.caret = Pos {
+            line: at.line,
+            col: end,
+        };
+        self.goal = None;
+    }
+
+    /// Select the whole line at `at`, column 0 through the line end
+    /// (triple-click).
+    pub fn select_line(&mut self, buf: &Buffer, at: Pos) {
+        let line = at.line.min(buf.line_count().saturating_sub(1));
+        self.anchor = Some(Pos { line, col: 0 });
+        self.caret = Pos {
+            line,
+            col: buf.line(line).len(),
+        };
         self.goal = None;
     }
 

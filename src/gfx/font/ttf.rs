@@ -232,64 +232,59 @@ struct Seg {
     indirect: Option<(u32, u32)>,
 }
 
-struct Cmap {
+struct Cmap<'a> {
     segs: Vec<Seg>,
-    /// The raw font buffer, for idRangeOffset indirection (kept inside the
-    /// parsed face so offsets stay valid for the face's whole life).
-    data: Vec<u8>,
+    /// The font buffer, for idRangeOffset indirection (borrowed so parsing
+    /// never duplicates the font bytes).
+    data: &'a [u8],
 }
 
-impl Cmap {
-    /// Look up the best Unicode subtable: a format 4 (BMP) for (3,1)/(0,3),
-    /// or a format 12 (full Unicode) for (3,10). Other platforms skipped.
-    fn parse(data: &[u8]) -> Result<Self, TtfError> {
-        let (off, len) = table(data, b"cmap");
-        if len < 4 {
-            return Err(TtfError::BadTable("cmap"));
-        }
-        let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
-        r.u16().map_err(|_| TtfError::BadTable("cmap"))?; // version
-        let n = r.u16().map_err(|_| TtfError::BadTable("cmap"))?;
-        let mut best: Option<(u8, (u32, u32))> = None;
-        for _ in 0..n {
-            let pid = r.u16()?;
-            let eid = r.u16()?;
-            let sub = r.u32()?;
-            let score = match (pid, eid) {
-                (3, 1) | (0, 3) => 0,
-                (3, 10) => 1,
-                _ => continue,
-            };
-            if best.is_some_and(|(s, _)| score >= s) {
-                continue;
-            }
-            // Subtable offsets are relative to the cmap table itself.
-            let abs = off + sub;
-            if abs as usize + 2 > data.len() {
-                return Err(TtfError::BadTable("cmap"));
-            }
-            let mut sr = Reader::new(&data[abs as usize..]);
-            match sr.u16().map_err(|_| TtfError::BadTable("cmap"))? {
-                4 if score < 2 => best = Some((score, (abs, 4))),
-                12 if score >= 1 => best = Some((score, (abs, 12))),
-                _ => {}
-            }
-        }
-        let Some((_, (sub, fmt))) = best else {
-            return Err(TtfError::BadTable("cmap"));
-        };
-        let mut segs = match fmt {
-            4 => parse_cmap4(data, sub)?,
-            12 => parse_cmap12(data, sub)?,
-            _ => return Err(TtfError::BadTable("cmap")),
-        };
-        segs.sort_by_key(|s| s.start);
-        Ok(Self {
-            segs,
-            data: data.to_vec(),
-        })
+fn parse_cmap(data: &[u8]) -> Result<Cmap<'_>, TtfError> {
+    let (off, len) = table(data, b"cmap");
+    if len < 4 {
+        return Err(TtfError::BadTable("cmap"));
     }
+    let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
+    r.u16().map_err(|_| TtfError::BadTable("cmap"))?; // version
+    let n = r.u16().map_err(|_| TtfError::BadTable("cmap"))?;
+    let mut best: Option<(u8, (u32, u32))> = None;
+    for _ in 0..n {
+        let pid = r.u16()?;
+        let eid = r.u16()?;
+        let sub = r.u32()?;
+        let score = match (pid, eid) {
+            (3, 1) | (0, 3) => 0,
+            (3, 10) => 1,
+            _ => continue,
+        };
+        if best.is_some_and(|(s, _)| score >= s) {
+            continue;
+        }
+        // Subtable offsets are relative to the cmap table itself.
+        let abs = off + sub;
+        if abs as usize + 2 > data.len() {
+            return Err(TtfError::BadTable("cmap"));
+        }
+        let mut sr = Reader::new(&data[abs as usize..]);
+        match sr.u16().map_err(|_| TtfError::BadTable("cmap"))? {
+            4 if score < 2 => best = Some((score, (abs, 4))),
+            12 if score >= 1 => best = Some((score, (abs, 12))),
+            _ => {}
+        }
+    }
+    let Some((_, (sub, fmt))) = best else {
+        return Err(TtfError::BadTable("cmap"));
+    };
+    let mut segs = match fmt {
+        4 => parse_cmap4(data, sub)?,
+        12 => parse_cmap12(data, sub)?,
+        _ => return Err(TtfError::BadTable("cmap")),
+    };
+    segs.sort_by_key(|s| s.start);
+    Ok(Cmap { segs, data })
+}
 
+impl Cmap<'_> {
     /// Codepoint -> glyph id; 0 = .notdef.
     fn gid(&self, cp: u32) -> u16 {
         for s in &self.segs {
@@ -389,13 +384,14 @@ fn parse_cmap12(data: &[u8], sub: u32) -> Result<Vec<Seg>, TtfError> {
 
 // =============================================================== face ======
 
-/// One parsed face: owns its font bytes, exposes metric + raster APIs that
-/// mirror `atlas::FontSystem`.
-pub struct Face {
-    data: Vec<u8>,
+/// One parsed face over borrowed font bytes, exposing metric + raster APIs
+/// that mirror `atlas::FontSystem`. Borrowing keeps parse allocation-free:
+/// the caller owns the font file (embedded bytes or a lazily-loaded file).
+pub struct Face<'a> {
+    data: &'a [u8],
     /// Absolute file offset of the `glyf` table (loca entries index it).
     glyf_off: u32,
-    cmap: Cmap,
+    cmap: Cmap<'a>,
     loca: Vec<u32>,
     num_glyphs: u16,
     upem: f32,
@@ -413,13 +409,13 @@ struct Contour {
     pts: Vec<(f32, f32)>,
 }
 
-impl Face {
-    pub fn parse(data: &[u8]) -> Result<Self, TtfError> {
+impl Face<'_> {
+    pub fn parse(data: &'static [u8]) -> Result<Self, TtfError> {
         if data.len() < 12 || data[0..4] != [0, 1, 0, 0] {
             // TrueType 1.0 open-type magic; CFF-flavored OTTO is out of scope.
             return Err(TtfError::BadMagic);
         }
-        let mut cmap = Cmap::parse(data)?;
+        let cmap = parse_cmap(data)?;
         let (upem, short_loca) = parse_head(data)?;
         if !(upem > 0.0 && upem.is_finite()) {
             return Err(TtfError::BadTable("head upem"));
@@ -428,9 +424,8 @@ impl Face {
         let (ascent, descent, nhm) = parse_hhea(data)?;
         let loca = parse_loca(data, short_loca, num_glyphs)?;
         let hmtx = parse_hmtx(data, nhm, num_glyphs)?;
-        cmap.data = data.to_vec();
         Ok(Self {
-            data: data.to_vec(),
+            data,
             glyf_off: table(data, b"glyf").0,
             cmap,
             loca,
@@ -654,7 +649,7 @@ fn read_coords(r: &mut Reader, n: usize, flags: &[u8], x_axis: bool) -> Result<V
 
 // =============================================================== face ======
 
-impl Face {
+impl<'a> Face<'a> {
     fn outline_composite(&self, r: &mut Reader, depth: u32) -> Result<Vec<Contour>, TtfError> {
         r.take(8).map_err(|_| TtfError::BadGlyph(0))?; // component bbox
         let mut contours: Vec<Contour> = Vec::new();
@@ -876,10 +871,12 @@ fn bounds(edges: &[Edge]) -> (f32, f32, f32, f32) {
 mod tests {
     use super::*;
 
-    fn load(name: &str) -> Face {
+    fn load(name: &str) -> Face<'static> {
         let path = format!("assets/fonts/{name}.ttf");
         let data = std::fs::read(&path).unwrap_or_else(|e| panic!("missing {path}: {e}"));
-        Face::parse(&data).unwrap()
+        // Test-only leak: the parsed face borrows the font bytes, so a handful
+        // of static font buffers outlive every test (dies_with tests inline).
+        Face::parse(Box::leak(data.into_boxed_slice())).unwrap()
     }
 
     #[test]
@@ -1034,7 +1031,7 @@ mod tests {
         let data = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
         let (off, len) = table(&data, b"cmap");
         println!("table cmap -> ({off}, {len})");
-        match Cmap::parse(&data) {
+        match parse_cmap(&data) {
             Ok(c) => {
                 println!("cmap OK, {} segs; 'A' -> gid {}", c.segs.len(), c.gid(65));
             }
@@ -1066,7 +1063,11 @@ mod tests {
 
     #[test]
     fn fuzz_byte_truncations_never_panic() {
-        let full = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
+        let full: &'static [u8] = Box::leak(
+            std::fs::read("assets/fonts/LiberationSans-Regular.ttf")
+                .unwrap()
+                .into_boxed_slice(),
+        );
         // Truncate every power-of-two prefix (plus last-100 bytes); each
         // shorter prefix is a worst case for table-boundary math.
         let mut n = 1usize;
@@ -1084,9 +1085,17 @@ mod tests {
         }
     }
 
+    fn leak(v: Vec<u8>) -> &'static mut [u8] {
+        Box::leak(v.into_boxed_slice())
+    }
+
     #[test]
     fn fuzz_single_byte_corruption_never_panics() {
-        let full = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
+        let full: &'static [u8] = Box::leak(
+            std::fs::read("assets/fonts/LiberationSans-Regular.ttf")
+                .unwrap()
+                .into_boxed_slice(),
+        );
         // Corrupt one byte at each structurally interesting spot: header
         // fields, table-directory entries, and a few mid-table offsets.
         let mut spots = Vec::new();
@@ -1106,9 +1115,9 @@ mod tests {
             if s >= full.len() {
                 continue;
             }
-            let mut bad = full.clone();
+            let mut bad = full.to_vec();
             bad[s] = bad[s].wrapping_add(0xA5);
-            if let Ok(f) = Face::parse(&bad) {
+            if let Ok(f) = Face::parse(leak(bad)) {
                 let _ = f.glyph('A', 16.0);
                 let _ = f.glyph('é', 24.0);
             }
@@ -1120,10 +1129,10 @@ mod tests {
         let full = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
         // Zero head.unitsPerEm (a hostile font): parse must reject rather
         // than later divide by zero into NaN metrics.
-        let mut bad = full.clone();
+        let mut bad = full.to_vec();
         bad[334] = 0;
         bad[335] = 0;
-        assert!(matches!(Face::parse(&bad), Err(TtfError::BadTable(_))));
+        assert!(matches!(Face::parse(leak(bad)), Err(TtfError::BadTable(_))));
     }
 
     #[test]
