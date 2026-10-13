@@ -19,7 +19,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const TAGLINE: &[&str] = &[
     "A small native viewer and light editor for Markdown, JSON,",
-    "JSONL and plain text.",
+    "JSONL, CSV, configs, logs, code and plain text.",
 ];
 
 /// `(label, value)`. The font credit is not decoration: the bundled

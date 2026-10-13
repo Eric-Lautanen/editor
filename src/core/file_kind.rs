@@ -5,12 +5,23 @@ pub enum FileKind {
     Markdown,
     Json,
     JsonLines,
+    Csv,
+    Yaml,
+    Toml,
+    Ini,
+    Log,
+    Code,
     PlainText,
 }
 
-/// Extensions claimed by the app (see `platform::install` and packaging/).
-/// `log` rides the plain-text viewer with level/timestamp tinting later.
-pub const EXTENSIONS: &[&str] = &["md", "markdown", "json", "jsonl", "ndjson", "txt", "log"];
+/// Extensions claimed by the app (see `platform::install` and packaging).
+/// All ride the same zero-dependency viewers; `Open With` entries, never a
+/// default handler grab.
+pub const EXTENSIONS: &[&str] = &[
+    "md", "markdown", "json", "jsonl", "ndjson", "txt", "log", "csv", "tsv", "yaml", "yml", "toml",
+    "ini", "cfg", "conf", "rs", "py", "js", "ts", "c", "h", "cpp", "hpp", "cs", "java", "go", "rb",
+    "php", "css", "html", "xml", "sh",
+];
 
 impl FileKind {
     pub fn from_path(p: &Path) -> Self {
@@ -23,6 +34,15 @@ impl FileKind {
             Some("md" | "markdown" | "mdown") => Self::Markdown,
             Some("json") => Self::Json,
             Some("jsonl" | "ndjson") => Self::JsonLines,
+            Some("csv" | "tsv" | "tab") => Self::Csv,
+            Some("yaml" | "yml") => Self::Yaml,
+            Some("toml") => Self::Toml,
+            Some("ini" | "cfg" | "conf") => Self::Ini,
+            Some("log") => Self::Log,
+            Some(
+                "rs" | "py" | "js" | "ts" | "c" | "h" | "cpp" | "hpp" | "cs" | "java" | "go" | "rb"
+                | "php" | "css" | "html" | "xml" | "sh",
+            ) => Self::Code,
             _ => Self::PlainText,
         }
     }
@@ -34,6 +54,12 @@ impl FileKind {
             Self::Markdown => "Markdown",
             Self::Json => "JSON",
             Self::JsonLines => "JSON Lines",
+            Self::Csv => "CSV",
+            Self::Yaml => "YAML",
+            Self::Toml => "TOML",
+            Self::Ini => "INI",
+            Self::Log => "Log",
+            Self::Code => "Code",
             Self::PlainText => "Plain text",
         }
     }
@@ -44,7 +70,13 @@ impl FileKind {
             Self::Markdown => "md",
             Self::Json => "json",
             Self::JsonLines => "jsonl",
-            Self::PlainText => "txt",
+            Self::Csv => "csv",
+            Self::Yaml => "yaml",
+            Self::Toml => "toml",
+            Self::Ini => "ini",
+            // Logs, code, and text save as plain text by default; the open
+            // path's suffix already decides the viewer for existing files.
+            Self::Log | Self::Code | Self::PlainText => "txt",
         }
     }
 }
@@ -75,7 +107,14 @@ mod tests {
             FileKind::from_path(Path::new("x.jsonl")),
             FileKind::JsonLines
         );
-        // `.log` intentionally rides the plain-text viewer for now.
-        assert_eq!(FileKind::from_path(Path::new("x.log")), FileKind::PlainText);
+        assert_eq!(FileKind::from_path(Path::new("x.log")), FileKind::Log);
+        assert_eq!(FileKind::from_path(Path::new("x.csv")), FileKind::Csv);
+        assert_eq!(FileKind::from_path(Path::new("x.tsv")), FileKind::Csv);
+        assert_eq!(FileKind::from_path(Path::new("x.yaml")), FileKind::Yaml);
+        assert_eq!(FileKind::from_path(Path::new("x.yml")), FileKind::Yaml);
+        assert_eq!(FileKind::from_path(Path::new("x.toml")), FileKind::Toml);
+        assert_eq!(FileKind::from_path(Path::new("x.ini")), FileKind::Ini);
+        assert_eq!(FileKind::from_path(Path::new("x.cfg")), FileKind::Ini);
+        assert_eq!(FileKind::from_path(Path::new("x.rs")), FileKind::Code);
     }
 }

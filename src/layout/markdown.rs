@@ -249,6 +249,114 @@ fn ranges_of(atoms: &[Atom], start: usize, end: usize) -> Vec<(usize, usize, usi
     out
 }
 
+/// Keywords tinted inside fenced/indented code. One generic C-like set covers
+/// rust/js/py/go/etc. well enough for a reader; a full per-language
+/// highlighter would cost tables and state this app does not need.
+const CODE_KEYWORDS: &[&str] = &[
+    "fn", "let", "mut", "const", "static", "struct", "enum", "impl", "trait", "type", "where",
+    "pub", "use", "mod", "return", "if", "else", "match", "for", "while", "loop", "in", "break",
+    "continue", "true", "false", "null", "nil", "None", "def", "class", "import", "from", "export",
+    "default", "new", "this", "self", "crate", "async", "await", "try", "catch", "switch", "case",
+    "do", "var",
+];
+
+/// Split one code row into `(text, color)` runs: comments muted, strings and
+/// keywords tinted with the theme's code colors, everything else `fg`.
+/// Single-line scanner, no state across rows: a string split by a fold
+/// paints its tail default, which beats complicating the wrapper.
+pub(crate) fn code_spans(line: &str, lang: Option<&str>, theme: &Theme) -> Vec<(String, Color)> {
+    // Whole-line `#` comments (scripts, configs, C preprocessor, attrs).
+    if line.trim_start().starts_with('#') {
+        return vec![(line.to_string(), theme.muted)];
+    }
+    let script_hash = matches!(
+        lang.unwrap_or("").to_lowercase().as_str(),
+        "py" | "python"
+            | "sh"
+            | "bash"
+            | "rb"
+            | "yml"
+            | "yaml"
+            | "toml"
+            | "ini"
+            | ""
+            | "text"
+            | "plain"
+    );
+    let chars: Vec<char> = line.chars().collect();
+    let mut out: Vec<(String, Color)> = Vec::new();
+    let mut cur = String::new();
+    let flush = |out: &mut Vec<(String, Color)>, cur: &mut String| {
+        if !cur.is_empty() {
+            out.push((std::mem::take(cur), theme.fg));
+        }
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // `//` comments, anywhere outside a string.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            flush(&mut out, &mut cur);
+            out.push((chars[i..].iter().collect(), theme.muted));
+            break;
+        }
+        // Inline `#` comments for script/config flavors (` # comment`).
+        if script_hash && c == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
+            flush(&mut out, &mut cur);
+            out.push((chars[i..].iter().collect(), theme.muted));
+            break;
+        }
+        // Strings with backslash escapes; unclosed runs to end of line.
+        if c == '"' || c == '\'' || c == '`' {
+            flush(&mut out, &mut cur);
+            let mut j = i + 1;
+            while j < chars.len() {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == c {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            out.push((
+                chars[i..j.min(chars.len())].iter().collect(),
+                theme.json_string,
+            ));
+            i = j;
+            continue;
+        }
+        // Words: keywords tinted, the rest default.
+        if c.is_alphanumeric() || c == '_' {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            if word.chars().next().is_some_and(|d| d.is_ascii_digit()) {
+                flush(&mut out, &mut cur);
+                out.push((word, theme.json_number));
+            } else if CODE_KEYWORDS.contains(&word.as_str()) {
+                flush(&mut out, &mut cur);
+                out.push((word, theme.json_key));
+            } else {
+                cur.push_str(&word);
+            }
+            i = j;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    flush(&mut out, &mut cur);
+    if out.is_empty() {
+        out.push((String::new(), theme.fg));
+    }
+    out
+}
+
 struct Md<'a> {
     fonts: &'a FontSystem,
     theme: &'a Theme,
@@ -345,6 +453,18 @@ impl Md<'_> {
                         color: sp.color,
                     });
                 }
+                if sp.link.is_some() {
+                    // Underline affordance: links read as clickable, not just blue.
+                    let m = self.fonts.metrics(sp.style, size);
+                    let uy = (baseline + m.descent * 0.4).round();
+                    self.ops.push(DrawOp::Line {
+                        x0: pen,
+                        y0: uy,
+                        x1: pen + w,
+                        y1: uy,
+                        color: sp.color,
+                    });
+                }
                 if let Some(href) = &sp.link {
                     self.hits.push(HitRegion {
                         rect: Rect::new(pen, self.y, w.max(4.0), lh),
@@ -431,10 +551,11 @@ impl Md<'_> {
                         self.gap(size, 0.35);
                     }
                 }
-                Block::Code { lang: _, text } => {
+                Block::Code { lang, text } => {
                     let size = self.body * 0.9;
                     let lh = self.line_h(size);
                     let style = FontStyle::Mono;
+                    let lang_opt = lang.as_deref();
                     // Fold a line that is wider than the panel rather than
                     // letting it run out of the column and off the pane: a
                     // command wrapped onto its own row is readable, one that
@@ -462,9 +583,15 @@ impl Md<'_> {
                         color: self.theme.code_bg,
                     });
                     let mut cy = self.y + 8.0;
-                    for row in rows {
+                    for row in &rows {
                         let baseline = self.baseline(cy, style, size);
-                        self.text_op(x + CODE_PAD, baseline, row, style, size, self.theme.fg);
+                        let mut rx = x + CODE_PAD;
+                        for (piece, color) in code_spans(row, lang_opt, self.theme) {
+                            if !piece.is_empty() {
+                                self.text_op(rx, baseline, piece.clone(), style, size, color);
+                                rx += self.fonts.measure(style, &piece, size);
+                            }
+                        }
                         cy += lh;
                     }
                     self.y += h;
@@ -644,6 +771,17 @@ impl Md<'_> {
                     }
                     let w = md.fonts.measure(sp.style, &piece, size);
                     md.text_op(ox, baseline, piece, sp.style, size, sp.color);
+                    if sp.link.is_some() {
+                        let m = md.fonts.metrics(sp.style, size);
+                        let uy = (baseline + m.descent * 0.4).round();
+                        md.ops.push(DrawOp::Line {
+                            x0: ox,
+                            y0: uy,
+                            x1: ox + w,
+                            y1: uy,
+                            color: sp.color,
+                        });
+                    }
                     if let Some(href) = &sp.link {
                         md.hits.push(HitRegion {
                             rect: Rect::new(ox, md.y, w.max(4.0), lh),
@@ -658,8 +796,14 @@ impl Md<'_> {
             }
             md.y += lh;
         };
+        // Header band: the head row reads as a header, not just bold text.
+        let table_w = max_w.min(natural);
+        self.ops.push(DrawOp::Rect {
+            rect: Rect::new(x, self.y, table_w, lh),
+            color: self.theme.code_bg,
+        });
         render_row(self, head, FontStyle::Bold);
-        self.rule(x, max_w.min(natural));
+        self.rule(x, table_w);
         for row in rows {
             // Pad short rows with empty cells.
             let mut full = row.clone();
@@ -778,6 +922,30 @@ mod tests {
     }
 
     #[test]
+    fn code_panel_tints_keywords_strings_and_comments() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("```rust\nfn main() { // hi\n    let s = \"ok\";\n}\n```\n"),
+            800.0,
+            &c,
+        );
+        let mut colors = std::collections::HashSet::new();
+        for op in &list.ops {
+            if let DrawOp::Text { color, .. } = op {
+                colors.insert(color.pack());
+            }
+        }
+        // fg + at least two tint colors (keyword/string/comment/number).
+        assert!(
+            colors.len() >= 3,
+            "code should tint, got {} colors",
+            colors.len()
+        );
+    }
+
+    #[test]
     fn headings_scale_and_rule() {
         let f = FontSystem::load_embedded();
         let t = Theme::light();
@@ -873,6 +1041,28 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, vec!["Readitor sample".to_string()]);
+    }
+
+    #[test]
+    fn tables_paint_a_header_band_and_links_underline() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        // Table: a code_bg rect behind the head row plus the separator rule.
+        let list = layout(&doc("| h |\n|---|\n| x |\n"), 800.0, &c);
+        let rects = list
+            .ops
+            .iter()
+            .filter(|op| matches!(op, DrawOp::Rect { .. }))
+            .count();
+        assert!(rects >= 1, "header band missing");
+        // Link: an accent line just below the text (not a strike mid-line).
+        let list = layout(&doc("[t](https://e.com)\n"), 800.0, &c);
+        let link_line = list.ops.iter().any(|op| match op {
+            DrawOp::Line { color, .. } => *color == t.accent,
+            _ => false,
+        });
+        assert!(link_line, "link underline missing");
     }
 
     #[test]

@@ -768,7 +768,12 @@ survived restarts (theme, mode, tabs); the window did not.
 - Tests: the settings round trip carries the list, `note_recent` moves/dedupes/caps, and an
   app-level test opens two files, checks the menu rows, and reopens one through
   `Action::Recent`. 284 tests, `clippy --all-targets` and `rustfmt --check` clean.
-- Still open in M10: find (`Ctrl+F`) and large-file handling.
+- **Oversized files are refused, not frozen on** (`app.rs`): everything Readitor does —
+  buffer, layout, render — is whole-document, so a huge file is a memory and latency trap.
+  `Tab::from_path` checks the size before reading and reports "file is N MB — larger than the
+  64 MB open limit" in the status bar instead (`size_error`, split out so the rule is testable
+  without a 64 MB fixture). Windowing/streaming a huge file stays out of scope for now.
+- Still open in M10: find (`Ctrl+F`).
 
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the

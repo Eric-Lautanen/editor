@@ -1,8 +1,42 @@
-//! Inline Markdown: code spans, emphasis/strong, links/images, strike,
-//! autolinks, hard breaks. Reference-style links and footnotes are v2; HTML tags
-//! are skipped (ignored) per the plan.
+//! Inline Markdown: code spans, emphasis/strong, links/images (inline +
+//! reference-style), strike, autolinks, hard breaks. Footnotes are v2; HTML
+//! tags are skipped (ignored) per the plan.
+
+use std::collections::HashMap;
 
 use super::ast::Inline;
+
+/// Normalize a reference label: trim, collapse whitespace, lowercase.
+fn norm_label(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Resolve `[text][label]`, `[text][]`, or shortcut `[text]` against `defs`.
+/// `after` is the index just past the closing `]` of the text run.
+/// Returns (href, next index) on success.
+fn scan_reference(
+    chars: &[char],
+    after: usize,
+    inner: &str,
+    defs: &HashMap<String, String>,
+) -> Option<(String, usize)> {
+    if chars.get(after) == Some(&'[') {
+        let (label, next) = scan_bracket(chars, after)?;
+        let key = if label.trim().is_empty() {
+            norm_label(inner)
+        } else {
+            norm_label(&label)
+        };
+        defs.get(&key).map(|href| (href.clone(), next))
+    } else {
+        // Shortcut: the text itself names the definition.
+        defs.get(&norm_label(inner))
+            .map(|href| (href.clone(), after))
+    }
+}
 
 /// Scan a code span opening at `i` (chars[i] == '`'). Returns the decoded
 /// content and the index after the closer, or `None` when unclosed.
@@ -82,7 +116,7 @@ fn push_text(out: &mut Vec<Out>, s: &str) {
 }
 
 /// Parse one raw (code-span-free) fragment.
-fn parse_raw(s: &str) -> Vec<Inline> {
+fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
     let chars: Vec<char> = s.chars().collect();
     let mut out: Vec<Out> = Vec::new();
     let mut openers: Vec<Opener> = Vec::new();
@@ -191,16 +225,18 @@ fn parse_raw(s: &str) -> Vec<Inline> {
             }
             continue;
         }
-        // Potential link / image.
+        // Potential link / image (inline `(href)` or reference `[ref]`).
         if c == '[' || (c == '!' && chars.get(i + 1) == Some(&'[')) {
             let img = c == '!';
             let lb = if img { i + 1 } else { i };
             if let Some((inner, after)) = scan_bracket(&chars, lb) {
-                if let Some((href, next)) = scan_link_target(&chars, after) {
+                if let Some((href, next)) = scan_link_target(&chars, after)
+                    .or_else(|| scan_reference(&chars, after, &inner, defs))
+                {
                     let content = if img {
                         Vec::new()
                     } else {
-                        parse_inlines(&inner)
+                        parse_inlines_with(&inner, defs)
                     };
                     let node = if img {
                         Inline::Image {
@@ -472,8 +508,8 @@ fn is_html_tag(s: &str) -> bool {
     }
 }
 
-pub fn parse_inlines(s: &str) -> Vec<Inline> {
-    let mut out = parse_raw(s.trim_end_matches([' ', '\t']));
+pub fn parse_inlines_with(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
+    let mut out = parse_raw(s.trim_end_matches([' ', '\t']), defs);
     // A trailing hard-break signal with no following line is just whitespace.
     while matches!(out.last(), Some(Inline::HardBreak)) {
         out.pop();
@@ -485,10 +521,14 @@ pub fn parse_inlines(s: &str) -> Vec<Inline> {
 mod tests {
     use super::*;
 
+    fn pi(s: &str) -> Vec<Inline> {
+        parse_inlines_with(s, &HashMap::new())
+    }
+
     #[test]
     fn emphasis_nests() {
         assert_eq!(
-            parse_inlines("**bold** and *it*"),
+            pi("**bold** and *it*"),
             vec![
                 Inline::Strong(vec![Inline::Text("bold".into())]),
                 Inline::Text(" and ".into()),
@@ -497,26 +537,23 @@ mod tests {
         );
         // Triple star: strong inside emph.
         assert_eq!(
-            parse_inlines("***both***"),
+            pi("***both***"),
             vec![Inline::Emph(vec![Inline::Strong(vec![Inline::Text(
                 "both".into()
             )])])]
         );
         // Intra-word underscores stay literal.
-        assert_eq!(
-            parse_inlines("foo_bar_baz"),
-            vec![Inline::Text("foo_bar_baz".into())]
-        );
+        assert_eq!(pi("foo_bar_baz"), vec![Inline::Text("foo_bar_baz".into())]);
         // Unmatched markers are literal.
-        assert_eq!(parse_inlines("*solo"), vec![Inline::Text("*solo".into())]);
+        assert_eq!(pi("*solo"), vec![Inline::Text("*solo".into())]);
     }
 
     #[test]
     fn code_links_strike() {
-        assert_eq!(parse_inlines("`a*b`"), vec![Inline::Code("a*b".into())]);
+        assert_eq!(pi("`a*b`"), vec![Inline::Code("a*b".into())]);
         // Emphasis reaches across code spans.
         assert_eq!(
-            parse_inlines("*a `c` b*"),
+            pi("*a `c` b*"),
             vec![Inline::Emph(vec![
                 Inline::Text("a ".into()),
                 Inline::Code("c".into()),
@@ -524,41 +561,48 @@ mod tests {
             ])]
         );
         assert_eq!(
-            parse_inlines("[t](https://e.com)"),
+            pi("[t](https://e.com)"),
             vec![Inline::Link {
                 href: "https://e.com".into(),
                 content: vec![Inline::Text("t".into())],
             }]
         );
+        // Reference-style links resolve against the definition map.
+        let mut defs = HashMap::new();
+        defs.insert("a".into(), "https://a.com".into());
         assert_eq!(
-            parse_inlines("![alt](i.png)"),
+            parse_inlines_with("[t][a]", &defs),
+            vec![Inline::Link {
+                href: "https://a.com".into(),
+                content: vec![Inline::Text("t".into())],
+            }]
+        );
+        assert_eq!(
+            pi("![alt](i.png)"),
             vec![Inline::Image {
                 src: "i.png".into(),
                 alt: "alt".into(),
             }]
         );
         assert_eq!(
-            parse_inlines("~~gone~~"),
+            pi("~~gone~~"),
             vec![Inline::Strike(vec![Inline::Text("gone".into())])]
         );
         assert_eq!(
-            parse_inlines("<https://e.com>"),
+            pi("<https://e.com>"),
             vec![Inline::Link {
                 href: "https://e.com".into(),
                 content: vec![Inline::Text("https://e.com".into())],
             }]
         );
         // Inline HTML tags are stripped but their content is kept.
-        assert_eq!(
-            parse_inlines("a<b>x</b>c"),
-            vec![Inline::Text("axc".into())]
-        );
+        assert_eq!(pi("a<b>x</b>c"), vec![Inline::Text("axc".into())]);
     }
 
     #[test]
     fn breaks_and_escapes() {
         assert_eq!(
-            parse_inlines("a  \nb"),
+            pi("a  \nb"),
             vec![
                 Inline::Text("a".into()),
                 Inline::HardBreak,
@@ -566,13 +610,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse_inlines("a\nb"),
+            pi("a\nb"),
             vec![
                 Inline::Text("a".into()),
                 Inline::SoftBreak,
                 Inline::Text("b".into())
             ]
         );
-        assert_eq!(parse_inlines("\\*x\\*"), vec![Inline::Text("*x*".into())]);
+        assert_eq!(pi("\\*x\\*"), vec![Inline::Text("*x*".into())]);
     }
 }

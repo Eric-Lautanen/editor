@@ -2,7 +2,7 @@
 name = "readitor"
 version = "0.1.0"
 edition = "2021"
-description = "A small native viewer/editor for Markdown, JSON and JSONL. std only."
+description = "A small native viewer/editor for Markdown, JSON, CSV, configs, logs and code. std only."
 license = "MIT"
 
 # NO dependencies. Ever.

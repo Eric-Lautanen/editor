@@ -1,0 +1,6 @@
+Step	Action	Result
+1	open	a tab appears
+2	scroll	the bar follows
+3	drag	the document moves
+4	edit	the gutter shows line numbers
+5	close	the tab is gone

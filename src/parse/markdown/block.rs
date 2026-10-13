@@ -4,8 +4,10 @@
 //! Line-based, single pass with local lookahead. Anything unrecognized
 //! degrades to paragraph text, so parsing is total.
 
+use std::collections::HashMap;
+
 use super::ast::*;
-use super::inline::parse_inlines;
+use super::inline::parse_inlines_with;
 
 /// Leading tabs count as 4 columns for indent measurement; the tab itself is
 /// replaced so downstream code works in spaces.
@@ -41,6 +43,87 @@ fn indent_of(line: &str) -> usize {
 
 fn is_blank(line: &str) -> bool {
     line.trim().is_empty()
+}
+
+/// Strip YAML/TOML frontmatter: a leading `---`/`+++` line closed by the same
+/// marker. Only at the very top; a lone `---` still parses as rule/setext.
+fn strip_frontmatter(lines: &mut Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    let first = lines[0].trim();
+    if first != "---" && first != "+++" {
+        return;
+    }
+    let marker = first.to_string();
+    // Bound the search so a 10k-line doc with no closing marker stays fast.
+    let limit = lines.len().min(51);
+    for i in 1..limit {
+        if lines[i].trim() == marker {
+            lines.drain(0..=i);
+            return;
+        }
+    }
+}
+
+/// Normalize a reference label: trim, collapse inner whitespace, lowercase.
+fn norm_label(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Parse a link-reference definition line (`[label]: dest "optional title"`).
+/// Returns (label, dest). Up to 3 leading spaces; titles are ignored.
+fn parse_ref_def(line: &str) -> Option<(String, String)> {
+    let t = line.trim_start();
+    if indent_of(line) > 3 || !t.starts_with('[') {
+        return None;
+    }
+    let close = t.find(']')?;
+    let label = t[1..close].trim();
+    if label.is_empty() || label.contains('[') || label.contains(']') {
+        return None;
+    }
+    let rest = t[close + 1..].trim_start();
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let mut dest = rest[1..].trim_start();
+    if dest.is_empty() {
+        return None;
+    }
+    let href: String;
+    if dest.starts_with('<') {
+        let end = dest.find('>')?;
+        href = dest[1..end].to_string();
+        dest = dest[end + 1..].trim_start();
+        let _ = dest; // optional title follows; ignored.
+    } else {
+        let end = dest.find(|c: char| c.is_whitespace()).unwrap_or(dest.len());
+        href = dest[..end].to_string();
+    }
+    if href.is_empty() || href.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some((norm_label(label), href))
+}
+
+/// True when the line is a reference definition (used to break paragraphs).
+fn is_ref_def(line: &str) -> bool {
+    parse_ref_def(line).is_some()
+}
+
+/// Collect all reference definitions in the document.
+fn collect_ref_defs(lines: &[String]) -> HashMap<String, String> {
+    let mut defs = HashMap::new();
+    for line in lines {
+        if let Some((label, href)) = parse_ref_def(line) {
+            defs.entry(label).or_insert(href);
+        }
+    }
+    defs
 }
 
 /// `---`/`***`/`___` thematic break (spaces allowed between markers).
@@ -310,6 +393,13 @@ fn delimiter_row(line: &str) -> Option<Vec<Align>> {
 struct Parser {
     lines: Vec<String>,
     pos: usize,
+    defs: HashMap<String, String>,
+}
+
+impl Parser {
+    fn inlines(&self, s: &str) -> Vec<super::ast::Inline> {
+        parse_inlines_with(s, &self.defs)
+    }
 }
 
 impl Parser {
@@ -336,6 +426,10 @@ impl Parser {
         if is_rule(line) {
             return true;
         }
+        // Reference definitions and indented code both end a paragraph.
+        if is_ref_def(line) || indent_of(line) >= 4 {
+            return true;
+        }
         if let Some(m) = list_marker(line) {
             return !in_para || !m.ordered || m.start == 1;
         }
@@ -349,6 +443,11 @@ impl Parser {
                 self.pos += 1;
                 continue;
             }
+            // Link-reference definitions never render.
+            if self.peek().is_some_and(is_ref_def) {
+                self.pos += 1;
+                continue;
+            }
             if let Some(b) = self.parse_fence() {
                 blocks.push(b);
             } else if let Some(b) = self.parse_atx() {
@@ -359,11 +458,53 @@ impl Parser {
                 blocks.push(b);
             } else if self.parse_html_skip() {
                 // Ignored per plan.
+            } else if let Some(b) = self.parse_indented_code() {
+                blocks.push(b);
             } else {
                 blocks.extend(self.parse_paragraph_or_table());
             }
         }
         blocks
+    }
+
+    /// Indented code: consecutive lines indented 4+. Blank lines ride along
+    /// only when followed by more code; trailing blanks are dropped.
+    fn parse_indented_code(&mut self) -> Option<Block> {
+        if indent_of(self.peek()?) < 4 {
+            return None;
+        }
+        let mut text: Vec<String> = Vec::new();
+        while self.pos < self.lines.len() {
+            let line = &self.lines[self.pos];
+            if is_blank(line) {
+                // Look ahead: keep the blank only if code continues.
+                let mut j = self.pos + 1;
+                while j < self.lines.len() && is_blank(&self.lines[j]) {
+                    j += 1;
+                }
+                if j < self.lines.len() && indent_of(&self.lines[j]) >= 4 {
+                    text.push(String::new());
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
+            if indent_of(line) < 4 {
+                break;
+            }
+            text.push(line[4.min(line.len())..].to_string());
+            self.pos += 1;
+        }
+        while text.last().is_some_and(|l| l.is_empty()) {
+            text.pop();
+        }
+        if text.is_empty() {
+            return None;
+        }
+        Some(Block::Code {
+            lang: None,
+            text: text.join("\n"),
+        })
     }
 
     fn parse_fence(&mut self) -> Option<Block> {
@@ -390,7 +531,7 @@ impl Parser {
         self.pos += 1;
         Some(Block::Heading {
             level,
-            content: parse_inlines(&content),
+            content: self.inlines(&content),
         })
     }
 
@@ -420,7 +561,9 @@ impl Parser {
             }
             self.pos += 1;
         }
-        Some(Block::Quote(parse_blocks(&inner.join("\n")).blocks))
+        Some(Block::Quote(
+            parse_blocks_with_defs(&inner.join("\n"), &self.defs).blocks,
+        ))
     }
 
     fn parse_list(&mut self) -> Option<Block> {
@@ -480,7 +623,7 @@ impl Parser {
             }
             items.push(ListItem {
                 checked: m.task,
-                blocks: parse_blocks(&content.join("\n")).blocks,
+                blocks: parse_blocks_with_defs(&content.join("\n"), &self.defs).blocks,
             });
         }
         if items.is_empty() {
@@ -518,14 +661,15 @@ impl Parser {
                     let head_line = para.pop().unwrap();
                     let mut out = Vec::new();
                     if !para.is_empty() {
-                        out.push(Block::Paragraph(parse_inlines(&para.join("\n"))));
+                        let text = para.join("\n");
+                        out.push(Block::Paragraph(self.inlines(&text)));
                     }
                     let mut head_cells = split_row(&head_line);
                     head_cells.resize_with(align.len(), Default::default);
                     let head = head_cells
                         .into_iter()
                         .take(align.len())
-                        .map(|c| parse_inlines(&c))
+                        .map(|c| self.inlines(&c))
                         .collect();
                     let mut rows = Vec::new();
                     while self.pos < self.lines.len() {
@@ -539,7 +683,7 @@ impl Parser {
                             cells
                                 .into_iter()
                                 .take(align.len())
-                                .map(|c| parse_inlines(&c))
+                                .map(|c| self.inlines(&c))
                                 .collect(),
                         );
                         self.pos += 1;
@@ -552,9 +696,10 @@ impl Parser {
             if !para.is_empty() {
                 if let Some(level) = setext_level(line) {
                     self.pos += 1;
+                    let text = para.join("\n");
                     return vec![Block::Heading {
                         level,
-                        content: parse_inlines(&para.join("\n")),
+                        content: self.inlines(&text),
                     }];
                 }
             }
@@ -572,13 +717,31 @@ impl Parser {
             para.push(line.trim().to_string());
             self.pos += 1;
         }
-        vec![Block::Paragraph(parse_inlines(&para.join("\n")))]
+        let text = para.join("\n");
+        vec![Block::Paragraph(self.inlines(&text))]
     }
 }
 
 pub fn parse_blocks(src: &str) -> Document {
+    let mut lines: Vec<String> = src.lines().map(expand_leading_tabs).collect();
+    strip_frontmatter(&mut lines);
+    let defs = collect_ref_defs(&lines);
+    parse_blocks_with_defs(&lines.join("\n"), &defs)
+}
+
+fn parse_blocks_with_defs(src: &str, outer: &HashMap<String, String>) -> Document {
     let lines: Vec<String> = src.lines().map(expand_leading_tabs).collect();
-    let mut p = Parser { lines, pos: 0 };
+    // Nested content (quotes/lists) inherits the outer definitions; local
+    // definitions win and never render.
+    let mut defs = outer.clone();
+    for (label, href) in collect_ref_defs(&lines) {
+        defs.entry(label).or_insert(href);
+    }
+    let mut p = Parser {
+        lines,
+        pos: 0,
+        defs,
+    };
     Document {
         blocks: p.parse_top(),
     }
@@ -667,5 +830,65 @@ mod tests {
         let d = parse_blocks("<div>\nskipped\n</div>\n\nkept");
         assert_eq!(d.blocks.len(), 1);
         assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn frontmatter_is_stripped() {
+        let d = parse_blocks("---\ntitle: hi\n---\n\n# Real\n");
+        assert_eq!(d.blocks.len(), 1, "frontmatter must not render: {d:?}");
+        assert!(matches!(d.blocks[0], Block::Heading { level: 1, .. }));
+        // No closing marker: a lone --- still parses as a rule.
+        let d = parse_blocks("---\n\ntext");
+        assert!(matches!(d.blocks[0], Block::Rule));
+    }
+
+    #[test]
+    fn indented_code_renders() {
+        let d = parse_blocks("para\n\n    code line\n    second\n\ntext");
+        assert_eq!(d.blocks.len(), 3);
+        match &d.blocks[1] {
+            Block::Code { lang, text } => {
+                assert_eq!(lang, &None);
+                assert_eq!(text, "code line\nsecond");
+            }
+            other => panic!("expected indented code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_links_resolve_and_defs_do_not_render() {
+        let d = parse_blocks("[hi][a] and [bye][]\n\n[a]: https://a.com\n[bye]: https://b.com\n");
+        assert_eq!(d.blocks.len(), 1, "defs must not render: {d:?}");
+        match &d.blocks[0] {
+            Block::Paragraph(inlines) => {
+                let hrefs: Vec<&str> = inlines
+                    .iter()
+                    .filter_map(|n| match n {
+                        Inline::Link { href, .. } => Some(href.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(hrefs, vec!["https://a.com", "https://b.com"]);
+            }
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+        // Shortcut form + nested inheritance (definition after a quote).
+        let d = parse_blocks("> [q]\n\n[q]: https://q.com\n");
+        match &d.blocks[0] {
+            Block::Quote(inner) => assert!(
+                matches!(&inner[0], Block::Paragraph(v) if v.iter().any(|n| matches!(n, Inline::Link { href, .. } if href == "https://q.com"))),
+                "quote must inherit outer defs: {inner:?}"
+            ),
+            other => panic!("expected quote, got {other:?}"),
+        }
+        // Undefined references stay literal text.
+        let d = parse_blocks("[nope]\n");
+        match &d.blocks[0] {
+            Block::Paragraph(v) => assert!(
+                v.iter().all(|n| !matches!(n, Inline::Link { .. })),
+                "undefined ref must not link: {v:?}"
+            ),
+            other => panic!("expected paragraph, got {other:?}"),
+        }
     }
 }

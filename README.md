@@ -1,7 +1,8 @@
 # Readitor
 
 Native, dependency-free (std-only) Rust app for reading and lightly editing
-Markdown, JSON, JSONL and text files. See [docs/PLAN.md](docs/PLAN.md).
+Markdown, JSON, JSONL, CSV, configs (YAML/TOML/INI), logs, code and text
+files. See [docs/PLAN.md](docs/PLAN.md).
 
 ```
 cargo run -- samples/sample.md
@@ -21,8 +22,8 @@ open tabs, window size/place/maximized), `--install` file associations.
 
 | OS | How |
 |---|---|
-| Windows | Unzip `readitor.exe` anywhere and run `readitor.exe --install` once — registers `Readitor.Document` for `.md .markdown .json .jsonl .ndjson .txt` under `HKCU` (no admin). Readitor then shows up in "Open with" and can be set as the default. `--uninstall` removes it. |
-| Linux | `packaging/linux/install.sh` — installs to `~/.local/bin`, a `.desktop` entry, a MIME package for `.jsonl`/`.ndjson`, and sets `xdg-mime` defaults for markdown/JSON/NDJSON/plain text. |
+| Windows | Unzip `readitor.exe` anywhere and run `readitor.exe --install` once — registers `Readitor.Document` for `.md .markdown .json .jsonl .ndjson .txt .log .csv .tsv .yaml .yml .toml .ini .cfg .conf` and code extensions under `HKCU` (no admin). Readitor then shows up in "Open with" and can be set as the default. `--uninstall` removes it. |
+| Linux | `packaging/linux/install.sh` — installs to `~/.local/bin`, a `.desktop` entry, a MIME package for `.jsonl`/`.ndjson`, and sets `xdg-mime` defaults for markdown/JSON/NDJSON/plain text/CSV/YAML/TOML. |
 | macOS | `Readitor.app` (built by `packaging/macos/bundle.sh`) declares `CFBundleDocumentTypes` for the same extensions, so it appears in "Open With". |
 
 ## Updating

@@ -199,7 +199,14 @@ fn pretty_print(file: Option<&std::path::Path>) -> Result<()> {
                 }
             }
         }
-        FileKind::Markdown | FileKind::PlainText => platform::print_text(&src),
+        FileKind::Markdown
+        | FileKind::PlainText
+        | FileKind::Csv
+        | FileKind::Yaml
+        | FileKind::Toml
+        | FileKind::Ini
+        | FileKind::Log
+        | FileKind::Code => platform::print_text(&src),
     }
     Ok(())
 }

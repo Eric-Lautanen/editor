@@ -1,4 +1,6 @@
+pub mod csv;
 pub mod display_list;
+pub mod highlight;
 pub mod json_tree;
 pub mod markdown;
 pub mod text;

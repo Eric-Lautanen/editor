@@ -14,7 +14,7 @@
       <key>CFBundleTypeRole</key><string>Editor</string>
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key>
-      <array><string>md</string><string>markdown</string><string>json</string><string>jsonl</string><string>ndjson</string><string>txt</string></array>
+      <array><string>md</string><string>markdown</string><string>json</string><string>jsonl</string><string>ndjson</string><string>txt</string><string>log</string><string>csv</string><string>tsv</string><string>yaml</string><string>yml</string><string>toml</string><string>ini</string><string>cfg</string><string>conf</string><string>rs</string><string>py</string><string>js</string><string>ts</string><string>c</string><string>h</string><string>cpp</string><string>hpp</string><string>cs</string><string>java</string><string>go</string><string>rb</string><string>php</string><string>css</string><string>html</string><string>xml</string><string>sh</string></array>
     </dict>
   </array>
 </dict></plist>

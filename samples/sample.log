@@ -1,0 +1,13 @@
+2024-05-01 10:00:01 INFO server listening on :8080
+2024-05-01 10:00:07 INFO GET /health 200 1ms
+2024-05-01 10:01:12 WARN slow query: 812ms on /api/rows
+2024-05-01 10:02:44 DEBUG cache miss for key session:42
+2024-05-01 10:03:09 INFO POST /api/save 200 12ms
+2024-05-01 10:04:55 ERROR write failed: disk full on /data
+2024-05-01 10:05:01 INFO retrying write (attempt 2)
+2024-05-01 10:05:02 INFO write ok after retry
+2024-05-01 10:06:30 TRACE gc freed 412 pages
+2024-05-01 10:07:11 WARN high memory: 82% of budget
+2024-05-01 10:08:00 INFO checkpoint complete
+[2024-05-01 10:09:12] ERROR unhandled panic in worker 3
+2024-05-01 10:09:13 INFO worker 3 restarted

@@ -58,9 +58,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
 ];
 
 const FOOTER: &[&str] = &[
-    "Preview renders Markdown documents, JSON as a collapsible tree, JSONL as",
-    "per-line records, and text/log files wrapped. Selecting and copying text",
-    "happens in Edit or Split (Ctrl+E); in Preview use right-click → Copy all.",
+    "Preview renders Markdown, JSON as a tree, JSONL per-line, CSV as a table,",
+    "YAML/TOML/INI tinted, logs with level colors, code lightly tinted, and",
+    "other text wrapped. Selecting happens in Edit/Split (Ctrl+E); in Preview",
+    "use right-click → Copy all.",
 ];
 
 /// One row of the legend, in paint order.

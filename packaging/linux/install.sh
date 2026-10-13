@@ -38,7 +38,7 @@ install -Dm644 "$here/readitor.desktop" "$HOME/.local/share/applications/readito
 install -Dm644 "$here/readitor-mime.xml" "$HOME/.local/share/mime/packages/readitor-mime.xml"
 update-mime-database "$HOME/.local/share/mime" || true
 update-desktop-database "$HOME/.local/share/applications" || true
-for t in text/markdown application/json application/x-ndjson text/plain; do
+for t in text/markdown application/json application/x-ndjson text/plain text/csv text/x-yaml application/toml; do
     xdg-mime default readitor.desktop "$t" || true
 done
 

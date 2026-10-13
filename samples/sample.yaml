@@ -1,0 +1,22 @@
+# Readitor sample config
+server:
+  host: localhost
+  port: 8080
+  debug: false
+  timeout: 30.5
+  # nested list of routes
+  routes:
+    - path: /health
+      enabled: true
+    - path: /api
+      enabled: false
+
+database:
+  url: postgres://localhost:5432/app
+  pool: 10
+  ssl: null
+
+features:
+  - fast-preview
+  - session-restore
+  - zero-deps  # the whole point

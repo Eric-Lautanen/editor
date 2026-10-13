@@ -461,6 +461,34 @@ mod tests {
     }
 
     #[test]
+    fn h_bar_starts_right_of_the_gutter_rail() {
+        // Regression: the editor's horizontal bar used to span the full pane,
+        // so its left end hid behind the line-number rail painted after it.
+        let view = PreviewView::default();
+        let area = Rect::new(0.0, 40.0, 400.0, 300.0);
+        let rail = 48.0;
+        let scroll = PaneScroll::editor(0.0, 0.0, 600.0, rail);
+        let g = view.h_sb(area, scroll, m()).unwrap();
+        assert!(
+            g.thumb.x >= area.x + rail,
+            "thumb {} starts under the {}px rail",
+            g.thumb.x,
+            rail
+        );
+        assert!(
+            g.zone.x >= area.x + rail - 0.001,
+            "zone {} reaches under the rail",
+            g.zone.x
+        );
+        assert!(g.thumb.right() <= area.right());
+        // No rail: the bar still spans the full pane.
+        let full = view
+            .h_sb(area, PaneScroll::editor(0.0, 0.0, 600.0, 0.0), m())
+            .unwrap();
+        assert!(full.thumb.x < area.x + rail);
+    }
+
+    #[test]
     fn zones_contain_their_thumbs() {
         let area = Rect::new(0.0, 0.0, 400.0, 300.0);
         let v = v_geom(area, 1000.0, 123.0, m()).unwrap();

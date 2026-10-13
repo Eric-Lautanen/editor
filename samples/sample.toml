@@ -1,0 +1,19 @@
+# Readitor sample config
+[server]
+host = "localhost"
+port = 8080
+debug = false
+timeout = 30.5
+
+[server.tls]
+enabled = false
+cert = "/etc/readitor/cert.pem"
+
+[database]
+url = "postgres://localhost:5432/app"
+pool = 10
+ssl = true
+
+[[theme]]
+name = "light"
+contrast = "normal"

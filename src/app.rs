@@ -93,6 +93,24 @@ pub struct Tab {
     pub mtime: Option<std::time::SystemTime>,
 }
 
+/// Files above this are refused rather than opened (see [`size_error`]):
+/// everything Readitor does — buffer, layout, render — is whole-document, so
+/// a huge file is a memory and latency trap, and windowing it is not in this
+/// milestone.
+const MAX_OPEN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The refusal message for an oversized file, or `None` when it fits.
+/// Split out so the rule is testable without writing a 64 MB fixture.
+fn size_error(len: u64) -> Option<String> {
+    (len > MAX_OPEN_BYTES).then(|| {
+        format!(
+            "file is {} MB — larger than the {} MB open limit",
+            len >> 20,
+            MAX_OPEN_BYTES >> 20
+        )
+    })
+}
+
 impl Tab {
     fn untitled() -> Self {
         Self {
@@ -111,6 +129,12 @@ impl Tab {
     }
 
     fn from_path(p: PathBuf) -> Result<Self> {
+        // Refuse oversized files before reading: the whole text is held in
+        // memory and laid out at once, so a huge file is a memory and
+        // latency trap — a clear refusal beats a frozen window.
+        if let Some(msg) = size_error(std::fs::metadata(&p)?.len()) {
+            return Err(crate::error::Error::Platform(msg));
+        }
         Ok(Self {
             kind: FileKind::from_path(&p),
             buffer: Buffer::from_text(&std::fs::read_to_string(&p)?),
@@ -770,6 +794,49 @@ impl App {
                 tab.status_extra.clear();
                 let doc = markdown::parse(&tab.buffer.text());
                 layout::markdown::layout(&doc, w, &ctx)
+            }
+            FileKind::Csv => {
+                let sheet = crate::parse::csv::parse(&tab.buffer.text());
+                tab.status_extra = if sheet.cols == 0 {
+                    String::new()
+                } else if sheet.capped {
+                    format!(
+                        "{} rows × {} cols (showing {})",
+                        sheet.total_rows,
+                        sheet.cols,
+                        sheet.rows.len()
+                    )
+                } else {
+                    format!("{} rows × {} cols", sheet.total_rows, sheet.cols)
+                };
+                layout::csv::layout(&sheet, w, &ctx)
+            }
+            FileKind::Yaml => {
+                tab.status_extra.clear();
+                layout::highlight::layout(&tab.buffer, w, &ctx, layout::highlight::Kind::Yaml, "")
+            }
+            FileKind::Toml => {
+                tab.status_extra.clear();
+                layout::highlight::layout(&tab.buffer, w, &ctx, layout::highlight::Kind::Toml, "")
+            }
+            FileKind::Ini => {
+                tab.status_extra.clear();
+                layout::highlight::layout(&tab.buffer, w, &ctx, layout::highlight::Kind::Ini, "")
+            }
+            FileKind::Log => {
+                tab.status_extra = log_counts(&tab.buffer);
+                layout::highlight::layout(&tab.buffer, w, &ctx, layout::highlight::Kind::Log, "")
+            }
+            FileKind::Code => {
+                tab.status_extra.clear();
+                let ext = tab
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                layout::highlight::layout(&tab.buffer, w, &ctx, layout::highlight::Kind::Code, &ext)
             }
             FileKind::PlainText => layout::text::layout_plain(&tab.buffer, w, &ctx, true),
         };
@@ -1844,6 +1911,48 @@ fn char_col(buf: &Buffer, p: Pos) -> usize {
     buf.line(p.line)[..p.col].chars().count() + 1
 }
 
+/// Log status counts over at most the first 20k lines: a full 64 MB scan on
+/// every relayout would jank the window for no reader benefit. Empty when
+/// nothing matched, so ordinary logs keep a clean bar.
+fn log_counts(buf: &Buffer) -> String {
+    let mut errors = 0u32;
+    let mut warns = 0u32;
+    for i in 0..buf.line_count().min(20_000) {
+        let line = buf.line(i);
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        // Skip a leading timestamp/bracket prefix the way the tint does.
+        let word = first.trim_matches(|c: char| !c.is_alphanumeric());
+        let level = words
+            .next()
+            .filter(|_| {
+                word.chars()
+                    .all(|c| c.is_ascii_digit() || "-:,./TZ[]".contains(c))
+                    && word.len() >= 4
+            })
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_uppercase()
+            })
+            .unwrap_or_else(|| word.to_uppercase());
+        if [
+            "ERROR", "ERR", "FATAL", "CRIT", "CRITICAL", "FAIL", "FAILED",
+        ]
+        .contains(&level.as_str())
+        {
+            errors += 1;
+        } else if ["WARN", "WARNING"].contains(&level.as_str()) {
+            warns += 1;
+        }
+    }
+    match (errors, warns) {
+        (0, 0) => String::new(),
+        (e, 0) => format!("{e} error{}", if e == 1 { "" } else { "s" }),
+        (0, w) => format!("{w} warn{}", if w == 1 { "" } else { "s" }),
+        (e, w) => format!("{e} errors · {w} warns"),
+    }
+}
+
 impl Handler for App {
     fn on_event(&mut self, ev: Event, host: &mut dyn Host) {
         match ev {
@@ -2145,6 +2254,17 @@ mod tests {
     }
 
     #[test]
+    fn oversized_files_are_refused_with_a_message() {
+        // The rule itself: anything at or under the limit opens, anything
+        // over it names the size and the limit.
+        assert_eq!(size_error(0), None);
+        assert_eq!(size_error(MAX_OPEN_BYTES), None);
+        let msg = size_error(MAX_OPEN_BYTES + 1).expect("over the limit refuses");
+        assert!(msg.contains("64 MB"), "names the limit: {msg}");
+        assert!(msg.contains("larger than"), "says which way: {msg}");
+    }
+
+    #[test]
     fn headless_render_draws_text_and_statusbar() {
         let mut app = open("readitor_test_a.txt", "Hello Readitor\nsecond line");
         let c = app.render_headless(640, 400, 1.0);
@@ -2309,6 +2429,44 @@ mod tests {
             c.pixels.iter().filter(|&&p| p != bg).count() > 200,
             "document area is blank"
         );
+    }
+
+    #[test]
+    fn new_kinds_render_with_status() {
+        // CSV: table + row/col counts.
+        let mut app = open("readitor_test_kinds.csv", "a,b\n1,2\n3,4\n");
+        assert_eq!(app.kind, FileKind::Csv);
+        let c = app.render_headless(800, 600, 1.0);
+        assert!(app.status_extra.contains("2 rows"), "{}", app.status_extra);
+        let bg = app.theme.bg.pack();
+        assert!(c.pixels.iter().filter(|&&p| p != bg).count() > 200);
+        // Configs: tinted preview, clean bar.
+        for (name, content, kind) in [
+            ("readitor_test_kinds.yaml", "port: 8080\n", FileKind::Yaml),
+            ("readitor_test_kinds.toml", "port = 8080\n", FileKind::Toml),
+            (
+                "readitor_test_kinds.ini",
+                "[s]\nport = 8080\n",
+                FileKind::Ini,
+            ),
+            ("readitor_test_kinds.rs", "fn main() {}\n", FileKind::Code),
+        ] {
+            let mut app = open(name, content);
+            assert_eq!(app.kind, kind);
+            let c = app.render_headless(800, 600, 1.0);
+            assert!(
+                c.pixels.iter().filter(|&&p| p != bg).count() > 50,
+                "{name} blank"
+            );
+        }
+        // Logs: level counts in the bar.
+        let mut app = open(
+            "readitor_test_kinds.log",
+            "INFO up\nERROR boom\nWARN slow\n",
+        );
+        assert_eq!(app.kind, FileKind::Log);
+        let _ = app.render_headless(800, 600, 1.0);
+        assert!(app.status_extra.contains("1 error"), "{}", app.status_extra);
     }
 
     #[test]
