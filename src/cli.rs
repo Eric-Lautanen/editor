@@ -95,19 +95,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
     // Restore the last session's tabs and view unless a file was given.
     if o.file.is_none() && !session.files.is_empty() {
-        let mut host = platform::NullHost::default();
-        for path in &session.files {
-            if path.is_file() {
-                app.open_path(path.clone(), &mut host);
-            }
-        }
-        app.active = session.active.min(app.tabs.len().saturating_sub(1));
-        app.mode = match session.mode {
+        let mode = match session.mode {
             1 => Mode::Edit,
             2 => Mode::Split,
             _ => Mode::Preview,
         };
-        app.mark_dirty();
+        app.restore(&session.files, session.active, mode);
     }
     if o.pretty {
         return pretty_print(o.file.as_deref());

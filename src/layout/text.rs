@@ -70,7 +70,9 @@ pub fn wrap_ranges(
     while start < chars.len() {
         let (mut w, mut i, mut last_break) = (0.0f32, start, None);
         while i < chars.len() {
-            let a = fonts.advance(style, chars[i], size);
+            // Look ahead: a variation selector changes the width of the
+            // codepoint in front of it, so wrapping has to know about it too.
+            let a = fonts.advance_at(style, chars[i], chars.get(i + 1).copied(), size);
             if w + a > max_w && i > start {
                 break;
             }

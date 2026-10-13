@@ -132,9 +132,40 @@ impl Canvas {
     }
 
     /// Blit a glyph with its pen origin at integer (`x`, `baseline`).
+    ///
+    /// An outline glyph is tinted with `c`; a *colour* glyph (an emoji bitmap)
+    /// carries its own pixels and ignores `c` entirely, because tinting it
+    /// would destroy the artwork.
     pub fn draw_glyph(&mut self, g: &Glyph, x: i32, baseline: i32, c: Color) {
         let gx = x + g.left;
         let gy = baseline - g.top;
+        if let Some(rgba) = &g.color {
+            for j in 0..g.height {
+                for i in 0..g.width {
+                    let o = (j * g.width + i) * 4;
+                    let a = rgba[o + 3];
+                    if a != 0 {
+                        let px = Color::rgba(rgba[o], rgba[o + 1], rgba[o + 2], a);
+                        // cov 255: the alpha is already in `px`.
+                        self.put(gx + i as i32, gy + j as i32, px, 255);
+                    }
+                }
+            }
+            // Parts the artwork asked to draw in the text colour (COLR's
+            // `0xFFFF` sentinel). They are kept as a mask rather than baked
+            // in, because the text colour only exists here.
+            if let Some(fg) = &g.fg {
+                for j in 0..g.height {
+                    for i in 0..g.width {
+                        let cov = fg[j * g.width + i] as u32;
+                        if cov != 0 {
+                            self.put(gx + i as i32, gy + j as i32, c, cov);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         for j in 0..g.height {
             for i in 0..g.width {
                 let cov = g.coverage[j * g.width + i] as u32;
@@ -156,14 +187,18 @@ impl Canvas {
     ) -> f32 {
         let mut pen = x;
         let by = baseline.round() as i32;
-        for ch in text.chars() {
+        // Peekable, not a bare `chars()`: a variation selector after a codepoint
+        // is what decides whether that codepoint is drawn as text or as emoji.
+        let mut it = text.chars().peekable();
+        while let Some(ch) = it.next() {
             if ch.is_control() {
                 continue;
             }
-            if let Some(g) = fonts.glyph(spec.style, ch, spec.size) {
+            let next = it.peek().copied();
+            if let Some(g) = fonts.glyph_at(spec.style, ch, next, spec.size) {
                 self.draw_glyph(&g, pen.round() as i32, by, spec.color);
             }
-            pen += fonts.advance(spec.style, ch, spec.size);
+            pen += fonts.advance_at(spec.style, ch, next, spec.size);
         }
         pen
     }
@@ -211,6 +246,43 @@ mod tests {
             Rect::new(0.0, 0.0, 1.0, 1.0),
             Color::rgba(255, 255, 255, 128),
         );
+        let v = (c.pixels[0] & 0xFF) as i32;
+        assert!((v - 128).abs() <= 1, "got {v}");
+    }
+
+    #[test]
+    fn colour_glyphs_keep_their_own_pixels() {
+        let mut c = Canvas::new(2, 2);
+        c.fill_rect(Rect::new(0.0, 0.0, 2.0, 2.0), Color::rgb(0, 0, 0));
+        let g = Glyph {
+            width: 2,
+            height: 1,
+            left: 0,
+            top: 1, // baseline 1 - top 1 = row 0
+            coverage: vec![255, 255],
+            color: Some(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+            fg: None,
+        };
+        // The text colour must be ignored: tinting would destroy the artwork.
+        c.draw_glyph(&g, 0, 1, Color::rgb(255, 255, 255));
+        assert_eq!(c.pixels[0] & 0xFFFFFF, 0xFF0000, "red pixel lost");
+        assert_eq!(c.pixels[1] & 0xFFFFFF, 0x00FF00, "green pixel lost");
+    }
+
+    #[test]
+    fn colour_glyph_alpha_blends_against_the_backdrop() {
+        let mut c = Canvas::new(1, 1);
+        c.fill_rect(Rect::new(0.0, 0.0, 1.0, 1.0), Color::rgb(0, 0, 0));
+        let g = Glyph {
+            width: 1,
+            height: 1,
+            left: 0,
+            top: 1,
+            coverage: vec![128],
+            color: Some(vec![255, 255, 255, 128]),
+            fg: None,
+        };
+        c.draw_glyph(&g, 0, 1, Color::rgb(0, 0, 0));
         let v = (c.pixels[0] & 0xFF) as i32;
         assert!((v - 128).abs() <= 1, "got {v}");
     }

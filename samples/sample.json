@@ -1,1 +1,46 @@
-{"name":"readitor","version":1,"tags":["md","json"],"nested":{"ok":true,"none":null,"pi":3.14159}}
+{
+  "name": "readitor",
+  "version": 1,
+  "description": "A small native viewer/editor for Markdown, JSON and JSONL.",
+  "tags": ["md", "json", "jsonl", "txt"],
+  "nested": {
+    "ok": true,
+    "none": null,
+    "pi": 3.14159,
+    "limits": {
+      "min": -128,
+      "max": 9007199254740991,
+      "step": 0.5
+    }
+  },
+  "views": [
+    {
+      "name": "preview",
+      "scrollbar": "vertical",
+      "wraps": true
+    },
+    {
+      "name": "edit",
+      "scrollbar": "vertical + horizontal",
+      "wraps": false,
+      "gutter": true
+    },
+    {
+      "name": "split",
+      "scrollbar": "both panes",
+      "divider": 2
+    }
+  ],
+  "window": {
+    "width": 1100,
+    "height": 800,
+    "borderless": true,
+    "resizable": true,
+    "maximizes_to": "the monitor work area"
+  },
+  "unicode": "café – “quotes” • bullets … → arrows ≤ ≥ © ® ™ € £ ½ ñ Ü 中文",
+  "escapes": "quote \" backslash \\ tab \t newline \n",
+  "empty": {},
+  "emptyList": [],
+  "mixed": [1, "two", 3.0, true, false, null, {"seven": 7}, [8, 9]]
+}

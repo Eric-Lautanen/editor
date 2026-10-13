@@ -1,8 +1,10 @@
+pub mod about;
 pub mod editor_view;
 pub mod event;
 pub mod gutter;
 pub mod help;
 pub mod menu;
+pub mod overlay;
 pub mod preview_view;
 pub mod scroll;
 pub mod statusbar;

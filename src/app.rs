@@ -12,13 +12,14 @@ use crate::{
         Ctx,
     },
     parse::{json, jsonl, markdown},
-    platform::{Handler, Host, NullHost},
+    platform::{self, Handler, Host, NullHost},
     settings,
     ui::{
+        about,
         editor_view::EditorView,
         event::{CursorShape, Event, Key, Modifiers, MouseButton},
         gutter, help, menu,
-        preview_view::{PaneScroll, PreviewView, Row as PreviewRow, SbGeom},
+        preview_view::{PaneMetrics, PaneScroll, PreviewView, Row as PreviewRow, SbGeom},
         scroll::ScrollState,
         statusbar,
         titlebar::{self, TitleHit},
@@ -122,10 +123,16 @@ pub struct App {
     /// Window size in physical px, and OS DPI scale.
     size: (usize, usize),
     scale: f32,
+    /// Window-edge strip the platform keeps for resizing (physical px).
+    /// Overlay scrollbars are inset by it so a press on the bar scrolls
+    /// instead of starting a window resize.
+    edge: f32,
     zoom: f32,
     layout_dirty: bool,
     /// F1 help overlay visible.
     help_open: bool,
+    /// F2 about box visible.
+    about_open: bool,
     /// Live right-click context menu, if any.
     menu: Option<menu::Menu>,
     /// Second Ctrl+W on a dirty tab discards it; any other action clears.
@@ -151,6 +158,10 @@ pub struct App {
     blink: u32,
     /// Live overlay-scrollbar drag, if any.
     sb_drag: Option<SbDrag>,
+    /// Click counting for double/triple selection: the running count and
+    /// where/when (tick) the last press landed.
+    clicks: u8,
+    last_click: Option<((f32, f32), u32)>,
 }
 
 /// The active tab is what all the existing per-document code touches.
@@ -172,10 +183,16 @@ impl App {
             Some(p) => Tab::from_path(p.clone())?,
             None => Tab::untitled(),
         };
+        // An Untitled buffer has nothing to preview: start in Edit mode.
+        let mode = if tab.path.is_none() {
+            Mode::Edit
+        } else {
+            Mode::Preview
+        };
         Ok(Self {
             tabs: vec![tab],
             active: 0,
-            mode: Mode::Preview,
+            mode,
             dark: false,
             theme: Theme::light(),
             fonts: FontSystem::load_embedded(),
@@ -183,9 +200,11 @@ impl App {
             drag_anchor: None,
             size: (1100, 800),
             scale: 1.0,
+            edge: platform::edge_grip(),
             zoom: 1.0,
             layout_dirty: true,
             help_open: false,
+            about_open: false,
             menu: None,
             close_armed: false,
             hover_title: None,
@@ -198,6 +217,8 @@ impl App {
             ticks: 0,
             blink: 0,
             sb_drag: None,
+            clicks: 0,
+            last_click: None,
         })
     }
 
@@ -212,6 +233,22 @@ impl App {
     pub fn set_dark_manual(&mut self, dark: bool) {
         self.theme_manual = true;
         self.set_dark(dark);
+    }
+
+    /// Restore a persisted session (cli startup): reopen the tabs that still
+    /// exist, focus `active`, switch to the saved view mode.
+    pub fn restore(&mut self, files: &[PathBuf], active: usize, mode: Mode) {
+        let mut host = NullHost::default();
+        for path in files {
+            if path.is_file() {
+                self.open_path(path.clone(), &mut host);
+            }
+        }
+        self.active = active.min(self.tabs.len().saturating_sub(1));
+        self.mode = mode;
+        self.focus_untitled_in_edit();
+        self.clear_preview_sel();
+        self.layout_dirty = true;
     }
 
     /// Write the session (theme, view mode, open tabs) for the next start.
@@ -229,17 +266,10 @@ impl App {
         });
     }
 
-    /// Force a relayout on the next paint (session restore, external callers).
-    pub fn mark_dirty(&mut self) {
-        self.layout_dirty = true;
-    }
-
+    /// Window title. Unsaved state is *not* encoded here any more — the tab's
+    /// save button carries it (the status bar and window title stay clean).
     pub fn title(&self) -> String {
-        format!(
-            "{}{} — Readitor",
-            self.name(),
-            if self.buffer.dirty { " •" } else { "" }
-        )
+        format!("{} — Readitor", self.name())
     }
     // ------------------------------------------------------------ tabs
 
@@ -278,11 +308,20 @@ impl App {
         host.request_redraw();
     }
 
+    /// Landing on an Untitled buffer drops into Edit mode: there is nothing to
+    /// preview and the user is about to type.
+    fn focus_untitled_in_edit(&mut self) {
+        if self.path.is_none() {
+            self.mode = Mode::Edit;
+        }
+    }
+
     fn switch_to(&mut self, i: usize) {
         if i == self.active || i >= self.tabs.len() {
             return;
         }
         self.active = i;
+        self.focus_untitled_in_edit();
         self.close_armed = false;
         self.clear_preview_sel();
         self.layout_dirty = true;
@@ -303,6 +342,7 @@ impl App {
             self.tabs.push(Tab::untitled());
         }
         self.active = self.active.min(self.tabs.len() - 1);
+        self.focus_untitled_in_edit();
         self.close_armed = false;
         self.clear_preview_sel();
         self.layout_dirty = true;
@@ -320,6 +360,7 @@ impl App {
         } else {
             (self.active + 1) % n
         };
+        self.focus_untitled_in_edit();
         self.close_armed = false;
         self.clear_preview_sel();
         self.layout_dirty = true;
@@ -388,17 +429,22 @@ impl App {
 
     /// True when `x, y` lands in an editor pane (Edit whole viewport, Split
     /// right half only). Returns the pane's document-space point (x includes
-    /// the horizontal scroll of the no-wrap lines).
+    /// the horizontal scroll of the no-wrap lines and excludes the gutter
+    /// rail, which the content is inset by when painted).
     fn editor_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
         match self.mode {
             Mode::Edit => {
                 let view = self.viewport();
-                Some((x - view.x + self.h_scroll, y - view.y + self.scroll.offset))
+                Some((
+                    x - view.x - rail + self.h_scroll,
+                    y - view.y + self.scroll.offset,
+                ))
             }
             Mode::Split => {
                 let right = self.split_panes().1;
                 (x >= right.x).then_some((
-                    x - right.x + self.h_scroll,
+                    x - right.x - rail + self.h_scroll,
                     y - right.y + self.scroll.offset,
                 ))
             }
@@ -421,24 +467,26 @@ impl App {
 
     /// Current geometry of one pane's scrollbar (editor pane?, horizontal?).
     fn sb_geom(&self, editor: bool, horizontal: bool) -> Option<SbGeom> {
-        let ps = PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max);
+        let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
+        let ps = PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail);
         match (self.mode, editor, horizontal) {
             (Mode::Preview, _, false) => {
                 self.preview
-                    .v_sb(self.viewport(), self.scroll.offset, self.scale)
+                    .v_sb(self.viewport(), self.scroll.offset, self.metrics())
             }
-            (Mode::Edit, true, true) => self.editor_pane.h_sb(self.viewport(), ps, self.scale),
-            (Mode::Edit, _, false) => self.editor_pane.v_sb(self.viewport(), ps.y, self.scale),
+            (Mode::Edit, true, true) => self.editor_pane.h_sb(self.viewport(), ps, self.metrics()),
+            (Mode::Edit, _, false) => self.editor_pane.v_sb(self.viewport(), ps.y, self.metrics()),
             (Mode::Split, false, false) => {
                 self.preview
-                    .v_sb(self.split_panes().0, self.scroll.offset, self.scale)
+                    .v_sb(self.split_panes().0, self.scroll.offset, self.metrics())
             }
             (Mode::Split, true, true) => {
-                self.editor_pane.h_sb(self.split_panes().1, ps, self.scale)
+                self.editor_pane
+                    .h_sb(self.split_panes().1, ps, self.metrics())
             }
             (Mode::Split, true, false) => {
                 self.editor_pane
-                    .v_sb(self.split_panes().1, ps.y, self.scale)
+                    .v_sb(self.split_panes().1, ps.y, self.metrics())
             }
             _ => None,
         }
@@ -470,6 +518,19 @@ impl App {
             return false;
         }
         x < area.x + gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count())
+    }
+
+    /// 1/2/3 for a single/double/triple click at (x, y): a press within
+    /// ~0.5 s and a few px of the last one counts up, anything else resets.
+    fn click_seq(&mut self, x: f32, y: f32) -> u8 {
+        let again = self.last_click.is_some_and(|(p, t)| {
+            (p.0 - x).abs() <= 6.0 * self.scale
+                && (p.1 - y).abs() <= 6.0 * self.scale
+                && self.ticks.wrapping_sub(t) <= BLINK_TICKS
+        });
+        self.clicks = if again { self.clicks % 3 + 1 } else { 1 };
+        self.last_click = Some(((x, y), self.ticks));
+        self.clicks
     }
 
     fn relayout(&mut self) {
@@ -511,6 +572,7 @@ impl App {
         if self.mode != Mode::Preview {
             // The editor pane never wraps: one row per line, h-scrolled.
             tab.editor_pane.list = layout::text::layout_plain(&tab.buffer, edit_w, &ctx, false);
+            let rail = gutter::rail_w(&self.fonts, &ctx, tab.buffer.line_count());
             let mut extent = 0.0f32;
             for op in &tab.editor_pane.list.ops {
                 if let DrawOp::Text {
@@ -524,7 +586,9 @@ impl App {
                     extent = extent.max(x + ctx.fonts.measure(*style, text, *size));
                 }
             }
-            tab.h_max = (extent + 32.0 * self.scale - edit_w).max(0.0);
+            // Content is painted inset by the rail, so it scrolls that much
+            // farther before hitting the right edge.
+            tab.h_max = (extent + rail + 32.0 * self.scale - edit_w).max(0.0);
             tab.h_scroll = tab.h_scroll.min(tab.h_max);
         }
         let content = match self.mode {
@@ -571,9 +635,18 @@ impl App {
             Key::Escape => {
                 self.menu = None;
                 self.help_open = false;
+                self.about_open = false;
                 self.clear_preview_sel();
             }
-            Key::F(1) => self.help_open = !self.help_open,
+            // The two overlays are mutually exclusive.
+            Key::F(1) => {
+                self.help_open = !self.help_open;
+                self.about_open = false;
+            }
+            Key::F(2) => {
+                self.about_open = !self.about_open;
+                self.help_open = false;
+            }
             Key::Char('q') if mods.ctrl => host.quit(),
             Key::Char('w') if mods.ctrl => self.close_tab(host),
             Key::Char('o') if mods.ctrl => {
@@ -696,9 +769,10 @@ impl App {
             host.request_redraw();
             return;
         }
-        // Any click dismisses the help overlay.
-        if self.help_open {
+        // Any click dismisses a full-window overlay.
+        if self.help_open || self.about_open {
             self.help_open = false;
+            self.about_open = false;
             host.request_redraw();
             return;
         }
@@ -712,6 +786,10 @@ impl App {
             );
             match titlebar::hit_test(&lay, x, y) {
                 TitleHit::Tab(i) => self.switch_to(i),
+                TitleHit::TabSave(i) => {
+                    self.active = i;
+                    self.save(host);
+                }
                 TitleHit::TabClose(i) => {
                     self.active = i;
                     self.close_tab(host);
@@ -724,15 +802,32 @@ impl App {
             host.request_redraw();
             return;
         }
-        // Status bar: clickable mode/theme/help buttons.
+        // Status bar: clickable mode/theme/help/open buttons.
         if y >= self.viewport().bottom() {
             let p = Point { x, y };
-            if let Some(b) = self.status_buttons.iter().find(|b| b.rect.contains(p)) {
-                match b.id {
+            let hit = self
+                .status_buttons
+                .iter()
+                .find(|b| b.rect.contains(p))
+                .map(|b| b.id);
+            if let Some(id) = hit {
+                match id {
                     0 => self.mode = Mode::Preview,
                     1 => self.mode = Mode::Edit,
                     2 => self.mode = Mode::Split,
-                    3 => self.help_open = !self.help_open,
+                    3 => {
+                        self.help_open = !self.help_open;
+                        self.about_open = false;
+                    }
+                    6 => {
+                        self.about_open = !self.about_open;
+                        self.help_open = false;
+                    }
+                    5 => {
+                        if let Some(p) = host.open_file_dialog() {
+                            self.open_path(p, host);
+                        }
+                    }
                     // Same as Ctrl+T: manual toggle, stops following the OS.
                     _ => {
                         self.set_dark_manual(!self.dark);
@@ -814,9 +909,25 @@ impl App {
             let pos =
                 self.editor
                     .caret_for_point(&self.buffer, dx, doc_y, self.editor_area().w, &ctx);
-            self.editor.caret = pos;
-            self.editor.anchor = None;
-            self.drag_anchor = Some(pos);
+            match self.click_seq(x, y) {
+                // Double-click selects the word, triple the whole line;
+                // dragging afterwards extends from the selection's start.
+                2 => {
+                    let tab = &mut self.tabs[self.active];
+                    tab.editor.select_word(&tab.buffer, pos);
+                    self.drag_anchor = tab.editor.selection().map(|(a, _)| a);
+                }
+                3.. => {
+                    let tab = &mut self.tabs[self.active];
+                    tab.editor.select_line(&tab.buffer, pos);
+                    self.drag_anchor = tab.editor.selection().map(|(a, _)| a);
+                }
+                _ => {
+                    self.editor.caret = pos;
+                    self.editor.anchor = None;
+                    self.drag_anchor = Some(pos);
+                }
+            }
             self.poke_caret();
             host.request_redraw();
             return;
@@ -845,6 +956,7 @@ impl App {
             menu::Action::Save => self.save(host),
             menu::Action::CloseTab => self.close_tab(host),
             menu::Action::Help => self.help_open = true,
+            menu::Action::About => self.about_open = true,
             menu::Action::CopyAll => host.clipboard_set(&self.buffer.text()),
             menu::Action::Copy => {
                 if let Some(text) = self.editor.copy(&self.buffer) {
@@ -1117,13 +1229,29 @@ impl App {
         self.layout_dirty = true;
     }
 
-    /// Save the buffer back to disk (`Ctrl+S`). Untitled buffers are rejected
-    /// until file dialogs land in M6.
+    /// Save the buffer to disk (`Ctrl+S`, the tab's save button, or the
+    /// context menu). A buffer with no path yet — an Untitled tab — opens the
+    /// save-as dialog first, defaulting to the OS Documents folder, and adopts
+    /// whatever path the user picks.
     fn save(&mut self, host: &mut dyn Host) {
-        let Some(path) = self.path.clone() else {
-            self.status_extra = "nothing to save (Untitled)".into();
-            host.request_redraw();
-            return;
+        let path = match self.path.clone() {
+            Some(p) => p,
+            None => {
+                let default = format!("Untitled.{}", self.kind.default_ext());
+                let Some(p) = host.save_file_dialog(&default) else {
+                    self.status_extra = "save cancelled".into();
+                    host.request_redraw();
+                    return;
+                };
+                // The tab becomes that file: name, kind and the file watcher's
+                // baseline all move over to the chosen path.
+                self.tabs[self.active].path = Some(p.clone());
+                self.tabs[self.active].kind = FileKind::from_path(&p);
+                self.mtime = None;
+                self.layout_dirty = true;
+                self.persist();
+                p
+            }
         };
         match std::fs::write(&path, self.buffer.text()) {
             Ok(()) => {
@@ -1191,6 +1319,11 @@ impl App {
         let viewport_w = self.editor_area().w;
         let ctx = self.ctx();
         let (doc_x, doc_y) = self.editor.caret_xy(&self.buffer, viewport_w, &ctx);
+        // The pane shows content inset by the gutter rail: the caret's
+        // screen x is rail + doc_x - h_scroll, so the visible content span
+        // is [0, viewport_w - rail] and the pan math runs in content space.
+        let rail = gutter::rail_w(&self.fonts, &ctx, self.buffer.line_count());
+        let vis_w = (viewport_w - rail).max(1.0);
         let line_h = self.editor.line_height(viewport_w, &ctx);
         let view_h = self.editor_area().h;
         self.scroll.offset = self
@@ -1200,8 +1333,8 @@ impl App {
         let margin = 32.0 * self.scale;
         self.h_scroll = if doc_x < self.h_scroll + margin {
             (doc_x - margin).max(0.0)
-        } else if doc_x > self.h_scroll + viewport_w - margin {
-            doc_x - viewport_w + margin
+        } else if doc_x > self.h_scroll + vis_w - margin {
+            doc_x - vis_w + margin
         } else {
             self.h_scroll
         }
@@ -1215,7 +1348,7 @@ impl App {
         // `area` and ignores horizontal scroll: numbers stay put while long
         // lines slide under the rail.
         let ctx = self.ctx();
-        gutter::paint_with(
+        let rail = gutter::paint_with(
             canvas,
             gutter::Gutter {
                 fonts: &self.fonts,
@@ -1229,7 +1362,7 @@ impl App {
         );
         let ops = self.editor.overlay_ops(
             &self.buffer,
-            area.w + self.h_scroll + gutter::rail_w(&self.fonts, &ctx, self.buffer.line_count()),
+            area.w + self.h_scroll + rail,
             &ctx,
             self.caret_visible(),
         );
@@ -1237,7 +1370,9 @@ impl App {
             return;
         }
         canvas.set_clip(Some(area));
-        let (ox, oy) = (area.x - self.h_scroll, area.y - scroll);
+        // Content is inset by the rail (PaneScroll::content_x), so the
+        // selection/caret overlay shifts with it.
+        let (ox, oy) = (area.x - self.h_scroll + rail, area.y - scroll);
         for op in &ops {
             if let DrawOp::Rect { rect, color } = op {
                 canvas.fill_rect(Rect::new(rect.x + ox, rect.y + oy, rect.w, rect.h), *color);
@@ -1318,6 +1453,11 @@ impl App {
         canvas
     }
 
+    /// DPI scale + window-edge grip for pane geometry and scrollbar hit tests.
+    fn metrics(&self) -> PaneMetrics {
+        PaneMetrics::new(self.scale, self.edge)
+    }
+
     /// Test/CLI helper: scroll to an absolute offset (physical px).
     pub fn set_scroll(&mut self, offset: f32) {
         self.scroll.offset = offset;
@@ -1337,30 +1477,32 @@ impl App {
                     &self.theme,
                     view,
                     PaneScroll::vertical(self.scroll.offset),
-                    self.scale,
+                    self.metrics(),
                 );
                 self.paint_preview_selection(canvas, view, self.scroll.offset);
             }
             Mode::Edit => {
+                let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
                 self.editor_pane.paint(
                     canvas,
                     &self.fonts,
                     &self.theme,
                     view,
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max),
-                    self.scale,
+                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    self.metrics(),
                 );
                 self.paint_editor_overlay(canvas, view, self.scroll.offset);
             }
             Mode::Split => {
                 let (left, right) = self.split_panes();
+                let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
                 self.preview.paint(
                     canvas,
                     &self.fonts,
                     &self.theme,
                     left,
                     PaneScroll::vertical(self.scroll.offset),
-                    self.scale,
+                    self.metrics(),
                 );
                 self.paint_preview_selection(canvas, left, self.scroll.offset);
                 self.editor_pane.paint(
@@ -1368,8 +1510,8 @@ impl App {
                     &self.fonts,
                     &self.theme,
                     right,
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max),
-                    self.scale,
+                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    self.metrics(),
                 );
                 self.paint_editor_overlay(canvas, right, self.scroll.offset);
                 // The seam between the panes.
@@ -1378,30 +1520,37 @@ impl App {
         }
     }
 
-    /// Status-bar buttons: the mode switcher, theme toggle and Help. Ids:
-    /// 0=Preview, 1=Edit, 2=Split, 3=Help, 4=Theme. Rects are filled in by
-    /// `statusbar::paint`.
+    /// Status-bar buttons. Ids: 0=Preview, 1=Edit, 2=Split, 3=Help, 4=Theme,
+    /// 5=Open, 6=About. The vec is in left-to-right order (paint walks it in
+    /// reverse), giving `Open | Preview Edit Split | Help About | Dark/Light`.
+    /// Rects are filled in by `statusbar::paint`.
     fn status_buttons(&self) -> Vec<statusbar::StatusButton> {
         let active = match self.mode {
             Mode::Preview => 0,
             Mode::Edit => 1,
             Mode::Split => 2,
         };
-        (0..=4)
-            .map(|id| statusbar::StatusButton {
-                id,
-                label: match id {
-                    0 => "Preview",
-                    1 => "Edit",
-                    2 => "Split",
-                    3 => "Help",
-                    // Names the theme a click switches to.
-                    _ if self.dark => "Light",
-                    _ => "Dark",
+        let rows: [(u8, &'static str, bool, bool); 7] = [
+            // id, label, active, starts-a-group
+            (5, "Open", false, false),
+            (0, "Preview", active == 0, true),
+            (1, "Edit", active == 1, false),
+            (2, "Split", active == 2, false),
+            (3, "Help", self.help_open, true),
+            (6, "About", self.about_open, false),
+            // Names the theme a click switches to.
+            (4, if self.dark { "Light" } else { "Dark" }, false, true),
+        ];
+        rows.iter()
+            .map(
+                |&(id, label, active, group_start)| statusbar::StatusButton {
+                    id,
+                    label,
+                    active,
+                    group_start,
+                    rect: Rect::default(),
                 },
-                active: id == active || (id == 3 && self.help_open),
-                rect: Rect::default(),
-            })
+            )
             .collect()
     }
 
@@ -1454,6 +1603,10 @@ impl Handler for App {
             } => {
                 self.size = (width, height);
                 self.scale = scale;
+                // The grip is a logical width; make it physical for this DPI. A
+                // DPI change arrives as a resize, so it is re-read here rather
+                // than only once at startup.
+                self.edge = platform::edge_grip() * scale;
                 self.layout_dirty = true;
                 host.request_redraw();
             }
@@ -1518,7 +1671,17 @@ impl Handler for App {
             m.paint(canvas, &self.fonts, &self.theme, self.scale);
         }
         if self.help_open {
-            help::paint(
+            let _ = help::paint(
+                canvas,
+                &self.fonts,
+                &self.theme,
+                canvas.width as f32,
+                canvas.height as f32,
+                self.scale,
+            );
+        }
+        if self.about_open {
+            let _ = about::paint(
                 canvas,
                 &self.fonts,
                 &self.theme,
@@ -1543,7 +1706,7 @@ impl Handler for App {
     }
 
     fn cursor_at(&self, x: f32, y: f32) -> CursorShape {
-        if self.menu.is_some() || self.help_open {
+        if self.menu.is_some() || self.help_open || self.about_open {
             return CursorShape::Arrow;
         }
         if y < titlebar::HEIGHT * self.scale {
@@ -1570,17 +1733,18 @@ impl Handler for App {
                 if self.preview.scrollbar_hit(
                     self.viewport(),
                     PaneScroll::vertical(self.scroll.offset),
-                    self.scale,
+                    self.metrics(),
                     p,
                 ) {
                     return CursorShape::Arrow;
                 }
             }
             Mode::Edit => {
+                let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
                 if self.editor_pane.scrollbar_hit(
                     self.viewport(),
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max),
-                    self.scale,
+                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    self.metrics(),
                     p,
                 ) {
                     return CursorShape::Arrow;
@@ -1588,15 +1752,16 @@ impl Handler for App {
             }
             Mode::Split => {
                 let (left, right) = self.split_panes();
+                let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
                 if self.preview.scrollbar_hit(
                     left,
                     PaneScroll::vertical(self.scroll.offset),
-                    self.scale,
+                    self.metrics(),
                     p,
                 ) || self.editor_pane.scrollbar_hit(
                     right,
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max),
-                    self.scale,
+                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    self.metrics(),
                     p,
                 ) {
                     return CursorShape::Arrow;
@@ -1747,15 +1912,51 @@ mod tests {
     fn mode_key_cycles_preview_edit_split() {
         let mut app = App::new(None).unwrap();
         let mut host = NullHost::default();
-        app.on_event(ctrl('e'), &mut host);
+        // An Untitled buffer opens straight in Edit mode.
         assert_eq!(app.mode, Mode::Edit);
         app.on_event(ctrl('e'), &mut host);
         assert_eq!(app.mode, Mode::Split);
         app.on_event(ctrl('e'), &mut host);
         assert_eq!(app.mode, Mode::Preview);
+        app.on_event(ctrl('e'), &mut host);
+        assert_eq!(app.mode, Mode::Edit);
         // Edit/Split panes lay out without panicking.
         app.on_event(ctrl('e'), &mut host);
         let _ = app.render_headless(800, 600, 1.0);
+    }
+
+    #[test]
+    fn untitled_tabs_switch_to_edit_mode() {
+        // Closing the last tab leaves a fresh Untitled, which drops into Edit.
+        let mut app = open("readitor_test_untitled.txt", "hello");
+        let mut host = NullHost::default();
+        assert_eq!(app.mode, Mode::Preview);
+        app.on_event(ctrl('w'), &mut host);
+        assert!(app.path.is_none(), "last tab is a fresh Untitled");
+        assert_eq!(app.mode, Mode::Edit);
+        // Give it content so the next open stacks a tab instead of replacing it.
+        app.on_event(Event::Text("draft".into()), &mut host);
+        app.mode = Mode::Preview; // as if the user flipped to Preview
+        let out = std::env::temp_dir().join("readitor_test_untitled2.txt");
+        std::fs::write(&out, "x").unwrap();
+        app.open_path(out.clone(), &mut host);
+        assert_eq!(app.path.as_ref(), Some(&out));
+        assert_eq!(app.mode, Mode::Preview, "a file tab keeps the mode");
+        // Cycling back onto the Untitled tab forces Edit again.
+        app.on_event(
+            Event::KeyDown {
+                key: Key::Tab,
+                mods: Modifiers {
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                },
+            },
+            &mut host,
+        );
+        assert!(app.path.is_none(), "cycled back to the Untitled tab");
+        assert_eq!(app.mode, Mode::Edit);
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]
@@ -1883,7 +2084,9 @@ mod tests {
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(Event::Text("!".into()), &mut host);
-        assert_eq!(app.title(), "readitor_test_k.txt • — Readitor");
+        // The dirty marker lives on the tab's save button now, not the title.
+        assert!(app.buffer.dirty);
+        assert_eq!(app.title(), "readitor_test_k.txt — Readitor");
         assert_eq!(app.buffer.text(), "!hello");
         app.on_event(ctrl('s'), &mut host);
         assert!(!app.buffer.dirty);
@@ -1892,6 +2095,105 @@ mod tests {
             std::fs::read_to_string(app.path.as_ref().unwrap()).unwrap(),
             "!hello"
         );
+    }
+
+    #[test]
+    fn save_as_writes_an_untitled_buffer() {
+        // An Untitled buffer has no path: Ctrl+S must ask the host where to
+        // put it, then adopt that path for the tab.
+        let mut app = App::new(None).unwrap();
+        assert!(app.path.is_none());
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host);
+        app.on_event(Event::Text("draft".into()), &mut host);
+        assert!(app.buffer.dirty);
+        // Cancelling changes nothing: still Untitled, still dirty.
+        app.on_event(ctrl('s'), &mut host);
+        assert!(app.path.is_none());
+        assert!(app.buffer.dirty);
+        assert_eq!(app.status_extra, "save cancelled");
+        // Choosing a path writes the file and re-homes the tab.
+        let out = std::env::temp_dir().join("readitor_test_saveas.md");
+        let _ = std::fs::remove_file(&out);
+        host.save_file = Some(out.clone());
+        app.on_event(ctrl('s'), &mut host);
+        assert_eq!(app.path.as_ref(), Some(&out));
+        assert_eq!(app.kind, FileKind::Markdown, "kind follows the suffix");
+        assert!(!app.buffer.dirty);
+        assert_eq!(app.title(), "readitor_test_saveas.md — Readitor");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "draft");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn tab_save_button_saves_the_tab() {
+        let mut app = open("readitor_test_savebtn.txt", "hello");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host);
+        app.on_event(Event::Text("!".into()), &mut host);
+        assert!(app.buffer.dirty);
+        let _ = app.render_headless(800, 600, 1.0);
+        let lay = titlebar::layout(&app.fonts, &app.tab_labels(), 800.0, app.scale);
+        let save = lay.saves[0].expect("dirty tab shows a save button");
+        assert!(
+            save.right() <= lay.closes[0].x + 0.5,
+            "save button must sit left of the close ×"
+        );
+        assert_eq!(
+            titlebar::hit_test(&lay, save.x + 2.0, save.y + 2.0),
+            TitleHit::TabSave(0)
+        );
+        app.on_event(
+            Event::MouseDown {
+                x: save.x + 2.0,
+                y: save.y + 2.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(!app.buffer.dirty, "clicking the tab save button saves");
+        assert_eq!(
+            std::fs::read_to_string(app.path.as_ref().unwrap()).unwrap(),
+            "!hello"
+        );
+        // A clean tab carries no save button.
+        let _ = app.render_headless(800, 600, 1.0);
+        let lay = titlebar::layout(&app.fonts, &app.tab_labels(), 800.0, app.scale);
+        assert!(lay.saves[0].is_none());
+    }
+
+    #[test]
+    fn status_bar_open_button_opens_a_file() {
+        let mut app = App::new(None).unwrap();
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        let open_btn = app
+            .status_buttons
+            .iter()
+            .find(|b| b.id == 5)
+            .expect("Open button")
+            .rect;
+        // Leftmost in the row: Open | Preview Edit Split | Help | Theme.
+        let leftmost = app
+            .status_buttons
+            .iter()
+            .map(|b| b.rect.x)
+            .fold(f32::MAX, f32::min);
+        assert!((open_btn.x - leftmost).abs() < 0.5, "Open is leftmost");
+        let out = std::env::temp_dir().join("readitor_test_openbtn.txt");
+        std::fs::write(&out, "opened").unwrap();
+        host.picked_file = Some(out.clone());
+        app.on_event(
+            Event::MouseDown {
+                x: open_btn.x + 2.0,
+                y: open_btn.y + 2.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert_eq!(app.path.as_ref(), Some(&out));
+        assert_eq!(app.buffer.text(), "opened");
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]
@@ -2155,6 +2457,114 @@ mod tests {
     }
 
     #[test]
+    fn about_overlay_toggles_with_f2_and_closes() {
+        let mut app = open("readitor_test_ab.txt", "hello");
+        let mut host = NullHost::default();
+        let f2 = || Event::KeyDown {
+            key: Key::F(2),
+            mods: Modifiers::default(),
+        };
+        app.on_event(f2(), &mut host);
+        assert!(app.about_open);
+        // F2 toggles it back off.
+        app.on_event(f2(), &mut host);
+        assert!(!app.about_open);
+        // Escape closes it too.
+        app.on_event(f2(), &mut host);
+        assert!(app.about_open);
+        app.on_event(
+            Event::KeyDown {
+                key: Key::Escape,
+                mods: Modifiers::default(),
+            },
+            &mut host,
+        );
+        assert!(!app.about_open);
+    }
+
+    #[test]
+    fn about_and_help_overlays_are_mutually_exclusive() {
+        let mut app = open("readitor_test_ab2.txt", "hello");
+        let mut host = NullHost::default();
+        let key = |k| Event::KeyDown {
+            key: k,
+            mods: Modifiers::default(),
+        };
+        app.on_event(key(Key::F(1)), &mut host);
+        assert!(app.help_open && !app.about_open);
+        // F2 swaps help for the about box rather than stacking them.
+        app.on_event(key(Key::F(2)), &mut host);
+        assert!(app.about_open && !app.help_open);
+        app.on_event(key(Key::F(1)), &mut host);
+        assert!(app.help_open && !app.about_open);
+        // Any click dismisses whichever is up.
+        app.on_event(
+            Event::MouseDown {
+                x: 100.0,
+                y: 100.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(!app.help_open && !app.about_open);
+    }
+
+    #[test]
+    fn status_bar_about_button_opens_the_box() {
+        let mut app = open("readitor_test_ab3.txt", "hello");
+        let mut host = NullHost::default();
+        let _ = app.render_headless(900, 600, 1.0);
+        let about = app
+            .status_buttons
+            .iter()
+            .find(|b| b.label == "About")
+            .expect("About button")
+            .rect;
+        app.on_event(
+            Event::MouseDown {
+                x: about.x + 2.0,
+                y: about.y + 2.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.about_open);
+    }
+
+    #[test]
+    fn menu_about_item_opens_the_box() {
+        let mut app = open("readitor_test_ab4.txt", "hello");
+        let mut host = NullHost::default();
+        let _ = app.render_headless(900, 600, 1.0);
+        app.on_event(
+            Event::MouseDown {
+                x: 300.0,
+                y: 300.0,
+                button: MouseButton::Right,
+            },
+            &mut host,
+        );
+        let menu = app.menu.as_ref().expect("right-click opens a menu");
+        let item = menu
+            .rects
+            .iter()
+            .enumerate()
+            .find(|(i, _)| menu.items[*i].0 == menu::Action::About)
+            .map(|(_, r)| *r)
+            .expect("menu offers About");
+        app.on_event(
+            Event::MouseDown {
+                x: item.x + 4.0,
+                y: item.y + 4.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.about_open);
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
     fn right_click_menu_copy_all_and_dismiss() {
         let mut app = open("readitor_test_v.txt", "whole document");
         let mut host = NullHost::default();
@@ -2276,7 +2686,9 @@ mod tests {
         let px = |x: f32, y: f32| c.pixels[y as usize * 800 + x as usize];
         let fg = app.theme.fg.pack();
         let mid_y = (view.y + cy + line_h / 2.0) as usize;
-        let x0 = (view.x + cx).round() as usize;
+        // Content (and the caret with it) is inset by the gutter rail.
+        let rail = gutter::rail_w(&app.fonts, &ctx, app.buffer.line_count());
+        let x0 = (view.x + cx + rail - app.h_scroll).round() as usize;
         let found = (0..3).any(|dx| px((x0 + dx) as f32, mid_y as f32) == fg);
         assert!(
             found,
@@ -2625,14 +3037,19 @@ mod tests {
         );
         app.on_event(ctrl('e'), &mut NullHost::default()); // Edit (=> editor pane)
         let _ = app.render_headless(800, 600, 1.0);
-        // Right edge over the vertical overlay scrollbar zone.
+        // Over the vertical overlay scrollbar zone (which sits a window-edge
+        // grip clear of the border so the OS resize border cannot eat it).
         let view = app.viewport();
-        let sb_x = view.right() - 4.0;
+        let v = app
+            .editor_pane
+            .v_sb(view, app.scroll.offset, app.metrics())
+            .expect("setup: editor pane must scroll");
+        let sb_x = v.zone.x + 1.0;
         let y_mid = view.y + view.h / 2.0;
         assert_eq!(app.cursor_at(sb_x, y_mid), CursorShape::Arrow);
         // Just inside the text area, same row: still I-beam.
         assert_eq!(
-            app.cursor_at(view.right() - 30.0, y_mid),
+            app.cursor_at(view.right() - v.zone.w - 30.0, y_mid),
             CursorShape::IBeam
         );
         // Horizontal bar zone (long line in Edit => h_max > 0). One file:
@@ -2642,8 +3059,18 @@ mod tests {
         app.open_path(wide, &mut NullHost::default());
         let _ = app.render_headless(800, 600, 1.0);
         assert!(app.h_max > 0.0, "setup: need a wide line");
-        let h_y = app.viewport().bottom() - 4.0;
-        assert_eq!(app.cursor_at(view.x + 200.0, h_y), CursorShape::Arrow);
+        let h = app
+            .editor_pane
+            .h_sb(
+                view,
+                PaneScroll::editor(app.scroll.offset, app.h_scroll, app.h_max, 0.0),
+                app.metrics(),
+            )
+            .expect("setup: wide line must overflow");
+        assert_eq!(
+            app.cursor_at(view.x + 200.0, h.zone.y + 1.0),
+            CursorShape::Arrow
+        );
     }
 
     #[test]
@@ -2712,5 +3139,222 @@ mod tests {
         // The preview pane wraps (many rows); the editor pane does not (1 row).
         assert!(app.preview_rows.len() > 1, "preview should wrap");
         assert_eq!(app.editor_pane.list.ops.len(), 1, "editor must not wrap");
+    }
+
+    #[test]
+    fn vertical_scrollbar_clears_the_resize_grip_in_every_mode() {
+        // Regression: the overlay scrollbar sat flush with the window's right
+        // edge, inside the strip the OS keeps for resizing, so pressing the
+        // thumb started a window resize instead of scrolling. Preview, Edit
+        // and Split reach the bar through different paths (`sb_geom`, `sb_at`,
+        // `paint_panes` all branch on mode), so every mode is checked: the
+        // zone and thumb clear the grip, the pointer is an arrow there, a
+        // press on the visible thumb starts a drag, and the painted bar never
+        // shows up inside the strip.
+        let grip = platform::edge_grip();
+        let (w, h) = (800usize, 600usize);
+        // One block per paragraph guarantees a document taller than any pane.
+        let content = "a paragraph of text\n\n".repeat(120);
+        for (presses, mode) in [(0u8, Mode::Preview), (1, Mode::Edit), (2, Mode::Split)] {
+            let mut app = open("readitor_test_sbedge.txt", &content);
+            let mut host = NullHost::default();
+            for _ in 0..presses {
+                app.on_event(ctrl('e'), &mut host); // Preview -> Edit -> Split
+            }
+            assert_eq!(app.mode, mode, "setup: mode after {presses} Ctrl+E");
+            assert_eq!(
+                app.edge,
+                grip * app.scale,
+                "{mode:?}: app tracks the edge grip (physical px)"
+            );
+            // Lay out first: the bar exists only once the pane knows its
+            // content height.
+            let canvas = app.render_headless(w, h, 1.0);
+            // The pane that owns the window's right edge: the preview when it
+            // fills the window, otherwise the editor pane.
+            let editor = mode != Mode::Preview;
+            let area = if editor {
+                app.editor_area()
+            } else {
+                app.viewport()
+            };
+            let g = app
+                .sb_geom(editor, false)
+                .unwrap_or_else(|| panic!("{mode:?}: expected a vertical scrollbar"));
+            assert!(
+                g.thumb.right() <= area.right() - grip,
+                "{mode:?}: thumb leaves no room for the resize strip: {g:?}"
+            );
+            assert!(
+                g.zone.right() <= area.right() - grip + 0.001,
+                "{mode:?}: interactive zone reaches into the strip: {g:?}"
+            );
+            // The bar still hugs the window edge — the gap is the resize
+            // strip, not a wide inset that reads as a floating bar.
+            assert!(
+                area.right() - g.thumb.right() <= grip.max(3.0 * app.scale) + 0.001,
+                "{mode:?}: bar floats {} px from the edge",
+                area.right() - g.thumb.right()
+            );
+            let (px, py) = (g.thumb.x + 1.0, g.thumb.y + 2.0);
+            assert_eq!(
+                app.cursor_at(px, py),
+                CursorShape::Arrow,
+                "{mode:?}: the pointer over the bar is an arrow"
+            );
+            app.on_event(
+                Event::MouseDown {
+                    x: px,
+                    y: py,
+                    button: MouseButton::Left,
+                },
+                &mut host,
+            );
+            assert!(
+                app.sb_drag.is_some(),
+                "{mode:?}: a press on the visible thumb must start a scroll drag"
+            );
+            // Painted pixels agree with the geometry: the bar's own colour is
+            // absent from the strip and present just inside it.
+            let bar = canvas.pixels[(py as usize) * w + px as usize];
+            let strip = (w - grip as usize)..w;
+            let in_strip = (40..h - 40)
+                .flat_map(|y| strip.clone().map(move |x| (x, y)))
+                .filter(|&(x, y)| canvas.pixels[y * w + x] == bar)
+                .count();
+            assert_eq!(
+                in_strip, 0,
+                "{mode:?}: bar colour painted inside the resize strip"
+            );
+            let inside = (40..h - 40)
+                .flat_map(|y| ((w - grip as usize - 20)..(w - grip as usize)).map(move |x| (x, y)))
+                .filter(|&(x, y)| canvas.pixels[y * w + x] == bar)
+                .count();
+            assert!(
+                inside > 20,
+                "{mode:?}: sampled colour is not the bar ({inside} px)"
+            );
+        }
+    }
+
+    #[test]
+    fn scrollbar_thumb_drag_scrolls() {
+        let mut app = open("readitor_test_sbd.txt", &"line\n".repeat(200));
+        let _ = app.render_headless(800, 600, 1.0);
+        let area = app.viewport();
+        let g = app
+            .preview
+            .v_sb(area, app.scroll.offset, app.metrics())
+            .unwrap();
+        assert!(app.scroll.offset < 10.0, "start at top");
+        let mut host = NullHost::default();
+        // Press on the thumb, drag to the bottom of the track.
+        app.on_event(
+            Event::MouseDown {
+                x: g.thumb.x + 2.0,
+                y: g.thumb.y + 4.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.sb_drag.is_some(), "thumb press starts a drag");
+        app.on_event(
+            Event::MouseMove {
+                x: g.thumb.x + 2.0,
+                y: g.start + g.travel,
+            },
+            &mut host,
+        );
+        assert!(
+            app.scroll.offset > g.max * 0.9,
+            "drag to bottom: {} / {}",
+            app.scroll.offset,
+            g.max
+        );
+        // Release ends the drag.
+        app.on_event(
+            Event::MouseUp {
+                x: g.thumb.x + 2.0,
+                y: g.start + g.travel,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.sb_drag.is_none());
+        // A track click below the thumb pages down and grabs the thumb.
+        app.scroll.offset = 0.0;
+        let g2 = app.preview.v_sb(area, 0.0, app.metrics()).unwrap();
+        app.on_event(
+            Event::MouseDown {
+                x: g2.thumb.x + 2.0,
+                y: g2.thumb.y + g2.thumb.h + 20.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.scroll.offset > 100.0, "track click pages down");
+        assert!(app.sb_drag.is_some(), "track click grabs the thumb");
+    }
+
+    #[test]
+    fn gutter_click_does_not_place_caret() {
+        let mut app = open("readitor_test_gut.txt", "hello world\nsecond line");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host);
+        let _ = app.render_headless(800, 600, 1.0);
+        app.on_event(
+            Event::KeyDown {
+                key: Key::Right,
+                mods: Modifiers::default(),
+            },
+            &mut host,
+        );
+        assert_eq!(app.editor.caret.col, 1);
+        // A click inside the line-number rail must not move the caret.
+        let y = app.viewport().y + 10.0;
+        app.on_event(
+            Event::MouseDown {
+                x: 5.0,
+                y,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert_eq!(app.editor.caret.col, 1, "gutter click must be ignored");
+        // The pointer is an arrow over the rail, not an I-beam.
+        assert_eq!(app.cursor_at(5.0, y), CursorShape::Arrow);
+    }
+
+    #[test]
+    fn double_and_triple_click_select_word_and_line() {
+        let mut app = open("readitor_test_dbl.txt", "hello world\nsecond line");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host);
+        let _ = app.render_headless(800, 600, 1.0);
+        let ctx = app.ctx();
+        let p = crate::layout::text::plain_params(800.0, &ctx, false);
+        let rail = gutter::rail_w(&app.fonts, &ctx, app.buffer.line_count());
+        // Middle of "world" (6.5 mono cells past the line start).
+        let adv = app
+            .fonts
+            .advance(crate::gfx::font::FontStyle::Mono, 'o', p.size);
+        let x = app.viewport().x + rail + p.x0 + 6.5 * adv;
+        let y = app.viewport().y + p.pad + p.line_h / 2.0;
+        let click = |app: &mut App, host: &mut NullHost| {
+            app.on_event(
+                Event::MouseDown {
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                },
+                host,
+            );
+        };
+        click(&mut app, &mut host); // single: places the caret
+        assert!(app.editor.selection().is_none());
+        click(&mut app, &mut host); // double: selects the word
+        assert_eq!(app.editor.sel_text(&app.buffer), "world");
+        click(&mut app, &mut host); // triple: selects the whole line
+        assert_eq!(app.editor.sel_text(&app.buffer), "hello world");
     }
 }

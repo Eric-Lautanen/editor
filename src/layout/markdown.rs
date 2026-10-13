@@ -161,13 +161,18 @@ fn wrap_spans(
             });
             continue;
         }
-        for (oi, ch) in s.text.chars().enumerate() {
+        let mut it = s.text.chars().peekable();
+        let mut oi = 0;
+        while let Some(ch) = it.next() {
             atoms.push(Atom {
                 span: si,
                 off: oi,
                 ch,
-                w: fonts.advance(s.style, ch, size),
+                // Widths need the lookahead too, or a row holding an emoji
+                // would be laid out with the narrower text-form advance.
+                w: fonts.advance_at(s.style, ch, it.peek().copied(), size),
             });
+            oi += 1;
         }
     }
     let mut rows = Vec::new();
@@ -316,10 +321,7 @@ impl Md<'_> {
                 if piece.is_empty() {
                     continue;
                 }
-                let w: f32 = piece
-                    .chars()
-                    .map(|c| self.fonts.advance(sp.style, c, size))
-                    .sum();
+                let w = self.fonts.measure(sp.style, &piece, size);
                 if sp.code {
                     self.ops.push(DrawOp::RoundedRect {
                         rect: Rect::new(pen - 3.0, self.y + 2.0, w + 6.0, lh - 3.0),
@@ -607,13 +609,8 @@ impl Md<'_> {
                 let used: f32 = first
                     .iter()
                     .map(|&(si, s, e)| {
-                        spans[si]
-                            .text
-                            .chars()
-                            .skip(s)
-                            .take(e - s)
-                            .map(|c| md.fonts.advance(spans[si].style, c, size))
-                            .sum::<f32>()
+                        md.fonts
+                            .measure_range(spans[si].style, &spans[si].text, s, e, size)
                     })
                     .sum();
                 let mut ox = match align.get(ci).copied().unwrap_or(Align::None) {
@@ -628,10 +625,7 @@ impl Md<'_> {
                     if piece.is_empty() {
                         continue;
                     }
-                    let w: f32 = piece
-                        .chars()
-                        .map(|c| md.fonts.advance(sp.style, c, size))
-                        .sum();
+                    let w = md.fonts.measure(sp.style, &piece, size);
                     md.text_op(ox, baseline, piece, sp.style, size, sp.color);
                     if let Some(href) = &sp.link {
                         md.hits.push(HitRegion {

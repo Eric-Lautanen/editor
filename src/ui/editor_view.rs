@@ -194,27 +194,30 @@ impl EditorView {
     pub fn select_word(&mut self, buf: &Buffer, at: Pos) {
         let line = buf.line(at.line);
         let chars: Vec<(usize, char)> = line.char_indices().collect();
-        let (start, end) = match chars
-            .iter()
-            .position(|(i, _)| *i >= at.col)
-            .unwrap_or(chars.len())
-            .checked_sub(1)
-        {
-            Some(k) => {
-                let cls = word_class(chars[k].1);
-                let mut a = k;
-                let mut b = k;
-                while a > 0 && word_class(chars[a - 1].1) == cls {
-                    a -= 1;
-                }
-                while b + 1 < chars.len() && word_class(chars[b + 1].1) == cls {
-                    b += 1;
-                }
-                (chars[a].0, chars[b + 1].0)
-            }
-            // Empty line or a click before the first char: collapse.
-            None => (0, 0),
+        if chars.is_empty() {
+            self.anchor = None;
+            self.goal = None;
+            return;
+        }
+        // Map the click column to the char it lands in. Exact-boundary clicks
+        // pick that char; a click in the middle of a multibyte char or in the
+        // gap between two chars picks the char whose byte range contains the
+        // column (or the preceding one if we're before any char).
+        let k = match chars.binary_search_by_key(&at.col, |(i, _)| *i) {
+            Ok(k) => k,
+            Err(k) => k.saturating_sub(1),
         };
+        // Expand outward to the full same-class run around `k`.
+        let cls = word_class(chars[k].1);
+        let mut a = k;
+        let mut b = k;
+        while a > 0 && word_class(chars[a - 1].1) == cls {
+            a -= 1;
+        }
+        while b + 1 < chars.len() && word_class(chars[b + 1].1) == cls {
+            b += 1;
+        }
+        let (start, end) = (chars[a].0, chars[b].0 + chars[b].1.len_utf8());
         self.anchor = Some(Pos {
             line: at.line,
             col: start,
@@ -562,17 +565,17 @@ mod tests {
 
     #[test]
     fn cut_paste_round_trip() {
-        let mut b = Buffer::from_text("hello world");
+        let mut b = buf();
         let mut e = EditorView::default();
         shift_moves(&mut e, &b, Key::Right, 5);
-        assert_eq!(e.cut(&mut b).as_deref(), Some("hello"));
-        assert_eq!(b.text(), " world");
+        assert_eq!(e.cut(&mut b).as_deref(), Some("alpha"));
+        assert_eq!(b.text(), " beta\ngamma\n");
         e.paste(&mut b, "goodbye");
-        assert_eq!(b.text(), "goodbye world");
+        assert_eq!(b.text(), "goodbye beta\ngamma\n");
         assert!(e.undo(&mut b) && e.undo(&mut b));
-        assert_eq!(b.text(), "hello world");
+        assert_eq!(b.text(), "alpha beta\ngamma\n");
         assert!(e.redo(&mut b) && e.redo(&mut b));
-        assert_eq!(b.text(), "goodbye world");
+        assert_eq!(b.text(), "goodbye beta\ngamma\n");
     }
 
     #[test]
@@ -628,5 +631,42 @@ mod tests {
         assert!(e.move_key(&b, Key::Right, Modifiers::default()));
         assert_eq!(e.caret, b.end());
         assert!(e.selection().is_none());
+    }
+
+    #[test]
+    fn double_click_selects_word_by_class() {
+        let b = Buffer::from_text("fn word_here(x: i32) {}");
+        let mut e = EditorView::default();
+        // Middle of an identifier: the whole identifier.
+        e.select_word(&b, Pos { line: 0, col: 5 });
+        assert_eq!(e.sel_text(&b), "word_here");
+        // A punctuation char selects the punctuation run.
+        e.select_word(&b, Pos { line: 0, col: 14 });
+        assert_eq!(e.sel_text(&b), ":");
+        // Whitespace selects the whitespace run.
+        e.select_word(&b, Pos { line: 0, col: 15 });
+        assert_eq!(e.sel_text(&b), " ");
+        // Clicking at end of line selects the last char's run.
+        e.select_word(
+            &b,
+            Pos {
+                line: 0,
+                col: b.line(0).len(),
+            },
+        );
+        assert_eq!(e.sel_text(&b), "{}");
+        // Empty line collapses instead of panicking.
+        let empty = Buffer::from_text("");
+        e.select_word(&empty, Pos { line: 0, col: 0 });
+        assert!(e.selection().is_none());
+    }
+
+    #[test]
+    fn triple_click_selects_whole_line() {
+        let b = Buffer::from_text("alpha beta\ngamma\n");
+        let mut e = EditorView::default();
+        e.select_line(&b, Pos { line: 1, col: 3 });
+        assert_eq!(e.sel_text(&b), "gamma");
+        assert_eq!(e.caret, Pos { line: 1, col: 5 });
     }
 }

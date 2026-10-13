@@ -23,6 +23,7 @@ pub enum Action {
     Save,
     CloseTab,
     Help,
+    About,
 }
 
 /// A live menu: item list plus their on-screen rects.
@@ -57,6 +58,7 @@ pub fn open(
             (Action::Save, "Save  Ctrl+S"),
             (Action::CloseTab, "Close tab  Ctrl+W"),
             (Action::Help, "Help  F1"),
+            (Action::About, "About Readitor  F2"),
         ]
     } else {
         vec![
@@ -65,6 +67,7 @@ pub fn open(
             (Action::Save, "Save  Ctrl+S"),
             (Action::CloseTab, "Close tab  Ctrl+W"),
             (Action::Help, "Help  F1"),
+            (Action::About, "About Readitor  F2"),
         ]
     };
     let size = 12.5 * scale;
@@ -144,7 +147,7 @@ mod tests {
     fn menu_items_and_hits() {
         let fonts = FontSystem::load_embedded();
         let menu = open(&fonts, 100.0, 100.0, true, 800.0, 600.0, 1.0);
-        assert_eq!(menu.items.len(), 8);
+        assert_eq!(menu.items.len(), 9);
         assert_eq!(menu.hit(100.0, 100.0), None, "above the first item");
         let first = menu.rects[0];
         assert_eq!(
@@ -153,7 +156,7 @@ mod tests {
             "first editor item is Copy"
         );
         let preview = open(&fonts, 100.0, 100.0, false, 800.0, 600.0, 1.0);
-        assert_eq!(preview.items.len(), 5);
+        assert_eq!(preview.items.len(), 6);
         assert_eq!(
             preview.hit(preview.rects[0].x + 4.0, preview.rects[0].y + 4.0),
             Some(Action::CopyAll)

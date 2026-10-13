@@ -54,16 +54,32 @@ const RASTER_SAMPLES: u32 = 4;
 /// in each axis so a single glyph can never ask for an absurd allocation.
 const MAX_BITMAP_DIM: usize = 4_096;
 
+/// Ceiling on the face count a `.ttc` header may claim. Real collections are
+/// well under this (macOS PingFang is ~10); a hostile count must not drive a
+/// huge allocation.
+const MAX_COLLECTION_FACES: u32 = 128;
+
 #[derive(Debug)]
-#[allow(clippy::enum_variant_names)] // BadMagic/BadTable/BadGlyph shape the message; rename would read worse.
 pub enum TtfError {
     /// Not a TrueType font (bad magic, truncated header).
-    BadMagic,
+    NotTrueType,
     /// Truncated or malformed table.
-    BadTable(&'static str),
+    Table(&'static str),
     /// Out-of-range glyph id or a glyph table inconsistency.
-    BadGlyph(u16),
+    Glyph(u16),
 }
+
+impl std::fmt::Display for TtfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotTrueType => write!(f, "not a TrueType font"),
+            Self::Table(what) => write!(f, "malformed {what} table"),
+            Self::Glyph(gid) => write!(f, "bad glyph id {gid}"),
+        }
+    }
+}
+
+impl std::error::Error for TtfError {}
 
 // =============================================================== reader ====
 
@@ -79,9 +95,9 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], TtfError> {
-        let end = self.p.checked_add(n).ok_or(TtfError::BadTable("overrun"))?;
+        let end = self.p.checked_add(n).ok_or(TtfError::Table("overrun"))?;
         if end > self.b.len() {
-            return Err(TtfError::BadTable("overrun"));
+            return Err(TtfError::Table("overrun"));
         }
         let s = &self.b[self.p..end];
         self.p = end;
@@ -110,10 +126,19 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Look up one table in the sfnt directory. `(0, 0)` when absent — caller
-/// treats missing tables as empty/unusable, never as a crash.
-fn table(data: &[u8], tag: &[u8; 4]) -> (u32, u32) {
-    let mut r = Reader::new(data);
+/// Look up one table in the sfnt directory that starts at `dir`. `(0, 0)` when
+/// absent — caller treats missing tables as empty/unusable, never as a crash.
+///
+/// `dir` is 0 for a plain `.ttf`. In a `.ttc` collection every member has its
+/// own directory, but the table *offsets* inside it stay absolute to the file
+/// start (that is how collections share tables), so the base cannot simply be
+/// sliced away — it has to be threaded through like this.
+pub(crate) fn table(data: &[u8], dir: u32, tag: &[u8; 4]) -> (u32, u32) {
+    let dir = dir as usize;
+    if dir >= data.len() {
+        return (0, 0);
+    }
+    let mut r = Reader::new(&data[dir..]);
     if r.u32().is_err() {
         return (0, 0);
     }
@@ -144,53 +169,87 @@ fn table(data: &[u8], tag: &[u8; 4]) -> (u32, u32) {
     (0, 0)
 }
 
+/// Table-directory offsets in a font file.
+///
+/// A plain sfnt yields `[0]`; a `.ttc` collection yields one offset per member,
+/// which is what [`Face::parse_at`] expects. Only the directory offsets are
+/// resolved — each face is parsed on demand, so a member that turns out to be
+/// CFF-flavoured (OTTO) fails at `parse_at` rather than poisoning the whole
+/// collection. This is what lets the fallback chain use system `.ttc` files
+/// (macOS PingFang, Linux NotoSansCJK, Windows msyh).
+pub fn faces(data: &[u8]) -> Result<Vec<u32>, TtfError> {
+    if data.len() < 12 {
+        return Err(TtfError::NotTrueType);
+    }
+    if &data[0..4] != b"ttcf" {
+        // Not a collection: a single face, whose directory sits at offset 0.
+        return Ok(vec![0]);
+    }
+    let mut r = Reader::new(data);
+    r.take(4).map_err(|_| TtfError::Table("ttcf"))?; // 'ttcf'
+    r.u32().map_err(|_| TtfError::Table("ttcf version"))?; // major+minor
+    let n = r.u32().map_err(|_| TtfError::Table("ttcf numFonts"))?;
+    if n == 0 || n > MAX_COLLECTION_FACES {
+        return Err(TtfError::Table("ttcf numFonts"));
+    }
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let off = r.u32().map_err(|_| TtfError::Table("ttcf offset"))?;
+        if off as usize + 12 > data.len() {
+            return Err(TtfError::Table("ttcf offset"));
+        }
+        out.push(off);
+    }
+    Ok(out)
+}
+
 // ============================================================ tables =======
 
-fn parse_head(data: &[u8]) -> Result<(f32, bool), TtfError> {
-    let (off, len) = table(data, b"head");
+fn parse_head(data: &[u8], dir: u32) -> Result<(f32, bool), TtfError> {
+    let (off, len) = table(data, dir, b"head");
     if len < 54 {
-        return Err(TtfError::BadTable("head"));
+        return Err(TtfError::Table("head"));
     }
     let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
-    r.take(18).map_err(|_| TtfError::BadTable("head"))?; // version..flags
-    let upem = r.u16().map_err(|_| TtfError::BadTable("head"))?;
-    r.take(30).map_err(|_| TtfError::BadTable("head"))?; // dates, bbox, macStyle…
-    let loc_fmt = r.i16().map_err(|_| TtfError::BadTable("head"))?;
+    r.take(18).map_err(|_| TtfError::Table("head"))?; // version..flags
+    let upem = r.u16().map_err(|_| TtfError::Table("head"))?;
+    r.take(30).map_err(|_| TtfError::Table("head"))?; // dates, bbox, macStyle…
+    let loc_fmt = r.i16().map_err(|_| TtfError::Table("head"))?;
     Ok((upem as f32, loc_fmt == 0))
 }
 
 /// We only need `numGlyphs`; everything else is sized to it.
-fn parse_maxp(data: &[u8]) -> Result<u16, TtfError> {
-    let (off, len) = table(data, b"maxp");
+fn parse_maxp(data: &[u8], dir: u32) -> Result<u16, TtfError> {
+    let (off, len) = table(data, dir, b"maxp");
     if len < 6 {
-        return Err(TtfError::BadTable("maxp"));
+        return Err(TtfError::Table("maxp"));
     }
     let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
-    r.u32().map_err(|_| TtfError::BadTable("maxp"))?;
-    r.u16().map_err(|_| TtfError::BadTable("maxp"))
+    r.u32().map_err(|_| TtfError::Table("maxp"))?;
+    r.u16().map_err(|_| TtfError::Table("maxp"))
 }
 
-fn parse_hhea(data: &[u8]) -> Result<(f32, f32, u16), TtfError> {
-    let (off, len) = table(data, b"hhea");
+fn parse_hhea(data: &[u8], dir: u32) -> Result<(f32, f32, u16), TtfError> {
+    let (off, len) = table(data, dir, b"hhea");
     if len < 34 {
-        return Err(TtfError::BadTable("hhea"));
+        return Err(TtfError::Table("hhea"));
     }
     let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
-    r.u32().map_err(|_| TtfError::BadTable("hhea"))?; // version
+    r.u32().map_err(|_| TtfError::Table("hhea"))?; // version
     let ascent = r.i16()?;
     let descent = r.i16()?;
-    r.take(26).map_err(|_| TtfError::BadTable("hhea"))?; // lineGap..metricDataFormat
-    let nhm = r.u16().map_err(|_| TtfError::BadTable("hhea"))?;
+    r.take(26).map_err(|_| TtfError::Table("hhea"))?; // lineGap..metricDataFormat
+    let nhm = r.u16().map_err(|_| TtfError::Table("hhea"))?;
     Ok((ascent as f32, descent as f32, nhm))
 }
 
-fn parse_loca(data: &[u8], short: bool, num_glyphs: u16) -> Result<Vec<u32>, TtfError> {
-    let (off, len) = table(data, b"loca");
+fn parse_loca(data: &[u8], dir: u32, short: bool, num_glyphs: u16) -> Result<Vec<u32>, TtfError> {
+    let (off, len) = table(data, dir, b"loca");
     let need = num_glyphs as usize + 1;
     // Short loca stores 2-byte entries, long stores 4.
     let entry = if short { 2 } else { 4 };
     if (len as usize) < need * entry {
-        return Err(TtfError::BadTable("loca"));
+        return Err(TtfError::Table("loca"));
     }
     let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
     let mut out = Vec::with_capacity(need);
@@ -200,8 +259,13 @@ fn parse_loca(data: &[u8], short: bool, num_glyphs: u16) -> Result<Vec<u32>, Ttf
     Ok(out)
 }
 
-fn parse_hmtx(data: &[u8], nhm: u16, num_glyphs: u16) -> Result<Vec<(u16, i16)>, TtfError> {
-    let (off, len) = table(data, b"hmtx");
+fn parse_hmtx(
+    data: &[u8],
+    dir: u32,
+    nhm: u16,
+    num_glyphs: u16,
+) -> Result<Vec<(u16, i16)>, TtfError> {
+    let (off, len) = table(data, dir, b"hmtx");
     let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
     let mut out = Vec::with_capacity(num_glyphs as usize);
     for _ in 0..nhm.min(num_glyphs) {
@@ -228,81 +292,112 @@ struct Seg {
     /// startCodePoint), for direct segments.
     delta: Option<i32>,
     /// Indirect segments (format-4 idRangeOffset): absolute byte offset of the
-    /// first array entry and the lowest codepoint it indexes.
-    indirect: Option<(u32, u32)>,
+    /// first array slot, the lowest codepoint it indexes, and the segment's
+    /// idDelta — which still applies to the slot's value (spec: "if the
+    /// glyphIndex is not 0, add idDelta").
+    indirect: Option<(u32, u32, i32)>,
 }
 
 struct Cmap<'a> {
-    segs: Vec<Seg>,
+    /// Segment runs in lookup order — the highest-coverage subtable first.
+    ///
+    /// Each run is sorted by `start`; a lookup walks the runs in turn and takes
+    /// the first hit. Keeping them separate (rather than concatenating) is what
+    /// lets a font whose format-12 subtable is partial still resolve the BMP
+    /// from its format-4 one, without giving up the early `break` that keeps
+    /// lookups fast.
+    runs: Vec<Vec<Seg>>,
     /// The font buffer, for idRangeOffset indirection (borrowed so parsing
     /// never duplicates the font bytes).
     data: &'a [u8],
 }
 
-fn parse_cmap(data: &[u8]) -> Result<Cmap<'_>, TtfError> {
-    let (off, len) = table(data, b"cmap");
+fn parse_cmap(data: &[u8], dir: u32) -> Result<Cmap<'_>, TtfError> {
+    let (off, len) = table(data, dir, b"cmap");
     if len < 4 {
-        return Err(TtfError::BadTable("cmap"));
+        return Err(TtfError::Table("cmap"));
     }
     let mut r = Reader::new(&data[off as usize..(off + len) as usize]);
-    r.u16().map_err(|_| TtfError::BadTable("cmap"))?; // version
-    let n = r.u16().map_err(|_| TtfError::BadTable("cmap"))?;
-    let mut best: Option<(u8, (u32, u32))> = None;
+    r.u16().map_err(|_| TtfError::Table("cmap"))?; // version
+    let n = r.u16().map_err(|_| TtfError::Table("cmap"))?;
+
+    // Rank candidates by *coverage*, not by platform id. A format-12 subtable
+    // spans all of Unicode including the astral planes, so it is strictly the
+    // better source; format 4 only reaches the BMP. Ranking the other way
+    // round is why astral emoji stayed unmapped even in fonts that carry them:
+    // every such font also ships a BMP subtable, and that one won.
+    let mut ranked: Vec<(u8, u32, u16)> = Vec::new();
     for _ in 0..n {
         let pid = r.u16()?;
         let eid = r.u16()?;
         let sub = r.u32()?;
-        let score = match (pid, eid) {
-            (3, 1) | (0, 3) => 0,
-            (3, 10) => 1,
+        let rank = match (pid, eid) {
+            (3, 10) | (0, 4) | (0, 6) => 0, // Unicode, full repertoire
+            (3, 1) | (0, 3) => 1,           // BMP only
             _ => continue,
         };
-        if best.is_some_and(|(s, _)| score >= s) {
-            continue;
-        }
         // Subtable offsets are relative to the cmap table itself.
         let abs = off + sub;
         if abs as usize + 2 > data.len() {
-            return Err(TtfError::BadTable("cmap"));
+            continue;
         }
         let mut sr = Reader::new(&data[abs as usize..]);
-        match sr.u16().map_err(|_| TtfError::BadTable("cmap"))? {
-            4 if score < 2 => best = Some((score, (abs, 4))),
-            12 if score >= 1 => best = Some((score, (abs, 12))),
-            _ => {}
+        let Ok(fmt) = sr.u16() else { continue };
+        if fmt == 4 || fmt == 12 {
+            ranked.push((rank, abs, fmt));
         }
     }
-    let Some((_, (sub, fmt))) = best else {
-        return Err(TtfError::BadTable("cmap"));
-    };
-    let mut segs = match fmt {
-        4 => parse_cmap4(data, sub)?,
-        12 => parse_cmap12(data, sub)?,
-        _ => return Err(TtfError::BadTable("cmap")),
-    };
-    segs.sort_by_key(|s| s.start);
-    Ok(Cmap { segs, data })
+    ranked.sort_by_key(|&(rank, _, _)| rank);
+
+    let mut runs: Vec<Vec<Seg>> = Vec::new();
+    for &(_, sub, fmt) in &ranked {
+        let parsed = match fmt {
+            12 => parse_cmap12(data, sub),
+            _ => parse_cmap4(data, sub),
+        };
+        // A malformed or *empty* subtable just does not contribute a run —
+        // Nirmala ships a format-12 subtable with length 0, and it must not
+        // shadow the format-4 one underneath it.
+        let Ok(mut segs) = parsed else { continue };
+        if segs.is_empty() {
+            continue;
+        }
+        segs.sort_by_key(|s| s.start);
+        runs.push(segs);
+    }
+    if runs.is_empty() {
+        return Err(TtfError::Table("cmap"));
+    }
+    Ok(Cmap { runs, data })
 }
 
 impl Cmap<'_> {
     /// Codepoint -> glyph id; 0 = .notdef.
     fn gid(&self, cp: u32) -> u16 {
-        for s in &self.segs {
-            if cp < s.start {
-                break; // sorted: nothing later can map
-            }
-            if cp > s.end {
-                continue;
-            }
-            if let Some((garr, gstart)) = s.indirect {
-                // Format-4 idRangeOffset: one array slot per codepoint.
-                let at = (garr + (cp - gstart) * 2) as usize;
-                if at + 2 <= self.data.len() {
-                    return u16::from_be_bytes([self.data[at + 1], self.data[at]]);
+        for run in &self.runs {
+            for s in run {
+                if cp < s.start {
+                    break; // sorted: nothing later in this run can map
                 }
-                return 0;
+                if cp > s.end {
+                    continue;
+                }
+                if let Some((garr, gstart, delta)) = s.indirect {
+                    // Format-4 idRangeOffset: one big-endian u16 slot per
+                    // codepoint, addressed relative to the slot's own location.
+                    // A zero slot means "no glyph", not "glyph zero + delta".
+                    let at = (garr + (cp - gstart) * 2) as usize;
+                    if at + 2 > self.data.len() {
+                        return 0;
+                    }
+                    let raw = u16::from_be_bytes([self.data[at], self.data[at + 1]]);
+                    if raw == 0 {
+                        return 0;
+                    }
+                    return (raw as i32 + delta) as u16;
+                }
+                return (cp as i32 + s.delta.unwrap_or(0)) as u16;
             }
-            return (cp as i32 + s.delta.unwrap_or(0)) as u16;
         }
         0
     }
@@ -315,7 +410,7 @@ fn parse_cmap4(data: &[u8], sub: u32) -> Result<Vec<Seg>, TtfError> {
     r.u16()?; // language
     let seg_x2 = r.u16()?; // segCountX2
     let seg = seg_x2 / 2;
-    r.take(6).map_err(|_| TtfError::BadTable("cmap4"))?; // searchRange..rangeShift
+    r.take(6).map_err(|_| TtfError::Table("cmap4"))?; // searchRange..rangeShift
 
     let mut ends = Vec::with_capacity(seg as usize);
     for _ in 0..seg {
@@ -350,7 +445,7 @@ fn parse_cmap4(data: &[u8], sub: u32) -> Result<Vec<Seg>, TtfError> {
                 start: s as u32,
                 end: e as u32,
                 delta: None,
-                indirect: Some((ros_off + (2 * i as u32) + ro as u32, s as u32)),
+                indirect: Some((ros_off + (2 * i as u32) + ro as u32, s as u32, d as i32)),
             });
         }
     }
@@ -365,7 +460,7 @@ fn parse_cmap12(data: &[u8], sub: u32) -> Result<Vec<Seg>, TtfError> {
     r.u32()?; // language
     let n = r.u32()?;
     if n > 20_000 {
-        return Err(TtfError::BadTable("cmap12"));
+        return Err(TtfError::Table("cmap12"));
     }
     let mut segs = Vec::with_capacity(n as usize);
     for _ in 0..n {
@@ -398,35 +493,79 @@ pub struct Face<'a> {
     ascent: f32,
     descent: f32,
     hmtx: Vec<(u16, i16)>,
+    /// COLR v1 paint graphs, when this face has them. `None` for the common
+    /// outline-only face, which is every face we embed.
+    colr: Option<super::colr::Colr<'a>>,
     cache: RefCell<HashMap<CacheKey, Option<Rc<Glyph>>>>,
 }
 
-/// Key for the rasterized-glyph cache, matching the atlas (char, 1/16 px).
-type CacheKey = (char, u32);
+/// Key for the rasterized-glyph cache: glyph id, and pixel size in 1/16 px.
+type CacheKey = (u16, u32);
 
 /// A flattened outline contour: polygon vertices in font units, y-up.
-struct Contour {
-    pts: Vec<(f32, f32)>,
+pub(crate) struct Contour {
+    pub(crate) pts: Vec<(f32, f32)>,
+}
+
+impl Contour {
+    /// Polygon contour from em-space vertices, wound clockwise in y-up space.
+    ///
+    /// `shapes` builds every primitive through this so that overlapping
+    /// contours keep a consistent winding — the non-zero fill rule then unions
+    /// them instead of cancelling them out. Reversing the vertices is how a
+    /// counter (a hole) is punched, which is what `shapes` does for outlines.
+    pub(crate) fn poly(pts: Vec<(f32, f32)>) -> Self {
+        Self { pts }
+    }
+
+    /// The same polygon wound the other way, so it subtracts from a filled
+    /// area under the non-zero rule.
+    pub(crate) fn reversed(pts: Vec<(f32, f32)>) -> Self {
+        let mut pts = pts;
+        pts.reverse();
+        Self { pts }
+    }
+}
+
+/// Rasterize em-space contours at `scale` pixels per em.
+///
+/// This is the seam `shapes` uses to draw procedural glyphs through the same
+/// scanline rasterizer as the real faces, so fallbacks anti-alias and quantize
+/// identically to font outlines. `None` when there is nothing to fill.
+pub(crate) fn rasterize_outline(contours: &[Contour], scale: f32) -> Option<Glyph> {
+    let edges = edges_of(contours, scale);
+    if edges.is_empty() {
+        return None;
+    }
+    Some(Face::rasterize(&edges))
 }
 
 impl Face<'_> {
+    /// Parse a plain single-font `.ttf`/`.otf`-flavoured TrueType file.
     pub fn parse(data: &'static [u8]) -> Result<Self, TtfError> {
-        if data.len() < 12 || data[0..4] != [0, 1, 0, 0] {
+        Self::parse_at(data, 0)
+    }
+
+    /// Parse the face whose sfnt directory starts at `dir` — 0 for a plain
+    /// file, or one of [`faces`]' offsets for a `.ttc` member.
+    pub fn parse_at(data: &'static [u8], dir: u32) -> Result<Self, TtfError> {
+        let at = dir as usize;
+        if data.len() < at + 12 || data.get(at..at + 4) != Some(&[0, 1, 0, 0]) {
             // TrueType 1.0 open-type magic; CFF-flavored OTTO is out of scope.
-            return Err(TtfError::BadMagic);
+            return Err(TtfError::NotTrueType);
         }
-        let cmap = parse_cmap(data)?;
-        let (upem, short_loca) = parse_head(data)?;
+        let cmap = parse_cmap(data, dir)?;
+        let (upem, short_loca) = parse_head(data, dir)?;
         if !(upem > 0.0 && upem.is_finite()) {
-            return Err(TtfError::BadTable("head upem"));
+            return Err(TtfError::Table("head upem"));
         };
-        let num_glyphs = parse_maxp(data)?;
-        let (ascent, descent, nhm) = parse_hhea(data)?;
-        let loca = parse_loca(data, short_loca, num_glyphs)?;
-        let hmtx = parse_hmtx(data, nhm, num_glyphs)?;
+        let num_glyphs = parse_maxp(data, dir)?;
+        let (ascent, descent, nhm) = parse_hhea(data, dir)?;
+        let loca = parse_loca(data, dir, short_loca, num_glyphs)?;
+        let hmtx = parse_hmtx(data, dir, nhm, num_glyphs)?;
         Ok(Self {
             data,
-            glyf_off: table(data, b"glyf").0,
+            glyf_off: table(data, dir, b"glyf").0,
             cmap,
             loca,
             num_glyphs,
@@ -434,12 +573,9 @@ impl Face<'_> {
             ascent,
             descent,
             hmtx,
+            colr: super::colr::Colr::parse(data, dir),
             cache: RefCell::new(HashMap::new()),
         })
-    }
-
-    pub fn units_per_em(&self) -> f32 {
-        self.upem
     }
 
     /// Baseline metrics as fractions of the em, matching `atlas::Metrics`.
@@ -455,14 +591,30 @@ impl Face<'_> {
         self.cmap.gid(cp)
     }
 
+    /// Number of glyphs in the face; every valid glyph id is below this.
+    pub fn num_glyphs(&self) -> u16 {
+        self.num_glyphs
+    }
+
+    /// Design units per em, the denominator of every font-unit coordinate.
+    pub(crate) fn upem(&self) -> f32 {
+        self.upem
+    }
+
+    /// Whether this face can draw `gid` as COLR colour art.
+    pub(crate) fn has_colour(&self, gid: u16) -> bool {
+        self.colr.as_ref().is_some_and(|c| c.has(gid))
+    }
+
+    /// Flattened glyph outline in font units (y-up); empty for blank glyphs.
+    /// The colour renderer transforms these itself, so it needs them raw.
+    pub(crate) fn contours(&self, gid: u16) -> Vec<Contour> {
+        self.outline(gid, 0).unwrap_or_default()
+    }
+
     /// Advance width in font units.
     pub fn advance(&self, gid: u16) -> f32 {
         self.hmtx.get(gid as usize).map_or(0.0, |&(a, _)| a as f32)
-    }
-
-    /// Number of parsed glyphs (probe/debug).
-    pub fn num_glyphs(&self) -> u16 {
-        self.num_glyphs
     }
 
     /// Advance width in pixels at `size`, matching the atlas scaling.
@@ -477,7 +629,7 @@ impl Face<'_> {
     /// Empty glyphs (space, .notdef) yield `Ok(vec![])`.
     fn outline(&self, gid: u16, depth: u32) -> Result<Vec<Contour>, TtfError> {
         if depth > MAX_COMPONENT_DEPTH || gid >= self.num_glyphs {
-            return Err(TtfError::BadGlyph(gid));
+            return Err(TtfError::Glyph(gid));
         }
         let start = self.loca[gid as usize] as usize;
         let end = self.loca[gid as usize + 1] as usize;
@@ -503,17 +655,17 @@ impl Face<'_> {
     }
 
     fn outline_simple(&self, r: &mut Reader, n_contours: u16) -> Result<Vec<Contour>, TtfError> {
-        r.take(8).map_err(|_| TtfError::BadGlyph(0))?; // xMin..yMax bbox
+        r.take(8).map_err(|_| TtfError::Glyph(0))?; // xMin..yMax bbox
         let mut ends = Vec::with_capacity(n_contours as usize);
         for _ in 0..n_contours {
             ends.push(r.u16()? as usize);
         }
         let n_points = ends.last().map_or(0, |&e| e + 1);
         if n_points > MAX_GLYF_POINTS {
-            return Err(TtfError::BadTable("glyf points"));
+            return Err(TtfError::Table("glyf points"));
         }
         let instr_len = r.u16()? as usize;
-        r.take(instr_len).map_err(|_| TtfError::BadGlyph(0))?;
+        r.take(instr_len).map_err(|_| TtfError::Glyph(0))?;
         let flags = read_flags(r, n_points)?;
         let xs = read_coords(r, n_points, &flags, true)?;
         let ys = read_coords(r, n_points, &flags, false)?;
@@ -524,7 +676,7 @@ impl Face<'_> {
         let mut start = 0;
         for &end in &ends {
             if end < start {
-                return Err(TtfError::BadGlyph(u16::MAX));
+                return Err(TtfError::Glyph(u16::MAX));
             }
             contours.push(Self::flatten_contour(&pt, &on, start, end));
             start = end + 1;
@@ -633,12 +785,12 @@ fn read_coords(r: &mut Reader, n: usize, flags: &[u8], x_axis: bool) -> Result<V
     let mut cur: i32 = 0;
     for f in flags.iter().take(n) {
         if f & short_flag != 0 {
-            let d = r.u8()?;
-            cur += if f & same_flag != 0 {
-                d as i32
-            } else {
-                d as i32 - 0x100
-            };
+            // Short vector: the byte is an unsigned magnitude; the flag bit
+            // carries the sign (set = positive, clear = negative). It is NOT
+            // a signed 8-bit delta — negating the magnitude is required, or
+            // every negative short delta is off by (256 - 2*d).
+            let d = r.u8()? as i32;
+            cur += if f & same_flag != 0 { d } else { -d };
         } else if f & same_flag == 0 {
             cur += r.i16()? as i32;
         }
@@ -651,7 +803,7 @@ fn read_coords(r: &mut Reader, n: usize, flags: &[u8], x_axis: bool) -> Result<V
 
 impl<'a> Face<'a> {
     fn outline_composite(&self, r: &mut Reader, depth: u32) -> Result<Vec<Contour>, TtfError> {
-        r.take(8).map_err(|_| TtfError::BadGlyph(0))?; // component bbox
+        r.take(8).map_err(|_| TtfError::Glyph(0))?; // component bbox
         let mut contours: Vec<Contour> = Vec::new();
         loop {
             let flags = r.u16()?;
@@ -697,27 +849,36 @@ impl<'a> Face<'a> {
 
     /// Rasterized glyph at `size` px (cached); `None` for blank glyphs.
     pub fn glyph(&self, ch: char, size: f32) -> Option<Rc<Glyph>> {
-        let key = (ch, (size * 16.0).round() as u32);
+        self.glyph_by_id(self.glyph_id(ch as u32), size)
+    }
+
+    /// Rasterized glyph addressed by id rather than codepoint (cached).
+    ///
+    /// The fallback chain resolves a codepoint to a face once and then wants to
+    /// address the glyph directly, and colour bitmaps are keyed by id too.
+    pub fn glyph_by_id(&self, gid: u16, size: f32) -> Option<Rc<Glyph>> {
+        let key = (gid, (size * 16.0).round() as u32);
         if let Some(g) = self.cache.borrow().get(&key) {
             return g.clone();
         }
-        let gid = self.glyph_id(ch as u32);
-        let contours = match self.outline(gid, 0) {
-            Ok(c) if !c.is_empty() => c,
-            _ => {
-                self.cache.borrow_mut().insert(key, None);
-                return None;
-            }
-        };
-        let scale = size / self.upem;
-        let edges = edges_of(&contours, scale);
-        if edges.is_empty() {
-            self.cache.borrow_mut().insert(key, None);
-            return None;
-        }
-        let g = Rc::new(Self::rasterize(&edges));
-        self.cache.borrow_mut().insert(key, Some(g.clone()));
-        Some(g)
+        // A COLR base glyph is drawn from its paint graph. The `glyf` outline
+        // it also carries is a stand-in for renderers that cannot read COLR —
+        // for emoji faces it is a crude approximation, so colour wins.
+        let g = self
+            .colr
+            .as_ref()
+            .and_then(|c| c.render(self, gid, size))
+            .map(Rc::new)
+            .or_else(|| {
+                let contours = match self.outline(gid, 0) {
+                    Ok(c) if !c.is_empty() => c,
+                    _ => return None,
+                };
+                let edges = edges_of(&contours, size / self.upem);
+                (!edges.is_empty()).then(|| Rc::new(Self::rasterize(&edges)))
+            });
+        self.cache.borrow_mut().insert(key, g.clone());
+        g
     }
 
     /// Scanline rasterizer: per pixel row, 4 vertical supersamples; each
@@ -784,6 +945,8 @@ impl<'a> Face<'a> {
             left: dx0,
             top: dy_top,
             coverage,
+            color: None,
+            fg: None,
         }
     }
 
@@ -894,6 +1057,236 @@ mod tests {
         }
     }
 
+    /// Wrap the committed Liberation bytes in a synthetic one-face `.ttc`, so
+    /// the collection path is exercised without depending on system fonts.
+    ///
+    /// A collection's table offsets stay absolute to the *file* start (that is
+    /// how members share tables), so the embedded copy's directory must be
+    /// rebased by the header size — the exact invariant `parse_at` relies on.
+    fn synthetic_ttc(name: &str) -> Vec<u8> {
+        const HDR: usize = 16; // 'ttcf' + version + numFonts + one offset
+        let mut src = std::fs::read(format!("assets/fonts/{name}.ttf")).unwrap();
+        let n = u16::from_be_bytes([src[4], src[5]]) as usize;
+        for i in 0..n {
+            let e = 12 + i * 16 + 8; // table entry's offset field
+            let off = u32::from_be_bytes(src[e..e + 4].try_into().unwrap());
+            src[e..e + 4].copy_from_slice(&(off + HDR as u32).to_be_bytes());
+        }
+        let mut out = Vec::with_capacity(HDR + src.len());
+        out.extend_from_slice(b"ttcf");
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&(HDR as u32).to_be_bytes());
+        out.extend_from_slice(&src);
+        out
+    }
+
+    #[test]
+    fn plain_files_report_one_face_at_offset_zero() {
+        let data = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
+        assert_eq!(faces(&data).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn collection_headers_resolve_to_their_member_directories() {
+        let ttc = synthetic_ttc("LiberationSans-Regular");
+        let dirs = faces(&ttc).unwrap();
+        assert_eq!(dirs, vec![16]);
+        let leaked: &'static [u8] = Box::leak(ttc.into_boxed_slice());
+        // Offset 0 holds the 'ttcf' header, not a face.
+        assert!(matches!(
+            Face::parse_at(leaked, 0),
+            Err(TtfError::NotTrueType)
+        ));
+        let f = Face::parse_at(leaked, dirs[0]).unwrap();
+        assert_eq!(f.upem, 2048.0);
+        assert!(f.num_glyphs > 1000);
+    }
+
+    /// Guards the rebasing: un-rebased offsets would leave `loca`/`glyf`
+    /// pointing at the wrong bytes, so the outline would come out empty.
+    #[test]
+    fn a_collection_member_renders_the_same_glyphs_as_the_plain_file() {
+        let plain = load("LiberationSans-Regular");
+        let ttc = synthetic_ttc("LiberationSans-Regular");
+        let leaked: &'static [u8] = Box::leak(ttc.into_boxed_slice());
+        let member = Face::parse_at(leaked, 16).unwrap();
+        let gid = plain.glyph_id('H' as u32);
+        assert_ne!(gid, 0);
+        assert_eq!(member.glyph_id('H' as u32), gid);
+        assert_eq!(member.advance_px(gid, 32.0), plain.advance_px(gid, 32.0));
+        let a = plain.glyph('H', 32.0).expect("plain H");
+        let b = member.glyph('H', 32.0).expect("collection H");
+        assert_eq!(
+            (a.width, a.height, a.left, a.top),
+            (b.width, b.height, b.left, b.top)
+        );
+        assert_eq!(a.coverage, b.coverage, "outline differs across containers");
+    }
+
+    /// Minimal format-4 subtable: one indirect (idRangeOffset) segment over
+    /// U+0041..U+0043 plus the terminator segment.
+    fn indirect_cmap(slots: [u16; 3], delta: i16) -> Vec<u8> {
+        fn push16(b: &mut Vec<u8>, v: u16) {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut b = Vec::new();
+        push16(&mut b, 4); // format
+        push16(&mut b, 0); // length (unvalidated on this path)
+        push16(&mut b, 0); // language
+        push16(&mut b, 4); // segCountX2 -> 2 segments
+        push16(&mut b, 4); // searchRange
+        push16(&mut b, 1); // entrySelector
+        push16(&mut b, 0); // rangeShift
+        push16(&mut b, 0x0043); // endCode[0]
+        push16(&mut b, 0xFFFF); // endCode[1]
+        push16(&mut b, 0); // reservedPad
+        push16(&mut b, 0x0041); // startCode[0]
+        push16(&mut b, 0xFFFF); // startCode[1]
+        b.extend_from_slice(&delta.to_be_bytes()); // idDelta[0]
+        b.extend_from_slice(&1i16.to_be_bytes()); // idDelta[1]
+                                                  // idRangeOffset[0] = 4: the slot array begins 4 bytes past its own
+                                                  // address (byte 28 -> byte 32). Terminator stays direct.
+        push16(&mut b, 4);
+        push16(&mut b, 0);
+        for s in slots {
+            push16(&mut b, s);
+        }
+        b
+    }
+
+    /// Regression: the idRangeOffset slot array was read little-endian, so
+    /// every indirect format-4 mapping came back byte-swapped (0x0681 read as
+    /// 0x8106). System fonts lean on indirect segments heavily — Nirmala and
+    /// Microsoft YaHei both did — while Liberation does not use them at all,
+    /// which is why this survived until `.ttc` support exercised them.
+    #[test]
+    fn indirect_cmap_slots_are_read_big_endian() {
+        let data = indirect_cmap([0x1234, 0x0000, 0x0005], 0);
+        let segs = parse_cmap4(&data, 0).unwrap();
+        let cmap = Cmap {
+            runs: vec![segs],
+            data: &data,
+        };
+        assert_eq!(cmap.gid(0x41), 0x1234, "slot read with swapped bytes");
+        assert_eq!(cmap.gid(0x43), 0x0005);
+    }
+
+    /// Regression: a zero slot means "no glyph", and per spec idDelta still
+    /// applies to non-zero slots.
+    #[test]
+    fn indirect_cmap_applies_id_delta_and_treats_zero_as_missing() {
+        let data = indirect_cmap([0x1234, 0x0000, 0x0005], 2);
+        let segs = parse_cmap4(&data, 0).unwrap();
+        let cmap = Cmap {
+            runs: vec![segs],
+            data: &data,
+        };
+        assert_eq!(cmap.gid(0x41), 0x1236, "idDelta not added to slot value");
+        assert_eq!(cmap.gid(0x42), 0, "a zero slot must stay .notdef");
+        assert_eq!(cmap.gid(0x43), 0x0007);
+        // Below the segment start there is no mapping at all.
+        assert_eq!(cmap.gid(0x40), 0);
+    }
+
+    /// A synthetic sfnt carrying one `cmap` with *both* a format-4 subtable
+    /// (BMP only) and a format-12 one (astral) — the shape every real emoji
+    /// font has.
+    ///
+    /// Format 4 maps U+0041 -> gid 5; format 12 maps U+1F600 -> gid 7 and
+    /// nothing else, so each subtable covers exactly what the other does not.
+    fn cmap_with_both_formats() -> Vec<u8> {
+        fn p16(b: &mut Vec<u8>, v: u16) {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        fn p32(b: &mut Vec<u8>, v: u32) {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        const CMAP_OFF: u32 = 28; // sfnt header (12) + one directory entry (16)
+
+        let mut cmap = Vec::new();
+        p16(&mut cmap, 0); // version
+        p16(&mut cmap, 2); // numTables
+        p16(&mut cmap, 3);
+        p16(&mut cmap, 1);
+        p32(&mut cmap, 20); // record 0 -> format 4
+        p16(&mut cmap, 3);
+        p16(&mut cmap, 10);
+        p32(&mut cmap, 52); // record 1 -> format 12
+                            // -- format 4 (BMP): U+0041 -> gid 5, plus the terminator segment.
+        p16(&mut cmap, 4);
+        p16(&mut cmap, 32);
+        p16(&mut cmap, 0);
+        p16(&mut cmap, 4);
+        p16(&mut cmap, 4);
+        p16(&mut cmap, 1);
+        p16(&mut cmap, 0);
+        p16(&mut cmap, 0x0041);
+        p16(&mut cmap, 0xFFFF); // endCode
+        p16(&mut cmap, 0); // reservedPad
+        p16(&mut cmap, 0x0041);
+        p16(&mut cmap, 0xFFFF); // startCode
+        cmap.extend_from_slice(&(-60i16).to_be_bytes()); // idDelta: 0x41 -> 5
+        cmap.extend_from_slice(&1i16.to_be_bytes());
+        p16(&mut cmap, 0);
+        p16(&mut cmap, 0); // idRangeOffset
+        assert_eq!(cmap.len(), 52, "format 4 must land at the planned offset");
+        // -- format 12 (astral): U+1F600 -> gid 7.
+        p16(&mut cmap, 12);
+        p16(&mut cmap, 0);
+        p32(&mut cmap, 28); // length: header 16 + one 12-byte group
+        p32(&mut cmap, 0); // language
+        p32(&mut cmap, 1); // nGroups
+        p32(&mut cmap, 0x1F600);
+        p32(&mut cmap, 0x1F600);
+        p32(&mut cmap, 7);
+
+        let mut f = Vec::new();
+        p32(&mut f, 0x0001_0000); // sfnt version
+        p16(&mut f, 1); // numTables
+        p16(&mut f, 0);
+        p16(&mut f, 0);
+        p16(&mut f, 0); // searchRange, entrySelector, rangeShift
+        f.extend_from_slice(b"cmap");
+        p32(&mut f, 0); // checksum (never validated)
+        p32(&mut f, CMAP_OFF);
+        p32(&mut f, cmap.len() as u32);
+        assert_eq!(f.len(), CMAP_OFF as usize);
+        f.extend_from_slice(&cmap);
+        f
+    }
+
+    /// Regression: the subtable chooser kept the *lowest*-ranked subtable, so
+    /// a font's BMP-only format-4 table always beat its format-12 one — and
+    /// astral emoji, which only format 12 reaches, came back as `.notdef`.
+    /// Every real emoji font ships both, which is why the whole emoji block
+    /// rendered as tofu even though the glyphs were right there.
+    #[test]
+    fn format_12_is_preferred_so_astral_codepoints_resolve() {
+        let data = cmap_with_both_formats();
+        let cmap = parse_cmap(&data, 0).unwrap();
+        assert_eq!(cmap.gid(0x1F600), 7, "astral codepoint must use format 12");
+        // The format-4 run is still consulted where format 12 has no answer,
+        // so a partial format-12 subtable cannot cost the font its BMP.
+        assert_eq!(cmap.gid(0x0041), 5, "BMP fallback run not consulted");
+        assert_eq!(cmap.gid(0x1F601), 0, "unmapped astral codepoint");
+        assert_eq!(cmap.gid(0x0042), 0, "unmapped BMP codepoint");
+    }
+
+    #[test]
+    fn a_hostile_collection_header_is_rejected() {
+        let mut d = b"ttcf".to_vec();
+        d.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        d.extend_from_slice(&9999u32.to_be_bytes()); // absurd face count
+        assert!(matches!(faces(&d), Err(TtfError::Table(_))));
+        let mut zero = b"ttcf".to_vec();
+        zero.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        zero.extend_from_slice(&0u32.to_be_bytes());
+        assert!(matches!(faces(&zero), Err(TtfError::Table(_))));
+        // Truncated input stays an error rather than a panic.
+        assert!(faces(&zero[..6]).is_err());
+    }
+
     #[test]
     fn cmap_maps_the_glyph_set() {
         let f = load("LiberationSans-Regular");
@@ -984,7 +1377,38 @@ mod tests {
             "descent={}",
             m.descent
         );
-        assert!((f.units_per_em() - 2048.0).abs() < 1.0);
+        assert!((f.upem - 2048.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn short_negative_delta_negates_the_magnitude() {
+        // Regression: a short-vector byte is an *unsigned magnitude* and the
+        // flag bit carries the sign. Reading it as a signed i8 (byte - 0x100)
+        // corrupts every negative short delta. Three points: +100, -30, +7.
+        let bytes = [100u8, 30u8, 7u8];
+        let mut r = Reader::new(&bytes);
+        let flags = [0x02 | 0x10, 0x02, 0x02 | 0x10];
+        let xs = read_coords(&mut r, 3, &flags, true).unwrap();
+        assert_eq!(xs, vec![100.0, 70.0, 77.0]);
+    }
+
+    #[test]
+    fn outline_decodes_negative_short_deltas() {
+        // Regression (the "garbage font" bug): 'H' uses a negative short delta
+        // at point 4 (dx = -191 stored as byte 0xBF). Decoding it as signed i8
+        // gives -65 and shifts every later point by +126, so the whole UI
+        // rendered as smeared garbage. Pin the exact outline.
+        let f = load("LiberationSans-Regular");
+        let c = f.outline(f.glyph_id(b'H' as u32), 0).unwrap();
+        assert_eq!(c.len(), 1);
+        let xs: Vec<f32> = c[0].pts.iter().map(|p| p.0).collect();
+        assert_eq!(
+            xs,
+            vec![
+                1121.0, 1121.0, 359.0, 359.0, 168.0, 168.0, 359.0, 359.0, 1121.0, 1121.0, 1312.0,
+                1312.0, 1121.0
+            ]
+        );
     }
 
     #[test]
@@ -1029,23 +1453,24 @@ mod tests {
     #[test]
     fn zz_probe_step_by_step() {
         let data = std::fs::read("assets/fonts/LiberationSans-Regular.ttf").unwrap();
-        let (off, len) = table(&data, b"cmap");
+        let (off, len) = table(&data, 0, b"cmap");
         println!("table cmap -> ({off}, {len})");
-        match parse_cmap(&data) {
+        match parse_cmap(&data, 0) {
             Ok(c) => {
-                println!("cmap OK, {} segs; 'A' -> gid {}", c.segs.len(), c.gid(65));
+                let segs: usize = c.runs.iter().map(|r| r.len()).sum();
+                println!("cmap OK, {segs} segs; 'A' -> gid {}", c.gid(65));
             }
             Err(e) => println!("cmap ERR {e:?}"),
         }
-        match parse_head(&data) {
+        match parse_head(&data, 0) {
             Ok((upem, short)) => println!("head OK upem={upem} short_loca={short}"),
             Err(e) => println!("head ERR {e:?}"),
         }
-        match parse_maxp(&data) {
+        match parse_maxp(&data, 0) {
             Ok(n) => println!("maxp OK glyphs={n}"),
             Err(e) => println!("maxp ERR {e:?}"),
         }
-        match parse_hhea(&data) {
+        match parse_hhea(&data, 0) {
             Ok(v) => println!("hhea OK {v:?}"),
             Err(e) => println!("hhea ERR {e:?}"),
         }
@@ -1055,9 +1480,9 @@ mod tests {
     fn rejects_garbage() {
         assert!(matches!(
             Face::parse(b"nope short thing"),
-            Err(TtfError::BadMagic)
+            Err(TtfError::NotTrueType)
         ));
-        // Empty cache key must be cheap: char + 1/16-px size = 8 bytes.
+        // Empty cache key must be cheap: gid + 1/16-px size = 8 bytes.
         assert_eq!(std::mem::size_of::<CacheKey>(), 8);
     }
 
@@ -1132,16 +1557,76 @@ mod tests {
         let mut bad = full.to_vec();
         bad[334] = 0;
         bad[335] = 0;
-        assert!(matches!(Face::parse(leak(bad)), Err(TtfError::BadTable(_))));
+        assert!(matches!(Face::parse(leak(bad)), Err(TtfError::Table(_))));
     }
 
     #[test]
     fn hostile_glyph_returns_empty_or_error_never_panic() {
         let f = load("LiberationSans-Regular");
         // Out-of-range gids: loca/outline paths must not read wild memory.
-        assert!(matches!(f.outline(u16::MAX, 0), Err(TtfError::BadGlyph(_))));
-        assert!(matches!(f.outline(50_000, 0), Err(TtfError::BadGlyph(_))));
+        assert!(matches!(f.outline(u16::MAX, 0), Err(TtfError::Glyph(_))));
+        assert!(matches!(f.outline(50_000, 0), Err(TtfError::Glyph(_))));
         // Deep composite recursion self-terminates at MAX_COMPONENT_DEPTH.
         let _ = f.outline(f.glyph_id(b'A' as u32), MAX_COMPONENT_DEPTH + 1);
+    }
+
+    /// Real system collections, where the platform has them.
+    ///
+    /// Synthetic fixtures cannot catch "this font uses a cmap feature we
+    /// mishandle", which is exactly how the `idRangeOffset` byte-order bug hid
+    /// for so long: it only shows up on fonts that use indirect segments.
+    /// So when a system collection is present, parse every face and assert the
+    /// invariant that actually broke — a mapped glyph id must be in range.
+    ///
+    /// Absent fonts are skipped rather than failed, so a bare CI box stays
+    /// green and this still runs on a developer machine.
+    #[test]
+    fn system_fonts_map_glyphs_in_range() {
+        let candidates: &[(&str, char)] = if cfg!(target_os = "windows") {
+            &[
+                ("C:/Windows/Fonts/cambria.ttc", 'A'),
+                ("C:/Windows/Fonts/msyh.ttc", '\u{4E2D}'),
+                ("C:/Windows/Fonts/Nirmala.ttc", '\u{0C05}'),
+                ("C:/Windows/Fonts/YuGothM.ttc", '\u{3042}'),
+            ]
+        } else if cfg!(target_os = "macos") {
+            &[
+                ("/System/Library/Fonts/Apple Symbols.ttf", '\u{2603}'),
+                ("/System/Library/Fonts/PingFang.ttc", '\u{4E2D}'),
+            ]
+        } else {
+            &[
+                (
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    '\u{2192}',
+                ),
+                (
+                    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                    '\u{4E2D}',
+                ),
+            ]
+        };
+        for (path, probe) in candidates {
+            let Ok(raw) = std::fs::read(path) else {
+                continue;
+            };
+            let data: &'static [u8] = Box::leak(raw.into_boxed_slice());
+            let Ok(dirs) = faces(data) else {
+                continue;
+            };
+            for &dir in &dirs {
+                // A CFF-flavoured member is out of scope, not a failure.
+                let Ok(f) = Face::parse_at(data, dir) else {
+                    continue;
+                };
+                let gid = f.glyph_id(*probe as u32);
+                assert!(
+                    gid < f.num_glyphs,
+                    "{path} face@{dir}: U+{:04X} -> gid {gid} but the face has only {} glyphs",
+                    *probe as u32,
+                    f.num_glyphs
+                );
+            }
+        }
     }
 }

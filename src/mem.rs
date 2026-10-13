@@ -64,19 +64,15 @@ struct TagSlot {
 
 static mut TAGS: [TagSlot; TAG_SLOTS] = unsafe { std::mem::zeroed() };
 
-// Variants land as components get instrumented; they are the stable wire
-// names for the census, listed up front so adding a tag needs no re-plumbing.
+// Variants land as components get instrumented; the discriminants are the
+// stable wire names for the census, so new tags go on the end.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Component {
     None = 0,
     Buffer,
     DisplayList,
     Canvas,
     GlyphCache,
-    Editor,
-    Fonts,
-    Other,
 }
 
 const NAMES: [&str; MAX_COMPONENTS] = [
@@ -85,9 +81,9 @@ const NAMES: [&str; MAX_COMPONENTS] = [
     "display-list",
     "canvas",
     "glyph-cache",
-    "editor",
-    "fonts",
-    "other",
+    "",
+    "",
+    "",
     "",
     "",
     "",

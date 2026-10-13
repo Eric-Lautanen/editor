@@ -1,12 +1,66 @@
 Readitor plain text sample
 ==========================
 
-This is a long paragraph to exercise word wrapping: the quick brown fox jumps over the lazy dog, then keeps running through the fields until the line is wider than the column, at which point it must wrap cleanly without cutting words in half.
+This is a long paragraph to exercise word wrapping: the quick brown fox jumps over the lazy dog, then keeps running through the fields until the line is wider than the column, at which point it must wrap cleanly without cutting words in half. It keeps going for a while, because a text file that fits on one screen never shows you the scrollbar.
+
+The word wraps below are ordinary prose with a few very long tokens to make sure a word that cannot fit is not chopped: antidisestablishmentarianism, pneumonoultramicroscopicsilicovolcanoconiosis, and a URL like https://example.com/a/very/long/path/that/does/not/break/anywhere/at/all/within/the/column.
 
 2026-10-11 09:14:02 INFO  server started on port 8080
 2026-10-11 09:14:03 WARN  config key "cache_ttl" missing, using default
 2026-10-11 09:14:09 ERROR request failed: connection reset by peer (code=104)
+2026-10-11 09:14:09 INFO  retrying in 250 ms
+2026-10-11 09:14:09 INFO  retry 1 of 5 succeeded after 12 ms
+2026-10-11 09:15:00 INFO  loaded 412 records from store
+2026-10-11 09:15:01 DEBUG index rebuilt in 88 ms
+2026-10-11 09:15:44 INFO  client connected peer=203.0.113.7:51234
+2026-10-11 09:15:44 DEBUG handshake ok cipher=TLS_AES_128_GCM_SHA256
+2026-10-11 09:16:02 INFO  GET /files 200 4.1 kB
+2026-10-11 09:16:02 INFO  GET /files/sample.md 200 6.7 kB
+2026-10-11 09:16:11 WARN  slow query 812 ms: SELECT * FROM documents
+2026-10-11 09:16:30 INFO  saved session: 3 tabs, mode=split
+2026-10-11 09:17:00 INFO  autosave flushed 2 dirty buffers
+2026-10-11 09:17:41 DEBUG cache hit ratio 0.94 over 1024 lookups
+2026-10-11 09:18:00 INFO  reloaded theme from OS (dark)
+2026-10-11 09:18:15 INFO  search for "scroll" matched 37 lines
+2026-10-11 09:19:02 INFO  client disconnected peer=203.0.113.7:51234
+2026-10-11 09:20:00 INFO  heartbeat ok
+2026-10-11 09:21:13 INFO  opened samples/sample.json as a JSON tree
+2026-10-11 09:22:07 INFO  opened samples/sample.jsonl, 1 error banner shown
+2026-10-11 09:23:31 INFO  opened samples/sample.md in preview mode
+2026-10-11 09:24:02 INFO  switched to edit mode (Ctrl+E)
+2026-10-11 09:24:15 DEBUG horizontal scroll needed: longest line 412 px past the column
+2026-10-11 09:25:00 INFO  switched to split mode (Ctrl+E again)
+2026-10-11 09:26:44 INFO  zoom 125% (Ctrl+plus)
+2026-10-11 09:27:02 INFO  zoom reset to 100% (Ctrl+0)
+2026-10-11 09:28:19 WARN  unsaved changes in "scratch.txt"
+2026-10-11 09:29:00 INFO  save-as completed in 3 ms
+2026-10-11 09:30:41 INFO  copied 1 line to the clipboard
+2026-10-11 09:31:12 INFO  pasted 1 line from the clipboard
+2026-10-11 09:32:00 INFO  window resized to 1280x800
+2026-10-11 09:33:22 INFO  window maximized
+2026-10-11 09:34:05 INFO  window restored
+2026-10-11 09:35:00 INFO  dragging the overlay scrollbar thumb
+2026-10-11 09:36:37 INFO  clicked the scrollbar track (page down)
+2026-10-11 09:37:58 INFO  wheel scrolled 3 lines
+2026-10-11 09:39:00 INFO  selected 12 lines with shift+down
+2026-10-11 09:40:11 INFO  indent 4 spaces
+2026-10-11 09:41:23 INFO  undo (Ctrl+Z)
+2026-10-11 09:42:34 INFO  redo (Ctrl+Y)
+2026-10-11 09:43:45 INFO  inserted tab character as four spaces
+2026-10-11 09:44:56 INFO  caret moved to line 1, column 1 (Ctrl+Home)
+2026-10-11 09:46:07 INFO  caret moved to the end of the buffer (Ctrl+End)
+2026-10-11 09:47:18 INFO  follow-caret panned the pane right
+2026-10-11 09:48:29 INFO  follow-caret panned the pane back
+2026-10-11 09:49:40 INFO  closing tab (Ctrl+W)
+2026-10-11 09:50:51 INFO  last tab closed, window quits
+2026-10-11 09:52:02 INFO  goodbye
+
+One deliberately long line, to give the no-wrap editor something wide to scroll through:
+
+0123456789 abcdefghij klmnopqrst uvwxyz 0123456789 abcdefghij klmnopqrst uvwxyz 0123456789 abcdefghij klmnopqrst uvwxyz 0123456789 abcdefghij klmnopqrst uvwxyz 0123456789 abcdefghij klmnopqrst uvwxyz 0123456789 abcdefghij klmnopqrst uvwxyz the end
 
 	tabs expand to four spaces
+     spaces are kept as typed
 Unicode: café – “quotes” • bullets … → arrows ≤ ≥ © ® ™ € £ ½ ñ Ü
-Unknown glyph fallback: 中文
+Unknown glyph fallback: 中文 日本語 한국어
+Emoji fallback: ✔ ✖ ⚠ ● ○ ■ □ ▲ ▼

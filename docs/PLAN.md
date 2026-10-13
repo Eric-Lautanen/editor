@@ -1,229 +1,10 @@
-# Readitor — Plan
-
-> **Readitor** = Read + Editor.
-
-A small, native, installable document reader/editor for text-style files:
-**Markdown, JSON, JSONL/NDJSON, plain text/logs.** Beautiful preview first,
-light editing second. Not a code editor.
-
-## Hard constraints
-
-| Constraint | Consequence |
-|---|---|
-| Rust **std only**, zero crates | No GUI toolkit, no font lib, no parser libs. We write them. |
-| Native app, **not** browser/webview | Own window + own renderer. |
-| Windows / macOS / Linux | One portable core + three thin platform backends. |
-| Installable with file associations | Per-OS packaging + registration. |
-
-**What "std only" means here:** no crates.io dependencies. We *do* declare
-`extern "C"` bindings to the OS's own system libraries (user32/gdi32, AppKit via
-the Objective-C runtime, libX11). That is the only way any program opens a window;
-it is FFI, not a dependency.
-
-## Architecture
-
-```
-          ┌────────────────────────── portable (pure std, unit-testable) ──────────────────────────┐
- file ──► │ core::Buffer ─► parse::{markdown,json,jsonl} ─► layout (blocks, wrap, theme) ─► DisplayList │
-          └───────────────────────────────────────────────────┬─────────────────────────────────────┘
-                                                              ▼
-                                  gfx::Canvas (software RGBA framebuffer) ◄── gfx::font (bitmap → TTF)
-                                                              ▼
-                      platform::Window  (events in, framebuffer blit out)
-                      ├─ windows.rs  Win32: CreateWindowExW, WndProc, StretchDIBits
-                      ├─ macos.rs    AppKit via objc_msgSend, NSView draw → CGImage
-                      └─ linux.rs    Xlib: XCreateWindow, XPutImage (works on Wayland via XWayland)
-```
-
-Design rule: **everything above `platform/` never touches the OS.** The platform layer
-only provides: create window, deliver `Event`s, present a pixel buffer, clipboard,
-open/save dialogs, set title, set cursor shape, window drag/resize hit-testing,
-drag-and-drop. Everything else is portable and testable headlessly
-(render to a buffer, compare to expected output).
-
-**Feature-parity rule (Oct 2026):** every user-facing feature — custom title bar,
-tabs, cursors, file dialogs, drag-drop, help — must work on all three OSes.
-Windows lands first (M6); the Linux (M8) and macOS (M9) backends must implement the
-same `Host`/`Handler` surface before their milestone closes.
-
-### Rendering model
-Layout produces a `DisplayList` (rects, rounded rects, text runs, lines). The canvas
-rasterizes it to RGBA. Redraw only on events (no busy loop). Dirty-rect optimization later.
-
-### Fonts (the hard part, staged)
-1. **Phase 1 ✅:** embedded **pre-rasterized anti-aliased atlas** (Liberation Sans ×4 styles + Liberation Mono, SIL OFL,
-   Latin-1 + common punctuation/arrows, 36px source). Generated once by `tools/gen_font.py` into
-   `assets/readitor-fonts.bin` (~550 KB) and pulled in with `include_bytes!`: zero runtime deps. Glyphs are
-   area-averaged down to the requested size and cached. Fallback glyph for anything missing.
-2. **Phase 2:** own TrueType parser (`glyf`, `cmap`, `hmtx`, `loca`, `head`) + scanline
-   anti-aliased rasterizer, loading system fonts (Segoe UI / SF / DejaVu or Liberation) at runtime.
-3. **Phase 3:** kerning, bold/italic via font variants, glyph cache, basic fallback.
-
-## Scope
-
-### File types
-| Type | Preview | Notes |
-|---|---|---|
-| `.md` `.markdown` | Rendered document | CommonMark subset (below) |
-| `.json` | Collapsible tree + pretty-printed view, syntax tinted | Error location on invalid JSON |
-| `.jsonl` `.ndjson` | Record list, each record collapsible/pretty | Per-line error markers, streams large files |
-| `.txt` `.log` | Clean wrapped text | Light level/timestamp tinting for `.log` (later) |
-
-### Markdown subset (v1)
-Headings, paragraphs, emphasis/strong/inline code, links, blockquotes, ordered/unordered/nested
-lists, task lists, fenced code blocks, horizontal rules, tables (GFM), images (placeholder → later PNG decoder).
-v2: footnotes, own PNG (inflate) decoder, HTML ignored.
-
-### UI (deliberately small)
-- Modes: **Preview** (default) · **Edit** · **Split**. `Ctrl/Cmd+E` toggles; the status bar always names the current mode.
-- Tabs live in a **custom-drawn title bar** (all three OSes): small tabs share the
-  strip with window buttons we draw ourselves (minimize / maximize / close); moving,
-### UI (deliberately small)
-- **Custom title bar**, drawn by us on all three OSes: Readitor name, a small tab per
-  open file, and window buttons (minimize / maximize / close). Drag the bar to move
-  the window, drag its edges to resize (thin platform hit-test hooks; all paint code
-  is portable). *(Scope change, Oct 2026: tabs moved here from Non-goals and live in
-  the title bar.)*
-- Tabs: click to switch, `×` or `Ctrl+W` closes (dirty tabs warn once before
-  discarding), `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle. `Ctrl+O` and drag-drop open new
-  tabs; re-opening a path focuses its existing tab.
-- Modes: **Preview** (default) · **Edit** · **Split**. `Ctrl/Cmd+E` toggles; the status
-  bar always names the current mode.
-- Help: `F1` toggles an in-app legend — modes, every shortcut, supported file types,
-  how to select text and copy. Right-click opens a small context menu
-  (copy/cut/paste/select all, copy-all in Preview, open/save/close/help) so the
-  permanent chrome stays minimal.
-- Cursors: I-beam over editable text, pointing hand over links, tree toggles, tabs
-  and window buttons, arrow elsewhere.
-- Plain text editor: caret, selection, copy/paste, undo/redo, find. No syntax highlighting, no indent magic.
-- Light/dark theme following OS; adjustable zoom (`Ctrl +/-`).
-- Open file / recent / drag-and-drop / reload-on-external-change.
-- One window, one tab per file, opened via association, CLI, `Ctrl+O` or drag-drop: `readitor path/to/file.md`.
-
-### Non-goals
-Plugins, LSP, syntax highlighting for code, git, themes marketplace, collaboration.
-
-## Repo layout
-```
-readitor/
-├─ Cargo.toml                no [dependencies], ever
-├─ docs/PLAN.md
-├─ src/
-│  ├─ main.rs                entry, CLI dispatch
-│  ├─ cli.rs                 args: <file>, --install, --uninstall, --version, --pretty, --render
-│  ├─ app.rs                 App state, event handling, mode switching
-│  ├─ error.rs
-│  ├─ core/    buffer.rs  undo.rs  file_kind.rs
-│  ├─ parse/   markdown/{ast,block,inline}.rs  json/{value,lexer,parser,pretty}.rs  jsonl.rs
-│  ├─ layout/  theme.rs  display_list.rs  text.rs  markdown.rs  json_tree.rs
-│  ├─ gfx/     color.rs  geom.rs  canvas.rs  font/{mod,atlas,ttf}.rs
-│  ├─ ui/      event.rs  scroll.rs  editor_view.rs  preview_view.rs  statusbar.rs
-│  └─ platform/ mod.rs  windows.rs  macos.rs  linux.rs  install.rs
-├─ assets/     readitor-fonts.bin  FONT-LICENSE.txt   (generated atlas + OFL notice)
-├─ tools/      gen_font.py                            (dev-only; needs Pillow + fontTools)
-├─ packaging/
-│  ├─ windows/  build_installer notes (registry keys written by `readitor --install`)
-│  ├─ macos/    Info.plist (CFBundleDocumentTypes), bundle.sh
-│  └─ linux/    readitor.desktop, readitor-mime.xml, install.sh
-└─ samples/    sample.md sample.json sample.jsonl
-```
-
-## File associations & install
-- **Windows:** `readitor --install` writes `HKCU\Software\Classes` (ProgID `Readitor.Document`, extensions,
-  `shell\open\command`, icon) via advapi32 FFI, then `SHChangeNotify`. No admin needed. `--uninstall` reverses it.
-  Windows 10/11 may still require the user to confirm default app in Settings; we register as an option.
-- **macOS:** `.app` bundle with `Info.plist` `CFBundleDocumentTypes` + UTIs; `bundle.sh` assembles it.
-  File-open arrives via `application:openFile:` delegate, not argv.
-- **Linux:** `.desktop` entry + shared-mime-info XML, `update-desktop-database`, `xdg-mime default`.
-
-## Milestones
-1. **M0 – Skeleton** ✅ tree compiles, stubs, samples, packaging files.
-2. **M1 – Windows window:** ✅ Win32 window, resize, blit, key/mouse/wheel events, per-monitor DPI.
-   First real run on Windows 11 (Oct 2026): `cargo run -- samples\sample.json` opens and idles
-   in the message loop with no crash. Manual checks (crisp paint, wheel/keys, multi-monitor
-   DPI, clean exit) still want a human pass — see acceptance checklist below.
-3. **M2 – Text on screen:** ✅ font atlas, canvas primitives (clip, alpha, rounded rects, text), wrapped plain-text preview, scrollbar, status bar, zoom, light/dark, headless `--render`.
-4. **M3 – JSON/JSONL:** ✅ strict lexer (positions, `\u`/surrogates, BOM) + depth-limited parser +
-   2-space pretty-printer (`--pretty`) + collapsible tinted tree layout with error banners.
-5. **M4 – Markdown:** ✅ block parser (ATX/setext heads, fences, quotes, nested/task lists, rules, GFM
-   tables) + inline parser (emphasis, code, links, strike, breaks) + full document layout.
-6. **M5 – Editing:** ✅ caret/selection movement, typing, clipboard, undo/redo, save, split view live re-render.
-7. **M6 – Windows polish + multi-file:** ✅ custom title bar with file tabs, cursors (I-beam/hand),
-   `Ctrl+O` open dialog, drag-drop anywhere on the window, `F1` help legend, right-click context
-   menu, `--install`, zoom. Still open: window icon, OS-theme auto-follow, GUI subsystem.
-   Linux/macOS parity for all of it lands with M8/M9.
-8. **M7 – TTF fonts:** parser + AA rasterizer; swap in for bitmap.
-9. **M8 – Linux (X11)** then **M9 – macOS (AppKit FFI)** backends + packaging.
-10. **M10 – Large-file handling, find, recent files, reload-on-change.**
-
-## Risks & mitigations
-- **Font rendering from scratch** → staged; bitmap first so everything else isn't blocked.
-- **macOS FFI via objc_msgSend is fiddly** (variadic ABI, struct returns) → keep it last; isolate in `macos.rs`.
-- **Wayland-only Linux** → XWayland initially; native Wayland deferred (needs protocol marshalling by hand).
-- **Can't test all three OSes locally** → portable core has headless tests; CI per-OS later.
-- **IME / complex scripts / RTL** → explicitly out of scope for v1.
-
-## Testing
-Unit tests for parsers and buffer; golden-image tests rendering `samples/*` to a buffer
-(hash compare) so layout regressions are caught without a window.
-
-## Progress log
-- **Scope change (Oct 2026, user):** file tabs promoted from non-goal to feature and
-  live in a custom-drawn title bar (all three OSes); custom cursors (I-beam/hand),
-  an `F1` help legend and a right-click context menu join M6. Feature parity across
-  OSes is now a rule — see the architecture section.
-- **M0** skeleton, 5 unit tests.
-- **M1** `platform/windows.rs` (hand-written FFI to user32/gdi32/kernel32). FFI uses Rust-style
-  names with `link_name` pointing at the real Win32 symbols, so `cargo clippy` stays clean with
-  **zero `allow` attributes in `src/`** (project rule: fix lints, don't silence them).
-  Type-checked from other OSes via `RUSTFLAGS="--cfg readitor_check_win" cargo check`
-  (declared in `[lints.rust] check-cfg` so the cfg never warns).
-
-### M1 acceptance checklist (run on Windows)
-- [x] `cargo run -- samples\sample.json` starts and idles without crashing (Oct 2026 smoke run)
-- [ ] Window titled `sample.md — Readitor`, crisp paint, resize without flicker
-- [ ] Mouse wheel, ↑/↓, PgUp/PgDn, Home/End scroll; DPI sane across monitors
-- [ ] `Ctrl+Q` / `Ctrl+W` / the close button exit cleanly
-- [ ] Known limitation: release build still shows a console window (fixed in M6 with the GUI subsystem + AttachConsole)
-
-- **M2** font atlas + `FontSystem`, `Canvas` (clip/alpha/AA rounded rect/text), `layout::text` wrapping, `PreviewView`
-  painting + scrollbar, status bar, zoom, theme toggle, `--render` headless snapshots.
-
-### Shortcuts
-`↑ ↓ PgUp PgDn Home End` / wheel scroll (arrows move the caret in Edit/Split) ·
-`Ctrl +` `Ctrl -` `Ctrl 0` zoom · `Ctrl T` light/dark ·
-`Ctrl E` Preview → Edit → Split · `Ctrl S` save ·
-`Ctrl O` open file (new tab) · `Ctrl Tab` / `Ctrl Shift Tab` cycle tabs ·
-`Ctrl W` close tab (twice if unsaved) · `Ctrl Q` quit ·
-`Ctrl C/X/V` copy/cut/paste · `Ctrl A` select all · `Ctrl Z/Y` undo/redo ·
-`F1` help overlay · right-click context menu · drag files onto the window to open them.
-
-### Dev: headless snapshots (no window needed, works on any OS)
-```
-readitor --render out.ppm --size 900x520 [--dark] [--scale 1.5] [--scroll 300] samples/sample.txt
-readitor --pretty samples/sample.json        # canonical 2-space JSON to stdout
-```
-
-- **M3** strict JSON front end + tree preview, 35 unit tests, `cargo fmt --check` / `cargo clippy
-  --all-targets` / `cargo build` all warning-free with zero `allow`s:
-  - `parse/json/lexer.rs`: tokens with 1-based positions; strict numbers (no leading zeros, kept as
-    source text); full string escapes incl. `\uXXXX` + surrogate pairs; BOM skipped; every failure is
-    `Error::Parse { line, col, msg }`.
-  - `parse/json/parser.rs`: recursive descent, any top-level value, key order + duplicates preserved,
-    trailing content rejected, nesting capped at 128 with a positioned error instead of a crash.
-  - `parse/json/pretty.rs`: canonical 2-space printer, `{}`/`[]` inline, round-trips through the parser.
-  - `parse/jsonl.rs`: one record per non-blank line with physical line numbers; a bad line becomes a
-    per-line error, never a file failure.
-  - `layout/json_tree.rs`: tinted rows (theme `json_*`), word-wrapped with hanging indent, `[+]`/`[-]`
-    toggles via `HitAction::ToggleNode` (click in Preview/Split-top), stable pre-order node ids,
-    error banners with `line:col`, message, source snippet + caret; JSONL gets `#N` headers + rule separators.
   - `app.rs`: kind-dispatched relayout, `collapsed` set, click-to-toggle, JSON status in the status bar
     (`error 2:5`, `3 records, 1 error`); `--pretty` re-anchors JSONL errors to file lines.
 
 ### M3 acceptance checklist (all verified headlessly; window pass still manual)
 - [x] `samples/sample.json` renders a tinted tree; `--pretty` output re-parses identically
 - [x] Invalid JSON shows a banner (`! line:col: msg` + snippet + caret) and a status error
-- [x] `samples/sample.jsonl` (incl. its broken line 3) shows 2 trees + 1 error banner + separators
+- [x] `samples/sample.jsonl` shows one tree per valid record + 1 error banner + separators (incl. its broken line 3)
 - [x] Clicking `[+]`/`[-]` collapses/expands; inner toggles keep working; zoom/reflow keeps place
 - [ ] Same three checks eyeballed in a real window (tree colors, toggle hit areas, banner)
 
@@ -386,9 +167,116 @@ readitor --pretty samples/sample.json        # canonical 2-space JSON to stdout
   sometimes hands GUI children a hidden-console handle even with `>`
   redirection), so live-console verification needs the user's real cmd/WT run.
 - M6 is now feature-complete; what remains is the user's real-window pass.
-  scripted `readitor --version` looks silent — the output lands after the
-  script moved on (interactive use is fine; `Start-Process -Wait` to verify).
-- M6 is now feature-complete; what remains is the user's real-window pass.
+
+### Editor UX round (Oct 2026) — scrollbars, gutter, click-select, session, 149 tests green
+- **Functional overlay scrollbars** (`ui/preview_view.rs` + `app.rs`): shared
+  `SbGeom` geometry (thumb rect, interactive zone, travel math) now backs
+  painting, the cursor, and interaction. Thumb press starts a drag that maps
+  pointer position back to scroll offset (`offset_for`); a track click pages
+  toward the pointer and grabs the thumb mid-bar; `MouseUp` ends the drag.
+  Works for the vertical bar in all modes and the horizontal bar of the
+  no-wrap editor pane (Edit + Split right).
+- **Gutter is off-limits to the caret**: editor content is now inset by the
+  rail width (`PaneScroll::content_x`) so text, selection, and caret start
+  right of the line numbers instead of sliding under the rail at column 0.
+  Clicks inside the rail are ignored (no caret placement), the pointer is an
+  Arrow there, hit tests subtract the rail, and `follow_caret` pans in
+  content space (visible span = pane width − rail).
+- **Click-select like a real editor**: `App` tracks click sequences
+  (position + 40 ms tick window) — single click places the caret, double
+  click selects the word (`EditorView::select_word`, char-class runs:
+  whitespace / word / punctuation), triple click selects the whole line
+  (`select_line`). Dragging after a double/triple click extends the
+  selection from its start.
+- **Session persistence** (`settings.rs`): theme (dark + manual flag), view
+  mode, open tabs, and active tab persist to one tiny text file
+  (`%APPDATA%\Readitor\session.txt`, XDG/`~/Library` on Unix) — written on
+  change, loaded at startup unless a file is passed on the CLI. Missing
+  files are skipped; any parse error falls back to defaults.
+- **Centered window**: `CreateWindowExW` now positions the 1100×800 window
+  at the center of the primary monitor (`GetSystemMetrics(SM_CX/ CYSCREEN)`)
+  instead of `CW_USEDEFAULT`, which parks a `WS_POPUP` window top-left.
+- **M7 phase 2 landed** (buffy): `FontSystem` now parses the embedded
+  Liberation TTFs live and rasterizes on demand behind the same API (no
+  pre-rendered bitmap atlas); glyph cache shape unchanged. RAM stays flat —
+  faces borrow the embedded bytes, glyphs rasterize per (char, size) on
+  demand.
+- Also this round: `mem.rs` allocation census (`--mem-report FILE`, 2-tab
+  delta ≈ 113 KB — the user-visible +5 MB/tab was framebuffer churn + heap
+  arena retention, not document data), duplicate-block merge artifacts from
+  the concurrent-edit window cleaned up (windows.rs centering, editor_view
+  tests), `on_mouse_up` stray lines removed.
+
+### Cross-OS readiness round (Oct 2026) — CI, releases, associations, update story
+- **GitHub Actions CI** (`.github/workflows/ci.yml`): `cargo test` +
+  `cargo clippy` on **windows-latest, ubuntu-latest, macos-latest** every
+  push/PR — the whole suite is headless (NullHost + software canvas), so the
+  portable core (parse/layout/gfx/app) is exercised on all three OSes —
+  plus `cargo fmt --check` on Linux. Clippy stays non-denying until the
+  deferred warning cleanup lands (TODO noted in the workflow).
+- **Release pipeline** (`.github/workflows/release.yml`): pushing a tag
+  (`v0.1.0`, …) builds + tests on all three runners, packages per-OS archives
+  — Windows zip (exe), Linux tar.gz (binary + `packaging/linux/` install
+  script), macOS zip (`.app` via `bundle.sh` + `ditto`) — and publishes them
+  to a GitHub Release with install/update notes.
+- **File associations everywhere** (user requirement): Windows `--install`
+  (HKCU ProgID + `OpenWithProgids`, no admin) unchanged; Linux
+  `packaging/linux/install.sh` installs the `.desktop` entry, the
+  `.jsonl`/`.ndjson` MIME package, and `xdg-mime` defaults; macOS
+  `Info.plist` `CFBundleDocumentTypes` covers the same extensions.
+- **Update story** (documented in README + release notes): no in-app
+  updater — releases are version-numbered overwrites. Replace the binary
+  (or the whole `.app`); associations keep pointing at the same path, so
+  nothing needs re-registering unless the executable moves (then re-run
+  `--install` / `install.sh`). `--version` prints the build version.
+- `mem-census` is now a real cargo feature (`cargo run --features
+  mem-census -- --mem-report FILE` works; previously the cfg was undeclared
+  and the flag unreachable).
+
+### Window-shell round (Oct 2026) — scrollbar vs. resize edge, maximize honors the taskbar
+- **Overlay scrollbars clear the OS resize border**: on a borderless window the
+  client area reaches the very edge, so a bar drawn flush with the border sat
+  inside the strip the platform claims for resizing (measured: 5 of the 8 thumb
+  columns inside the band, so most of the thumb was unclickable).
+  `platform::edge_grip()` now reports that strip in *logical* px (Win32: a fixed
+  4 px classic sizing border, DPI-scaled — deliberately not `SM_CXFRAME`, which
+  reports 8 px on current Windows and would push the bar off the edge; X11:
+  `RESIZE_BAND`), `PaneMetrics { scale, edge }` carries it into
+  `ui::preview_view` geometry, and `v_geom`/`h_geom` put the bar's outer edge
+  exactly on the strip boundary with the click slack inward — net visual change
+  from the old build: 1 px. The maximize frame inset is measured separately
+  (`frame_inset`) so narrowing the strip cannot disturb the work-area clamping.
+  `PaneMetrics` replaces the bare `scale` parameter through
+  `PreviewView::{paint, v_sb, h_sb, scrollbar_hit}`, so painting, cursor, and hit
+  testing stay in agreement by construction; the strip is checked for every
+  mode (Preview/Edit/Split) in one test. Runtime probes on the live window: over
+  the thumb `HTCLIENT`, one pixel further out `HTRIGHT`.
+- **App-drawn controls win the hit test**: window buttons and tabs sit flush
+  with the top/right border, so a band-first `WM_NCHITTEST` ate the corner of
+  whatever button the pointer was on. Both backends now ask `title_hit` first
+  and return `HTCLIENT` for real controls, falling through to the resize band
+  only for empty title-bar filler and panes.
+- **Maximize respects the work area (taskbar/panel)**: a borderless
+  `WS_POPUP | WS_THICKFRAME` window maximized to the whole monitor (measured
+  before: client `1918×1198` at `(1,1)` on a 1920×1200 screen with a 48 px
+  taskbar). `WM_GETMINMAXINFO` clamps to `MonitorFromWindow(…,
+  MONITOR_DEFAULTTONEAREST)`'s `rcWork`, expressed so the maximized
+  `WM_NCCALCSIZE` frame inset lands the client exactly on the work area
+  (`maximize_metrics` is a pure, tested function, incl. a negative-origin
+  secondary monitor). Verified on the real window: client `1920×1152` at
+  `(0,0)` == `rcWork`, taskbar untouched.
+- **X11 maximize is tracked, not guessed**: `_NET_WM_STATE` is read on
+  `PropertyNotify` so a manual edge drag stands down while the WM has the
+  window maximized instead of dragging a maximized window out of place.
+- **`--cfg readitor_check_linux` works from Windows** (the symmetric of the
+  existing Win32-from-Linux check): the Win32 module is gated on
+  `any(target_os = "windows", readitor_check_win)` instead of excluding
+  `readitor_check_linux`, and both cfgs are declared in `Cargo.toml`. The X11
+  backend type-checked for the first time under that flag (a stray brace and a
+  duplicated `intern` signature were blocking it).
+- **Samples are long enough to scroll** (`samples/sample.md`, `sample.txt`,
+  `sample.jsonl`, `sample.json`): the old samples fit on one screen, which is
+  why no scrollbar ever appeared in a window or a `--render` snapshot.
 
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the
@@ -406,3 +294,5 @@ readitor --pretty samples/sample.json        # canonical 2-space JSON to stdout
 - [ ] Wheel/keys scroll smoothly; scrollbar thumb tracks position
 - [ ] `Ctrl +/-/0` zoom reflows and keeps your place; `Ctrl T` flips theme
 - [ ] Status bar shows file name, kind, line count, zoom %
+
+Time: 2026-10-12 13:42:24 UTC

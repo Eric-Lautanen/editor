@@ -37,6 +37,16 @@ impl FileKind {
             Self::PlainText => "Plain text",
         }
     }
+
+    /// Extension used when saving a new buffer of this kind (Save-As default).
+    pub fn default_ext(self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Json => "json",
+            Self::JsonLines => "jsonl",
+            Self::PlainText => "txt",
+        }
+    }
 }
 
 #[cfg(test)]

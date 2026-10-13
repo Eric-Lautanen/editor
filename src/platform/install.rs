@@ -5,14 +5,15 @@
 //! advapi32 FFI and then `SHChangeNotify` — no admin needed. Linux/macOS
 //! registration is owned by the `packaging/` scripts.
 
-use crate::{
-    core::file_kind::EXTENSIONS,
-    error::{Error, Result},
-};
+use crate::error::{Error, Result};
 
-#[cfg(any(target_os = "windows", readitor_check_win))]
+#[cfg(all(
+    any(target_os = "windows", readitor_check_win),
+    not(readitor_check_linux)
+))]
 mod win {
     use super::*;
+    use crate::core::file_kind::EXTENSIONS;
     use std::ffi::c_void;
 
     const HKEY_CURRENT_USER: isize = 0x8000_0001;
@@ -177,31 +178,46 @@ mod win {
 }
 
 /// The exe path on Windows (FFI lives in the backend module).
-#[cfg(any(target_os = "windows", readitor_check_win))]
+#[cfg(all(
+    any(target_os = "windows", readitor_check_win),
+    not(readitor_check_linux)
+))]
 use super::windows::exe_path;
 
 pub fn install() -> Result<()> {
-    #[cfg(any(target_os = "windows", readitor_check_win))]
+    #[cfg(all(
+        any(target_os = "windows", readitor_check_win),
+        not(readitor_check_linux)
+    ))]
     {
         win::install()
     }
-    #[cfg(not(any(target_os = "windows", readitor_check_win)))]
+    #[cfg(not(all(
+        any(target_os = "windows", readitor_check_win),
+        not(readitor_check_linux)
+    )))]
     {
-        Err(Error::Unsupported(
-            "use the scripts in packaging/ on this OS",
+        Err(Error::Platform(
+            "use the scripts in packaging/ on this OS".into(),
         ))
     }
 }
 
 pub fn uninstall() -> Result<()> {
-    #[cfg(any(target_os = "windows", readitor_check_win))]
+    #[cfg(all(
+        any(target_os = "windows", readitor_check_win),
+        not(readitor_check_linux)
+    ))]
     {
         win::uninstall()
     }
-    #[cfg(not(any(target_os = "windows", readitor_check_win)))]
+    #[cfg(not(all(
+        any(target_os = "windows", readitor_check_win),
+        not(readitor_check_linux)
+    )))]
     {
-        Err(Error::Unsupported(
-            "use the scripts in packaging/ on this OS",
+        Err(Error::Platform(
+            "use the scripts in packaging/ on this OS".into(),
         ))
     }
 }

@@ -1,0 +1,92 @@
+name: release
+
+# Tag a version (v0.1.0) to build and publish binaries for all three OSes.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: readitor-${{ github.ref_name }}-windows-x86_64.zip
+          - os: ubuntu-latest
+            artifact: readitor-${{ github.ref_name }}-linux-x86_64.tar.gz
+          - os: macos-latest
+            artifact: readitor-${{ github.ref_name }}-macos.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo build --release
+
+      # ---- package per OS -------------------------------------------------
+      - name: package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/readitor.exe -DestinationPath ${{ matrix.artifact }}
+
+      - name: package (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          cp target/release/readitor dist/
+          cp -r packaging/linux dist/packaging
+          tar -czf ${{ matrix.artifact }} -C dist .
+
+      - name: package (macos)
+        if: matrix.os == 'macos-latest'
+        run: |
+          sh packaging/macos/bundle.sh
+          # ditto keeps the .app bundle resource forks/permissions intact.
+          ditto -c -k --sequesterRsrc target/Readitor.app ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  publish:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            ## Readitor ${{ github.ref_name }}
+
+            | File | OS | Install |
+            |---|---|---|
+            | `*-windows-x86_64.zip` | Windows 10/11 | Unzip anywhere, run `readitor.exe --install` once to claim file associations (HKCU, no admin). |
+            | `*-linux-x86_64.tar.gz` | Linux (X11/XWayland) | Unpack, run `packaging/install.sh` (~/.local install + MIME defaults). |
+            | `*-macos.zip` | macOS | Unzip, drag `Readitor.app` to /Applications. |
+
+            **Updating**: replace the binary (or the whole `.app` / zip
+            contents) — associations keep pointing at the same path, so no
+            re-registration is needed unless you move the executable. Run
+            `readitor --version` to check what you have.
+
+            Note: the Linux and macOS GUI backends (M8/M9) are in progress;
+            those builds currently compile and pass the full headless test
+            suite but the window does not open yet.
+          generate_release_notes: true

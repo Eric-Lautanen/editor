@@ -29,6 +29,7 @@ pub enum TitleHit {
     /// Below the bar: ordinary content, not the title bar's business.
     Client,
     Tab(usize),
+    TabSave(usize),
     TabClose(usize),
     Minimize,
     Maximize,
@@ -39,6 +40,8 @@ pub enum TitleHit {
 pub struct Layout {
     pub bar: Rect,
     pub tabs: Vec<Rect>,
+    /// Save button per tab: `Some` only while that tab has unsaved edits.
+    pub saves: Vec<Option<Rect>>,
     pub closes: Vec<Rect>,
     pub min: Rect,
     pub max: Rect,
@@ -62,9 +65,10 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
     };
     let tab_y = ((bar_h - TAB_H * scale) / 2.0).round();
     let mut tabs = Vec::with_capacity(names.len());
+    let mut saves = Vec::with_capacity(names.len());
     let mut closes = Vec::with_capacity(names.len());
     let mut x = TABS_X * scale;
-    for w in ideal {
+    for (i, w) in ideal.into_iter().enumerate() {
         // When tabs overflow, shrink proportionally down to a small floor so
         // they always fit before the window buttons.
         let w = if shrink < 1.0 {
@@ -75,17 +79,26 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
         };
         tabs.push(Rect::new(x, tab_y, w, TAB_H * scale));
         let cs = 16.0 * scale;
-        closes.push(Rect::new(
+        let close = Rect::new(
             x + w - cs - 4.0 * scale,
             tab_y + (TAB_H * scale - cs) / 2.0,
             cs,
             cs,
-        ));
+        );
+        // The save button sits just left of the close ×, and only exists for
+        // a tab with unsaved edits.
+        saves.push(if names[i].1 {
+            Some(Rect::new(close.x - cs - 2.0 * scale, close.y, cs, cs))
+        } else {
+            None
+        });
+        closes.push(close);
         x += w;
     }
     Layout {
         bar: Rect::new(0.0, 0.0, width, bar_h),
         tabs,
+        saves,
         closes,
         min: Rect::new(width - 3.0 * BTN_W * scale, 0.0, BTN_W * scale, bar_h),
         max: Rect::new(width - 2.0 * BTN_W * scale, 0.0, BTN_W * scale, bar_h),
@@ -158,13 +171,10 @@ pub fn paint(
                 Color::rgba(theme.rule.r, theme.rule.g, theme.rule.b, 90),
             );
         }
-        let label = if *dirty {
-            format!("{name} •")
-        } else {
-            name.clone()
-        };
+        // No dirty dot any more: the save button below is the edited marker.
         let close_w = 20.0 * scale;
-        let label = ellipsize(fonts, &label, r.w - close_w - 10.0 * scale, size);
+        let reserve = if *dirty { 2.0 * close_w } else { close_w };
+        let label = ellipsize(fonts, name, r.w - reserve - 10.0 * scale, size);
         canvas.draw_text(
             fonts,
             &label,
@@ -176,6 +186,16 @@ pub fn paint(
                 color: if is_active { theme.fg } else { theme.muted },
             },
         );
+        if let Some(sr) = lay.saves[i] {
+            paint_save_icon(
+                canvas,
+                sr,
+                theme,
+                if is_active { theme.fg } else { theme.muted },
+                matches!(hover, Some(TitleHit::TabSave(j)) if j == i),
+                scale,
+            );
+        }
         let close_hover = matches!(hover, Some(TitleHit::TabClose(j)) if j == i);
         canvas.draw_text(
             fonts,
@@ -237,6 +257,46 @@ pub fn paint(
     canvas.set_clip(None);
 }
 
+/// Paint the floppy-disk "save" affordance inside the square `r`.
+///
+/// Drawn from rects rather than a glyph: Liberation has no floppy/tray
+/// codepoint (checked — no U+1F4BE, U+1F4E5, U+1F5AB), and the window
+/// buttons already take this font-independent approach.
+fn paint_save_icon(
+    canvas: &mut Canvas,
+    r: Rect,
+    theme: &Theme,
+    color: Color,
+    hover: bool,
+    scale: f32,
+) {
+    if hover {
+        canvas.fill_rounded_rect(
+            r,
+            4.0 * scale,
+            Color::rgba(theme.rule.r, theme.rule.g, theme.rule.b, 90),
+        );
+    }
+    let t = scale.max(1.0).round();
+    let s = 11.0 * scale;
+    let x = (r.x + (r.w - s) / 2.0).round();
+    let y = (r.y + (r.h - s) / 2.0).round();
+    // Body outline (the floppy shell).
+    canvas.fill_rect(Rect::new(x, y, s, t), color);
+    canvas.fill_rect(Rect::new(x, y + s - t, s, t), color);
+    canvas.fill_rect(Rect::new(x, y, t, s), color);
+    canvas.fill_rect(Rect::new(x + s - t, y, t, s), color);
+    // Shutter: the solid metal slider at the top centre.
+    canvas.fill_rect(Rect::new(x + s * 0.30, y + t, s * 0.40, s * 0.32), color);
+    // Label: an outlined plate across the bottom.
+    let (lx, lw) = (x + s * 0.22, s * 0.56);
+    let (ly, lh) = (y + s * 0.58, s * 0.30);
+    canvas.fill_rect(Rect::new(lx, ly, lw, t), color);
+    canvas.fill_rect(Rect::new(lx, ly + lh - t, lw, t), color);
+    canvas.fill_rect(Rect::new(lx, ly, t, lh), color);
+    canvas.fill_rect(Rect::new(lx + lw - t, ly, t, lh), color);
+}
+
 /// What a point in the window (client space) hits. Points below the bar
 /// return `Client`; callers usually only ask about in-bar points.
 pub fn hit_test(lay: &Layout, x: f32, y: f32) -> TitleHit {
@@ -256,6 +316,11 @@ pub fn hit_test(lay: &Layout, x: f32, y: f32) -> TitleHit {
     for (i, r) in lay.closes.iter().enumerate().rev() {
         if r.contains(p) {
             return TitleHit::TabClose(i);
+        }
+    }
+    for (i, r) in lay.saves.iter().enumerate().rev() {
+        if r.is_some_and(|r| r.contains(p)) {
+            return TitleHit::TabSave(i);
         }
     }
     for (i, r) in lay.tabs.iter().enumerate().rev() {
@@ -282,6 +347,14 @@ mod tests {
         // Close button of the second tab.
         let hit = hit_test(&lay, lay.closes[1].x + 2.0, lay.closes[1].y + 2.0);
         assert_eq!(hit, TitleHit::TabClose(1));
+        // Only the dirty tab (index 1) carries a save button, left of its ×.
+        assert!(lay.saves[0].is_none(), "clean tab has no save button");
+        let save = lay.saves[1].expect("dirty tab has a save button");
+        assert!(save.right() <= lay.closes[1].x + 0.5, "save sits left of ×");
+        assert_eq!(
+            hit_test(&lay, save.x + 2.0, save.y + 2.0),
+            TitleHit::TabSave(1)
+        );
         // Window buttons at the right edge.
         assert_eq!(hit_test(&lay, lay.close.x + 10.0, 10.0), TitleHit::Close);
         assert_eq!(hit_test(&lay, lay.max.x + 10.0, 10.0), TitleHit::Maximize);

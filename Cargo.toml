@@ -8,6 +8,11 @@ license = "MIT"
 # NO dependencies. Ever.
 [dependencies]
 
+# Allocation census (`--mem-report FILE`): wires src/mem.rs's tracked
+# global allocator + component attribution into the build.
+[features]
+mem-census = []
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -17,9 +22,11 @@ strip = true
 
 [lints.rust]
 # `--cfg readitor_check_win` (RUSTFLAGS) type-checks the Win32 backend from
-# Linux/macOS; declare it so `cargo clippy` stays warning-free everywhere.
+# Linux/macOS, and `--cfg readitor_check_linux` the X11 backend from
+# Windows/macOS; declare both so `cargo clippy` stays warning-free everywhere.
 # `feature = "mem-census"` gates the allocation-count allocator (src/mem.rs).
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(readitor_check_win)",
+    "cfg(readitor_check_linux)",
     "cfg(feature, values(\"mem-census\"))",
 ] }

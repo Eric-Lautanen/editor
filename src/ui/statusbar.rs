@@ -11,12 +11,15 @@ use crate::{
 pub const HEIGHT: f32 = 28.0; // logical px
 
 /// A clickable segment of the status bar. `id` is app-defined
-/// (0=Preview, 1=Edit, 2=Split, 3=Help, 4=Theme here).
+/// (0=Preview, 1=Edit, 2=Split, 3=Help, 4=Theme, 5=Open, 6=About).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StatusButton {
     pub id: u8,
     pub label: &'static str,
     pub active: bool,
+    /// Draw a hairline rule in the gap to this button's left, splitting the
+    /// row into visual groups (`Open | Preview Edit Split | Help About | Theme`).
+    pub group_start: bool,
     pub rect: Rect,
 }
 
@@ -44,13 +47,26 @@ pub fn paint(
     let baseline = (area.y + (area.h - m.height()) / 2.0 + m.ascent).round();
     let pad = 14.0 * scale;
 
-    // Buttons, right-aligned: [Preview] [Edit] [Split] [Help]
+    // Buttons, right-aligned; the vec order is left-to-right on screen, so we
+    // walk it in reverse. [Open] | [Preview] [Edit] [Split] | [Help] [About] [Theme]
     let mut bx = area.right() - pad;
     let gap = 6.0 * scale;
-    for b in buttons.iter_mut().rev() {
+    for (i, b) in buttons.iter_mut().enumerate().rev() {
         let tw = fonts.measure(FontStyle::Regular, b.label, size);
         let w = tw + 14.0 * scale;
         b.rect = Rect::new(bx - w, area.y + 3.0 * scale, w, area.h - 6.0 * scale);
+        // A group rule sits in the gap immediately left of this button.
+        if b.group_start && i != 0 {
+            canvas.fill_rect(
+                Rect::new(
+                    (b.rect.x - gap / 2.0).round(),
+                    area.y + 6.0 * scale,
+                    scale.max(1.0),
+                    area.h - 12.0 * scale,
+                ),
+                theme.rule,
+            );
+        }
         bx = b.rect.x - gap;
         if b.active {
             canvas.fill_rounded_rect(

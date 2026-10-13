@@ -1,3 +1,20 @@
 {"id":1,"msg":"hello"}
 {"id":2,"msg":"world","extra":[1,2,3]}
 {"id":3,"msg":"bad line" 
+{"id":4,"msg":"recovered","ok":true}
+{"id":5,"level":"info","event":"start","ts":"2026-10-11T09:14:02Z"}
+{"id":6,"level":"warn","event":"cache_miss","key":"cache_ttl","fallback":300}
+{"id":7,"level":"error","event":"request_failed","code":104,"retry":1}
+{"id":8,"level":"info","event":"retry_ok","attempt":1,"latency_ms":12}
+{"id":9,"user":{"id":42,"name":"ada","roles":["reader","editor"]}}
+{"id":10,"user":{"id":43,"name":"grace","roles":["reader"]}}
+{"id":11,"tags":["md","json","jsonl","txt"],"count":4,"active":true}
+{"id":12,"tags":[],"count":0,"active":false}
+{"id":13,"nested":{"a":{"b":{"c":{"d":{"e":"five levels deep"}}}}}}
+{"id":14,"numbers":[0,-1,3.14159,1e6,9007199254740991]}
+{"id":15,"escapes":"quote \" backslash \\ tab \t newline \n unicode \u00e9"}
+{"id":16,"empty":{},"emptyList":[],"null":null}
+{"id":17,"unicode":"café – “quotes” • bullets … → arrows ≤ ≥ © ® ™ € £ ½ ñ Ü 中文"}
+{"id":18,"long":"a string long enough that the tree view has to truncate it with an ellipsis rather than wrap the whole row"}
+{"id":19,"mixed":[1,"two",3.0,true,false,null,{"seven":7},[8,9]]}
+{"id":20,"path":"samples/sample.jsonl","line":20,"last":true}

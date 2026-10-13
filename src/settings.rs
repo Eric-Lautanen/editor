@@ -19,6 +19,12 @@ pub struct Settings {
 /// Per-user config directory (`%APPDATA%\\Readitor`, `~/.config/readitor`,
 /// `~/Library/Application Support/Readitor`), if the OS provides one.
 pub fn config_dir() -> Option<PathBuf> {
+    config_base()
+}
+
+/// The real per-user config directory.
+#[cfg(not(test))]
+fn config_base() -> Option<PathBuf> {
     let base = if let Some(a) = std::env::var_os("APPDATA") {
         Some(PathBuf::from(a).join("Readitor"))
     } else if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -38,6 +44,17 @@ pub fn config_dir() -> Option<PathBuf> {
         None
     }?;
     Some(base)
+}
+
+/// A throwaway directory, so the suite never touches the real one.
+///
+/// `App::open_path` persists the session, and the tests open temp files in a
+/// dozen places, so without this redirect a plain `cargo test` run would
+/// overwrite the developer's own theme, view mode and open tabs with whatever
+/// the last test happened to be looking at.
+#[cfg(test)]
+fn config_base() -> Option<PathBuf> {
+    Some(std::env::temp_dir().join("readitor_test_config"))
 }
 
 fn file_in(dir: &Path) -> PathBuf {
@@ -138,5 +155,17 @@ mod tests {
         std::fs::write(file_in(&dir), render(&s)).unwrap();
         assert_eq!(parse(&std::fs::read_to_string(file_in(&dir)).unwrap()), s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The suite must not write the real session file: `App::open_path`
+    /// persists, so a test run would otherwise clobber the developer's theme
+    /// and open tabs.
+    #[test]
+    fn tests_never_reach_the_real_config_dir() {
+        let dir = config_dir().expect("a config dir under test");
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "tests would write {dir:?}"
+        );
     }
 }

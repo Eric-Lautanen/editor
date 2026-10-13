@@ -140,6 +140,28 @@ mod ffi {
         pub lppos: *mut c_void,
     }
 
+    /// `MINMAXINFO` for `WM_GETMINMAXINFO`. All five fields are part of the
+    /// struct Win32 writes through, so they are all declared. `ptMaxPosition`
+    /// is relative to the monitor origin, not the virtual-screen origin.
+    #[repr(C)]
+    pub struct MinMaxInfo {
+        pub reserved: Point,
+        pub max_size: Point,
+        pub max_position: Point,
+        pub min_track_size: Point,
+        pub max_track_size: Point,
+    }
+
+    /// `MONITORINFO` — `cbSize` must be `size_of::<MonitorInfo>()` before the
+    /// `GetMonitorInfoW` call or it fails.
+    #[repr(C)]
+    pub struct MonitorInfo {
+        pub size: u32,
+        pub monitor: Rect,
+        pub work: Rect,
+        pub flags: u32,
+    }
+
     /// `OPENFILENAMEW` for `GetOpenFileNameW`.
     #[repr(C)]
     pub struct OpenFileNameW {
@@ -168,16 +190,41 @@ mod ffi {
         pub flags_ex: u32,
     }
 
+    /// `KNOWNFOLDERID` / `REFKNOWNFOLDERID` — a plain GUID.
+    #[repr(C)]
+    pub struct Guid {
+        pub data1: u32,
+        pub data2: u16,
+        pub data3: u16,
+        pub data4: [u8; 8],
+    }
+
+    /// `FOLDERID_Documents` = {FDD39AD0-238F-46AF-ADB4-6C85480369C7}.
+    pub const FOLDERID_DOCUMENTS: Guid = Guid {
+        data1: 0xFDD3_9AD0,
+        data2: 0x238F,
+        data3: 0x46AF,
+        data4: [0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7],
+    };
+
     /// `TOUCHINPUT` for `WM_TOUCH` (coordinates are screen px × 100).
+    ///
+    /// Field order and size matter: `GetTouchInputInfo` rejects a `cbSize`
+    /// that is not exactly `sizeof(TOUCHINPUT)`, so a missing member silently
+    /// disables all touch handling.
     #[repr(C)]
     pub struct TouchInput {
         pub x: i32,
         pub y: i32,
-        pub handle: Handle,
+        pub source: Handle,
+        /// `dwID` — the touch contact identifier.
+        pub id: u32,
         pub flags: u32,
         pub mask: u32,
         pub time: u32,
         pub extra_info: usize,
+        pub contact_x: u32,
+        pub contact_y: u32,
     }
 
     /// `ICONINFO` for `CreateIconIndirect`.
@@ -208,9 +255,15 @@ mod ffi {
     // Window messages
     pub const WM_DESTROY: u32 = 0x0002;
     pub const WM_SIZE: u32 = 0x0005;
+    /// Sent before a size/position change; the hook for clamping maximize to
+    /// the monitor work area so a borderless window does not bury the taskbar.
+    pub const WM_GETMINMAXINFO: u32 = 0x0024;
     pub const WM_PAINT: u32 = 0x000F;
     pub const WM_CLOSE: u32 = 0x0010;
     pub const WM_ERASEBKGND: u32 = 0x0014;
+    /// Activation change; returning TRUE without DefWindowProc keeps the
+    /// legacy inactive frame off our borderless client edges.
+    pub const WM_NCACTIVATE: u32 = 0x0086;
     pub const WM_NCCREATE: u32 = 0x0081;
     pub const WM_NCCALCSIZE: u32 = 0x0083;
     pub const WM_NCHITTEST: u32 = 0x0084;
@@ -297,9 +350,14 @@ mod ffi {
     pub const SM_CXSCREEN: i32 = 0;
     pub const SM_CYSCREEN: i32 = 1;
     pub const SM_CXFRAME: i32 = 32;
+    pub const SM_CYFRAME: i32 = 33;
     pub const SM_CXPADDEDBORDER: i32 = 92;
 
-    // GetOpenFileNameW flags
+    /// `MONITOR_DEFAULTTONEAREST` for `MonitorFromWindow`.
+    pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
+    // GetOpenFileNameW / GetSaveFileNameW flags
+    pub const OFN_OVERWRITEPROMPT: u32 = 0x0000_0002;
     pub const OFN_HIDEREADONLY: u32 = 0x0000_0004;
     pub const OFN_NOCHANGEDIR: u32 = 0x0000_0008;
     pub const OFN_PATHMUSTEXIST: u32 = 0x0000_0800;
@@ -460,6 +518,10 @@ mod ffi {
         pub fn screen_to_client(hwnd: Hwnd, pt: *mut Point) -> i32;
         #[link_name = "IsZoomed"]
         pub fn is_zoomed(hwnd: Hwnd) -> i32;
+        #[link_name = "MonitorFromWindow"]
+        pub fn monitor_from_window(hwnd: Hwnd, flags: u32) -> Handle;
+        #[link_name = "GetMonitorInfoW"]
+        pub fn get_monitor_info_w(monitor: Handle, info: *mut MonitorInfo) -> i32;
         #[link_name = "GetSystemMetrics"]
         pub fn get_system_metrics(index: i32) -> i32;
         #[link_name = "GetCursorPos"]
@@ -504,6 +566,22 @@ mod ffi {
             dir: *const u16,
             show: i32,
         ) -> Hinstance;
+        /// `SHGetKnownFolderPath` — resolve a KNOWNFOLDERID to a path. The
+        /// returned buffer is CoTaskMem-allocated (free with `co_task_mem_free`).
+        #[link_name = "SHGetKnownFolderPath"]
+        pub fn sh_get_known_folder_path(
+            rfid: *const Guid,
+            flags: u32,
+            token: Handle,
+            out: *mut *mut u16,
+        ) -> i32;
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        /// Frees the buffer `SHGetKnownFolderPath` hands back.
+        #[link_name = "CoTaskMemFree"]
+        pub fn co_task_mem_free(p: *mut c_void);
     }
 
     #[link(name = "advapi32")]
@@ -525,6 +603,8 @@ mod ffi {
     extern "system" {
         #[link_name = "GetOpenFileNameW"]
         pub fn get_open_file_name_w(ofn: *mut OpenFileNameW) -> i32;
+        #[link_name = "GetSaveFileNameW"]
+        pub fn get_save_file_name_w(ofn: *mut OpenFileNameW) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -568,6 +648,9 @@ mod ffi {
 }
 use ffi::*;
 
+/// Touch travel (client px) under which a contact is a tap rather than a pan.
+const TAP_SLOP: f32 = 8.0;
+
 // ---------------------------------------------------------------- state & host
 
 struct State {
@@ -576,8 +659,13 @@ struct State {
     last_title: String,
     /// Pending UTF-16 high surrogate from WM_CHAR (emoji etc. arrive as two messages).
     high_surrogate: Option<u16>,
-    /// Last touch contact (screen px × 100) while a touch drag pans the view.
+    /// Last touch contact (client px) while a touch drag pans the view.
     touch: Option<(f32, f32)>,
+    /// Touch travel since the contact began: a tap barely moves.
+    touch_travel: f32,
+    /// A mouse message arrived while a touch was live (Windows promotes touch
+    /// to mouse input). A tap then needs no synthetic click — the OS sent one.
+    touch_promoted: bool,
     /// OS dark preference as last seen; WM_SETTINGCHANGE compares against it.
     handler_dark: bool,
 }
@@ -658,6 +746,62 @@ impl Host for WinHost {
             }
         }
     }
+    fn save_file_dialog(&mut self, default_name: &str) -> Option<std::path::PathBuf> {
+        unsafe {
+            // Filter pairs, double-NUL terminated: label\0pattern\0…\0\0.
+            let mut filter: Vec<u16> = Vec::new();
+            for s in [
+                "Markdown (*.md;*.markdown)",
+                "*.md;*.markdown",
+                "JSON (*.json)",
+                "*.json",
+                "JSON Lines (*.jsonl;*.ndjson)",
+                "*.jsonl;*.ndjson",
+                "Text (*.txt;*.log)",
+                "*.txt;*.log",
+                "All files (*.*)",
+                "*.*",
+            ] {
+                filter.extend(s.encode_utf16());
+                filter.push(0);
+            }
+            filter.push(0);
+
+            let mut file: Vec<u16> = default_name.encode_utf16().collect();
+            file.push(0);
+            file.resize(8192, 0);
+
+            let ext = wide("txt");
+            let title = wide("Save As");
+            // Default to the OS Documents folder unless the user navigates away.
+            let docs = documents_dir();
+
+            let mut ofn: OpenFileNameW = mem::zeroed();
+            ofn.l_struct_size = mem::size_of::<OpenFileNameW>() as u32;
+            ofn.hwnd_owner = self.hwnd;
+            ofn.lpstr_filter = filter.as_ptr();
+            ofn.n_filter_index = 1;
+            ofn.lpstr_file = file.as_mut_ptr();
+            ofn.n_max_file = file.len() as u32;
+            ofn.lpstr_def_ext = ext.as_ptr();
+            ofn.lpstr_title = title.as_ptr();
+            if let Some(d) = docs.as_deref() {
+                ofn.lpstr_initial_dir = d.as_ptr();
+            }
+            ofn.flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
+            if get_save_file_name_w(&mut ofn) != 0 {
+                let len = file.iter().position(|&c| c == 0).unwrap_or(0);
+                if len == 0 {
+                    return None;
+                }
+                Some(std::path::PathBuf::from(String::from_utf16_lossy(
+                    &file[..len],
+                )))
+            } else {
+                None
+            }
+        }
+    }
     fn minimize(&mut self) {
         unsafe { show_window(self.hwnd, SW_MINIMIZE) };
     }
@@ -727,6 +871,26 @@ impl WinHost {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The user's Documents folder as a NUL-terminated UTF-16 path, or `None`
+/// when the shell cannot resolve it (the dialog then uses its own default).
+fn documents_dir() -> Option<Vec<u16>> {
+    unsafe {
+        let mut p: *mut u16 = null_mut();
+        if sh_get_known_folder_path(&FOLDERID_DOCUMENTS, 0, null_mut(), &mut p) != 0 || p.is_null()
+        {
+            return None;
+        }
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        let mut v = std::slice::from_raw_parts(p, len).to_vec();
+        co_task_mem_free(p as *mut c_void);
+        v.push(0);
+        Some(v)
+    }
 }
 
 fn loword(v: isize) -> i32 {
@@ -846,9 +1010,68 @@ pub fn system_prefers_dark() -> bool {
     }
 }
 
-/// Resize border thickness in px (frame + padded border), min 4.
-fn resize_frame() -> i32 {
+/// Horizontal frame thickness Win32 adds around a *maximized* `WS_THICKFRAME`
+/// window (frame plus padded border). Used to compensate `WM_NCCALCSIZE` and
+/// to build the maximize rect, so both agree and maximize lands on the work
+/// area. Not the resize strip — see `resize_band`.
+fn frame_inset() -> i32 {
     unsafe { (get_system_metrics(SM_CXFRAME) + get_system_metrics(SM_CXPADDEDBORDER)).max(4) }
+}
+
+/// Vertical frame thickness; see `frame_inset`.
+fn frame_inset_y() -> i32 {
+    unsafe { (get_system_metrics(SM_CYFRAME) + get_system_metrics(SM_CXPADDEDBORDER)).max(4) }
+}
+
+/// Logical thickness (96-dpi px) of the strip along the window edge where a
+/// press starts a resize. Deliberately the classic sizing-border width and
+/// *not* the frame metric: `SM_CXFRAME` reports 8 px on current Windows, and a
+/// wide strip forces the overlay scrollbar to float away from the edge to stay
+/// clickable (strip and bar cannot share pixels).
+const EDGE_GRIP_LOGICAL: f32 = 4.0;
+
+/// `hwnd`'s monitor DPI as a 96-dpi scale factor.
+fn dpi_scale(hwnd: Hwnd) -> f32 {
+    let dpi = unsafe { get_dpi_for_window(hwnd) };
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f32 / 96.0
+    }
+}
+
+/// Physical resize strip width for `hwnd`'s monitor DPI.
+fn resize_band(hwnd: Hwnd) -> i32 {
+    (EDGE_GRIP_LOGICAL * dpi_scale(hwnd)).round().max(2.0) as i32
+}
+
+/// The window-edge strip this backend claims for resizing, in logical px.
+/// `App` scales it by the window DPI and keeps its overlay scrollbars clear of
+/// it (see `platform::edge_grip`).
+pub fn edge_grip() -> f32 {
+    EDGE_GRIP_LOGICAL
+}
+
+/// Maximize geometry for a borderless window, as `WM_GETMINMAXINFO` wants it:
+/// the window's `(max position, max size)`.
+///
+/// The client rect is what must land on the monitor work area (`rcWork`, i.e.
+/// everything the taskbar/docked bars leave free), but the maximized
+/// `WM_NCCALCSIZE` handler insets the client by the frame on each side, and
+/// `ptMaxSize` is the *window*, so the frame is added back here. `work` and
+/// `monitor` are in virtual-screen coords and may be negative; `ptMaxPosition`
+/// is relative to the monitor's own origin — using the raw `work.left/top`
+/// there offsets every window on a secondary monitor.
+fn maximize_metrics(monitor: Rect, work: Rect, fx: i32, fy: i32) -> (Point, Point) {
+    let position = Point {
+        x: work.left - monitor.left - fx,
+        y: work.top - monitor.top - fy,
+    };
+    let size = Point {
+        x: (work.right - work.left) + 2 * fx,
+        y: (work.bottom - work.top) + 2 * fy,
+    };
+    (position, size)
 }
 
 fn modifiers() -> Modifiers {
@@ -942,19 +1165,68 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
     }
     let st = &mut *state;
 
+    // While a touch contact is live the finger owns the pointer. Windows
+    // promotes touch to mouse messages; letting those through would start a
+    // text selection instead of panning the document. Swallow them, and note
+    // that promotion happened so the WM_TOUCH handler knows a tap already
+    // produced a real click.
+    if st.touch.is_some()
+        && matches!(
+            msg,
+            WM_MOUSEMOVE
+                | WM_LBUTTONDOWN
+                | WM_RBUTTONDOWN
+                | WM_MBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONUP
+                | WM_MBUTTONUP
+        )
+    {
+        st.touch_promoted = true;
+        return 0;
+    }
+
     match msg {
+        WM_NCACTIVATE => {
+            // Borderless: DefWindowProc paints the legacy inactive caption/
+            // frame whenever activation changes (focus loss, minimize/
+            // restore) — the grey band that appears when the app is not
+            // focused. Handle the message ourselves and let the app repaint;
+            // wParam == 0 (deactivate) with a -1 lParam keeps visual styles.
+            1
+        }
+        WM_GETMINMAXINFO => {
+            // A borderless WS_POPUP window maximizes to the whole monitor,
+            // burying the taskbar (and any docked app bar) — the work area is
+            // ignored. Clamp maximize to this window's monitor work area, then
+            // add the frame back on each side so the maximized WM_NCCALCSIZE
+            // inset below lands the client rect exactly on the work area.
+            let mmi = &mut *(lp as *mut MinMaxInfo);
+            let monitor = monitor_from_window(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info: MonitorInfo = mem::zeroed();
+            info.size = mem::size_of::<MonitorInfo>() as u32;
+            if !monitor.is_null() && get_monitor_info_w(monitor, &mut info) != 0 {
+                let (fx, fy) = (frame_inset(), frame_inset_y());
+                let (position, size) = maximize_metrics(info.monitor, info.work, fx, fy);
+                mmi.max_position = position;
+                mmi.max_size = size;
+            }
+            0
+        }
         WM_NCCALCSIZE => {
             // Borderless: the client area is the whole window. When maximized a
             // WS_THICKFRAME window extends past the monitor by the frame, so
-            // pull the client rect back in.
+            // pull the client rect back in — the insets must match the frame
+            // added back in WM_GETMINMAXINFO or maximize drifts off the work
+            // area (and clips under the taskbar).
             if wp != 0 {
                 let p = lp as *mut NcCalcSizeParams;
                 if is_zoomed(hwnd) != 0 {
-                    let f = resize_frame();
-                    (*p).rgrc[0].left += f;
-                    (*p).rgrc[0].top += f;
-                    (*p).rgrc[0].right -= f;
-                    (*p).rgrc[0].bottom -= f;
+                    let (fx, fy) = (frame_inset(), frame_inset_y());
+                    (*p).rgrc[0].left += fx;
+                    (*p).rgrc[0].top += fy;
+                    (*p).rgrc[0].right -= fx;
+                    (*p).rgrc[0].bottom -= fy;
                 }
                 0
             } else {
@@ -962,18 +1234,25 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             }
         }
         WM_NCHITTEST => {
-            // Screen -> client, then: resize edges, else ask the app about the
-            // title bar (Drag -> caption so the OS moves the window).
+            // Screen -> client, then: app-drawn controls, resize edges, then
+            // the title bar (Drag -> caption so the OS moves the window).
+            // Controls win over the resize band: the window buttons and tabs
+            // are flush with the top/right border, so a band-first test ate
+            // the corner of the button the user aimed at.
             let mut pt = Point {
                 x: loword(lp),
                 y: hiword(lp),
             };
             screen_to_client(hwnd, &mut pt);
+            let hit = st.handler.title_hit(pt.x as f32, pt.y as f32);
+            if !matches!(hit, TitleHit::Drag | TitleHit::Client) {
+                return HTCLIENT;
+            }
             if is_zoomed(hwnd) == 0 {
-                let f = resize_frame();
+                let (fx, fy) = (resize_band(hwnd), resize_band(hwnd));
                 let (x, y) = (pt.x, pt.y);
                 let (w, h) = (st.canvas.width as i32, st.canvas.height as i32);
-                let hit = match (x < f, x >= w - f, y < f, y >= h - f) {
+                let edge = match (x < fx, x >= w - fx, y < fy, y >= h - fy) {
                     (true, _, true, _) => HTTOPLEFT,
                     (true, _, _, true) => HTBOTTOMLEFT,
                     (_, true, true, _) => HTTOPRIGHT,
@@ -984,11 +1263,11 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                     (_, _, _, true) => HTBOTTOM,
                     _ => 0,
                 };
-                if hit != 0 {
-                    return hit;
+                if edge != 0 {
+                    return edge;
                 }
             }
-            match st.handler.title_hit(pt.x as f32, pt.y as f32) {
+            match hit {
                 TitleHit::Drag => HTCAPTION,
                 _ => HTCLIENT,
             }
@@ -1012,17 +1291,20 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             }
         }
         WM_TOUCH => {
-            // Touch drags pan the document (taps still arrive as mouse clicks).
+            // Touch drags pan the document; a tap (no travel) becomes a click.
             let count = (wp & 0xFFFF) as u32;
             let mut inputs: Vec<TouchInput> = Vec::new();
             inputs.resize_with(count as usize, || TouchInput {
                 x: 0,
                 y: 0,
-                handle: null_mut(),
+                source: null_mut(),
+                id: 0,
                 flags: 0,
                 mask: 0,
                 time: 0,
                 extra_info: 0,
+                contact_x: 0,
+                contact_y: 0,
             });
             let hinput = lp as Handle;
             if get_touch_input_info(
@@ -1033,18 +1315,53 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             ) != 0
             {
                 for t in &inputs {
-                    let (x, y) = (t.x as f32 / 100.0, t.y as f32 / 100.0);
+                    // TOUCHINPUT coordinates are screen px × 100; the app
+                    // speaks client px.
+                    let mut pt = Point {
+                        x: t.x / 100,
+                        y: t.y / 100,
+                    };
+                    screen_to_client(hwnd, &mut pt);
+                    let (x, y) = (pt.x as f32, pt.y as f32);
                     if t.flags & TOUCHEVENTF_DOWN != 0 {
                         st.touch = Some((x, y));
+                        st.touch_travel = 0.0;
+                        st.touch_promoted = false;
                     } else if t.flags & TOUCHEVENTF_MOVE != 0 {
                         if let Some((lx, ly)) = st.touch {
                             let (dx, dy) = (x - lx, y - ly);
+                            st.touch_travel += dx.abs() + dy.abs();
                             if dx != 0.0 || dy != 0.0 {
                                 dispatch(st, hwnd, Event::Scroll { dx, dy });
                             }
                         }
                         st.touch = Some((x, y));
                     } else if t.flags & TOUCHEVENTF_UP != 0 {
+                        // A tap's promoted click was swallowed above, so issue
+                        // one here. (When the OS did promote, it already
+                        // delivered the click and we must not double it.)
+                        if let Some((lx, ly)) = st.touch {
+                            if !st.touch_promoted && st.touch_travel <= TAP_SLOP {
+                                dispatch(
+                                    st,
+                                    hwnd,
+                                    Event::MouseDown {
+                                        x: lx,
+                                        y: ly,
+                                        button: MouseButton::Left,
+                                    },
+                                );
+                                dispatch(
+                                    st,
+                                    hwnd,
+                                    Event::MouseUp {
+                                        x: lx,
+                                        y: ly,
+                                        button: MouseButton::Left,
+                                    },
+                                );
+                            }
+                        }
                         st.touch = None;
                     }
                 }
@@ -1094,8 +1411,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                 let (w, h) = (loword(lp) as usize, hiword(lp) as usize);
                 if w > 0 && h > 0 {
                     st.canvas.resize(w, h);
-                    let dpi = get_dpi_for_window(hwnd);
-                    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+                    let scale = dpi_scale(hwnd);
                     dispatch(
                         st,
                         hwnd,
@@ -1275,6 +1591,8 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             last_title: title,
             high_surrogate: None,
             touch: None,
+            touch_travel: 0.0,
+            touch_promoted: false,
             handler_dark: system_prefers_dark(),
         }));
 
@@ -1335,6 +1653,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::ffi::*;
+    use super::maximize_metrics;
     use std::ptr::null_mut;
 
     #[test]
@@ -1347,5 +1666,74 @@ mod tests {
                 assert!(!cur.is_null(), "cursor {id} failed to load");
             }
         }
+    }
+
+    #[test]
+    fn maximize_lands_the_client_on_the_work_area() {
+        // Regression: a borderless WS_POPUP window maximized to the whole
+        // monitor, burying the taskbar. Maximize must clamp to the monitor
+        // work area, expressed so that our maximized WM_NCCALCSIZE inset
+        // (frame on every side) leaves the client exactly on the work area.
+        let monitor = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let work = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040, // 40 px taskbar along the bottom
+        };
+        let (fx, fy) = (8, 8);
+        let (position, size) = maximize_metrics(monitor, work, fx, fy);
+        // Client origin = max position + one frame, measured from the monitor.
+        assert_eq!(position.x + fx, work.left - monitor.left);
+        assert_eq!(position.y + fy, work.top - monitor.top);
+        // Client size = window size minus a frame on each side: the work area,
+        // so the bottom frame never reaches into the taskbar.
+        assert_eq!(size.x - 2 * fx, work.right - work.left);
+        assert_eq!(size.y - 2 * fy, work.bottom - work.top);
+        assert!(position.y + size.y - fy <= work.bottom - monitor.top);
+    }
+
+    #[test]
+    fn maximize_is_monitor_relative_on_a_secondary_screen() {
+        // A second monitor to the left of the primary has a negative origin;
+        // ptMaxPosition is relative to that monitor, not the virtual screen.
+        let monitor = Rect {
+            left: -1920,
+            top: -200,
+            right: 0,
+            bottom: 880,
+        };
+        let work = Rect {
+            left: -1920,
+            top: -200,
+            right: 0,
+            bottom: 840,
+        };
+        let (position, size) = maximize_metrics(monitor, work, 8, 8);
+        assert_eq!(position.x, -8);
+        assert_eq!(position.y, -8);
+        assert_eq!(size.x, 1920 + 16);
+        assert_eq!(size.y, 1040 + 16);
+    }
+
+    #[test]
+    fn touch_input_layout_matches_win32() {
+        // Regression: a TOUCHINPUT that drops a member (dwID) has the wrong
+        // cbSize, and GetTouchInputInfo then fails outright — every touch
+        // silently fell through to promoted mouse input, so a finger drag
+        // selected text instead of panning.
+        let (size, flags_off) = if std::mem::size_of::<usize>() == 8 {
+            (48, 20)
+        } else {
+            (40, 16)
+        };
+        assert_eq!(std::mem::size_of::<TouchInput>(), size);
+        // `flags` must be dwFlags — i.e. sit after hSource *and* dwID.
+        assert_eq!(std::mem::offset_of!(TouchInput, flags), flags_off);
     }
 }
