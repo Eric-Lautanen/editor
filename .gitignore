@@ -4,3 +4,5 @@
 tools/recovery_manifest.json
 test_out.txt
 *.msi
+*.wixpdb
+*.cab
