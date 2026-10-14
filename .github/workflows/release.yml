@@ -63,6 +63,10 @@ jobs:
           # in src/update.rs's asset scan must stay in sync with this stamp
           # of `editor-<tag>-windows-x86_64.msi`.
           $version = "${{ github.ref_name }}" -replace '^v', ''
+          # The msi must be `editor-<tag>-windows-x86_64.msi` exactly —
+          # src/update.rs's asset scan matches prefab suffix, and plain
+          # `<artifact>.msi` would have produced an odd `...zip.msi`.
+          $msi = "${{ matrix.artifact }}" -replace '\.zip$', '.msi'
           & "$env:USERPROFILE\.dotnet\tools\wix.exe" build `
             -acceptEula wix7 `
             -ext WixToolset.UI.wixext `
@@ -70,7 +74,7 @@ jobs:
             -d Version=$version `
             -d PublishDir=target/release `
             -d Icon=assets/icon.ico `
-            -o ${{ matrix.artifact }}.msi `
+            -o $msi `
             packaging/windows/editor.wxs
 
       - name: package (linux)
