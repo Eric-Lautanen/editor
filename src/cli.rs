@@ -173,11 +173,18 @@ pub fn run(args: Vec<String>) -> Result<()> {
         ));
         return Ok(());
     }
+    // Hand a second launch's file to the already-running instance and exit
+    // before any window appears: "open with Editor" on a file while an
+    // editor is already open must land as a new tab in *that* window, not
+    // paint a second one. No file → same handoff (focuses the open window).
+    if platform::forward_to_running(o.file.as_deref())? {
+        return Ok(());
+    }
     // Silent update check, detached: the check lives its own life (its
     // thread may end in an installer spawn + process exit) while the window
     // opens immediately. Dev loops turn it off with --no-update or
     // EDITOR_NO_UPDATE_CHECK; see src/update.rs for the whole story.
-    if !o.no_update {
+    if !o.no_update && update::due_for_check() {
         update::background_check();
     }
     platform::run(app)

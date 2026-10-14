@@ -290,6 +290,11 @@ mod ffi {
     /// `end_gesture` is the reconciliation point for this and `WM_KILLFOCUS`.
     pub const WM_CAPTURECHANGED: u32 = 0x0215;
     pub const WM_DROPFILES: u32 = 0x0233;
+    /// Second-instance handoff message (app-defined, WM_USER range): `lParam`
+    /// carries the fresh instance's file path, NUL-terminated, in the same
+    /// UTF-16 `arg` allocation the process was passed. Registered at runtime
+    /// so only messages from our own registered class name ever match.
+    pub const WM_OPEN_FROM_SECOND: u32 = 0x8000; // WM_APP
     pub const WM_TIMER: u32 = 0x0113;
     /// `WM_TIMER` ids. `TIMER_TICK` is the app's slow heartbeat (caret blink,
     /// drag auto-scroll). Frame pacing is a waitable timer, not a user timer,
@@ -623,6 +628,10 @@ mod ffi {
         ) -> i32;
         #[link_name = "WaitForSingleObject"]
         pub fn wait_for_single_object(handle: Handle, ms: u32) -> u32;
+        #[link_name = "CreateMutexW"]
+        pub fn create_mutex_w(attrs: *mut c_void, initial_owner: i32, name: *const u16) -> Handle;
+        #[link_name = "GetLastError"]
+        pub fn get_last_error() -> u32;
         #[link_name = "RegisterTouchWindow"]
         pub fn register_touch_window(hwnd: Hwnd, flags: u32) -> i32;
         #[link_name = "GetTouchInputInfo"]
@@ -636,6 +645,12 @@ mod ffi {
         pub fn close_touch_input_handle(input: Handle) -> i32;
         #[link_name = "SendMessageW"]
         pub fn send_message_w(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) -> Lresult;
+        #[link_name = "FindWindowW"]
+        pub fn find_window_w(class: *const u16, title: *const u16) -> Hwnd;
+        #[link_name = "SetForegroundWindow"]
+        pub fn set_foreground_window(hwnd: Hwnd) -> i32;
+        #[link_name = "IsIconic"]
+        pub fn is_iconic(hwnd: Hwnd) -> i32;
         #[link_name = "GetDC"]
         pub fn get_dc(hwnd: Hwnd) -> Hdc;
         #[link_name = "ReleaseDC"]
@@ -1787,6 +1802,22 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             }
             0
         }
+        WM_OPEN_FROM_SECOND => {
+            // Another instance of editor.exe was started with a file; its
+            // argv gave this window a path and died before it drew anything.
+            // Open it as a new tab — exactly what a drag onto the window does
+            // (Event::FileOpen → app.open_path, which handles recent-list and
+            // session persistence).
+            let s = lp as *const u16;
+            let mut len = 0usize;
+            while *s.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(s, len);
+            let path = String::from_utf16_lossy(slice);
+            dispatch(st, hwnd, Event::FileOpen(std::path::PathBuf::from(path)));
+            0
+        }
         WM_DROPFILES => {
             // Open every dropped file as a tab (last one ends up active).
             let drop = wp as Handle;
@@ -2003,6 +2034,45 @@ unsafe fn make_icon() -> Handle {
     delete_object(color);
     delete_object(mask);
     icon
+}
+
+/// ERROR_ALREADY_EXISTS, from `GetLastError` after `CreateMutexW` finds the
+/// mutex already owned by another instance.
+const ERROR_ALREADY_EXISTS: u32 = 183;
+/// Windows message the running instance listens for (WM_USER range, app-
+/// defined); see the ffi mod's `WM_OPEN_FROM_SECOND` handler in `wndproc`.
+use ffi::WM_OPEN_FROM_SECOND;
+
+/// Single-instance handoff: if an editor window of this class is already
+/// running, hand it the file this process was started with and exit before
+/// ever creating a second window. Returns `Ok(true)` when the handoff
+/// happened (the caller must not continue), `Ok(false)` when we are the
+/// first instance (and now hold the mutex marker for future ones).
+pub(crate) unsafe fn handoff_to_running(file: Option<&std::path::Path>) -> Result<bool> {
+    // Named mutex keyed by the class name; ownership lasts only until the
+    // first instance releases it at exit, so a crashed one frees future ones.
+    let marker = wide("EditorWindow.Instance");
+    let mutex = create_mutex_w(null_mut(), 0, marker.as_ptr());
+    if !mutex.is_null() && get_last_error() == ERROR_ALREADY_EXISTS {
+        // Someone else holds it: find their window and forward. The path is
+        // passed as the *message* pointer directly — the fresh process is
+        // alive for the (synchronous) send, so the buffer stays valid.
+        let class = wide("EditorWindow");
+        let target = find_window_w(class.as_ptr(), null());
+        if !target.is_null() {
+            let arg = file.and_then(|p| p.to_str()).map(wide).unwrap_or_default();
+            send_message_w(target, WM_OPEN_FROM_SECOND, 0, arg.as_ptr() as isize);
+            if is_iconic(target) != 0 {
+                show_window(target, 9); /* SW_RESTORE */
+            }
+            set_foreground_window(target);
+            return Ok(true);
+        }
+        // Mutex present but no window (startup race, or the window is
+        // mid-close): proceed as first — Windows frees the mutex when the
+        // other process exits anyway.
+    }
+    Ok(false)
 }
 
 pub fn run(handler: Box<dyn Handler>) -> Result<()> {

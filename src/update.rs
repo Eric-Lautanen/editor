@@ -31,6 +31,40 @@ const API_LATEST: &str = "https://api.github.com/repos/Eric-Lautanen/editor/rele
 /// works.
 const NO_CHECK_ENV: &str = "EDITOR_NO_UPDATE_CHECK";
 
+/// The silent on-launch check runs at most this often: a timestamp file in
+/// the config dir records the last attempt (not the last success — a machine
+/// offline for a week tries again on its first online launch, which is the
+/// point). `--update` ignores it; only the *automatic* check is throttled.
+pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+const LAST_CHECK_FILE: &str = "last_update_check";
+
+/// Should this launch's background check run? Reads/creates the timestamp;
+/// any IO problems (no config dir, read failure) resolve to "check" — the
+/// throttle is a courtesy, not a correctness guarantee.
+pub fn due_for_check() -> bool {
+    let Some(dir) = crate::settings::config_dir() else {
+        return true;
+    };
+    let stamp = dir.join(LAST_CHECK_FILE);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = std::fs::read_to_string(&stamp)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok());
+    if last.is_none_or(|l| now.saturating_sub(l) >= CHECK_INTERVAL.as_secs()) {
+        // Write through the attempt, success or not: a firewalled machine
+        // must not retry every launch within the interval either, or the
+        // black flash it cannot see turns into silent traffic we deny by
+        // design. The next window opens whether this write happens or not.
+        let _ = std::fs::write(&stamp, format!("{now}\n"));
+        true
+    } else {
+        false
+    }
+}
+
 pub fn run() -> Result<()> {
     print_line("editor self-update:");
     let Some(r) = newest_release()? else {
@@ -168,16 +202,15 @@ fn newer(tag: &str, current: &str) -> bool {
     let mut cur = current.split('.');
     for t in tag.split('.') {
         match (t.parse::<u64>(), cur.next()) {
-            (Ok(t), Some(c)) => match c.parse::<u64>() {
-                Ok(c) => {
+            (Ok(t), Some(c)) => {
+                if let Ok(c) = c.parse::<u64>() {
                     if t != c {
                         return t > c;
                     }
                 }
                 // A non-numeric segment in the *running* version is a dev
                 // build suffix; let the next segment decide.
-                Err(_) => {}
-            },
+            }
             // The tag names something past our (numerically exhausted)
             // version: `v1` vs `0.9.9`.
             (Ok(_), None) => return true,
@@ -207,6 +240,14 @@ fn curl(args: &[&str]) -> Result<String> {
     for a in args {
         cmd.arg(a);
     }
+    // On Windows a GUI-subsystem parent has no console to inherit, so a child
+    // curl would get one allocated for it — a black window that flashes for
+    // the length of the call. CREATE_NO_WINDOW suppresses that; every other
+    // platform runs curl as an ordinary child.
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
     let out = cmd
         .output()
         .map_err(|e| Error::Platform(format!("could not run {exe}: {e}")))?;
@@ -329,7 +370,7 @@ fn install_macos(file: &std::path::Path, tag: &str) -> Result<()> {
     // none: report the bundle path instead of guessing at ~half-replaced.
     let Some(bundle) = me
         .ancestors()
-        .find(|p| p.extension().map_or(false, |e| e == "app"))
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
         .map(|p| p.to_path_buf())
     else {
         return Err(Error::Platform(format!(
@@ -411,7 +452,7 @@ fn win_dialog(text: &str, caption: &str) -> bool {
     const MB_SETFOREGROUND: u32 = 0x1_0000;
     const MB_TOPMOST: u32 = 0x4_0000;
     const MB_YESNO: u32 = 0x0004;
-    const MB_SYSTEMMODAL: u32 = 0_1000;
+    const MB_SYSTEMMODAL: u32 = 0x1000;
     const IDYES: i32 = 6;
     let to_wide = |s: &str| {
         std::ffi::OsStr::new(s)
@@ -527,6 +568,33 @@ mod tests {
             None
         );
         assert_eq!(find_asset("{}", "editor-v9", "macos.zip"), None);
+    }
+
+    #[test]
+    fn launch_check_respects_the_twelve_hour_throttle() {
+        // The tests' config dir is a throwaway (see settings::config_base),
+        // but delete the stamp anyway so the sequence below starts fresh.
+        let dir = crate::settings::config_dir().expect("test config dir");
+        let stamp = dir.join(LAST_CHECK_FILE);
+        let _ = std::fs::remove_file(&stamp);
+
+        // First launch checks (and records the attempt); a second one within
+        // the interval must not. Both calls are "attempts", so a flaky
+        // network between them would still be throttled — by design.
+        assert!(due_for_check());
+        assert!(stamp.is_file(), "throttle must persist its attempt");
+        assert!(!due_for_check());
+
+        // An old timestamp (13h ago) reopens the window.
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            - CHECK_INTERVAL.as_secs()
+            - 3600;
+        std::fs::write(&stamp, format!("{old}\n")).unwrap();
+        assert!(due_for_check());
+        let _ = std::fs::remove_file(&stamp);
     }
 
     #[test]
