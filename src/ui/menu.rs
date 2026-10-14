@@ -67,7 +67,7 @@ pub fn open(
             (Action::Save, "Save  Ctrl+S".into()),
             (Action::CloseTab, "Close tab  Ctrl+W".into()),
             (Action::Help, "Help  F1".into()),
-            (Action::About, "About Readitor  F2".into()),
+            (Action::About, "About Editor  F2".into()),
         ]
     } else {
         vec![
@@ -76,7 +76,7 @@ pub fn open(
             (Action::Save, "Save  Ctrl+S".into()),
             (Action::CloseTab, "Close tab  Ctrl+W".into()),
             (Action::Help, "Help  F1".into()),
-            (Action::About, "About Readitor  F2".into()),
+            (Action::About, "About Editor  F2".into()),
         ]
     };
     let shown: Vec<&PathBuf> = recent.iter().take(RECENT_SHOWN).collect();

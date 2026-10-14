@@ -1,4 +1,4 @@
-//! Readitor entry point.
+//! Editor entry point.
 // GUI subsystem: no console window is spawned next to the app. Console-style
 // output (`--help`, `--pretty`, errors) re-attaches to the parent console
 // via `platform::print_*`; test builds stay console-subsystem so `cargo test`
@@ -26,7 +26,7 @@ fn main() {
     let code = match cli::run(std::env::args().skip(1).collect()) {
         Ok(()) => 0,
         Err(e) => {
-            platform::print_err_line(&format!("readitor: {e}"));
+            platform::print_err_line(&format!("editor: {e}"));
             1
         }
     };

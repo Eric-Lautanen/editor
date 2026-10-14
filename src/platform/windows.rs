@@ -2011,7 +2011,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         set_process_dpi_awareness_context(DPI_PER_MONITOR_V2);
 
         let hinst = get_module_handle_w(null());
-        let class = wide("ReaditorWindow");
+        let class = wide("EditorWindow");
         let icon = make_icon();
         let wc = WndClassExW {
             cb_size: mem::size_of::<WndClassExW>() as u32,

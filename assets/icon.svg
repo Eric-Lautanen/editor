@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <title>Readitor icon</title>
+  <title>Editor icon</title>
   <desc>Slate document page with folded corner and ruled lines (one blue) on a light tile. Vector source of src/gfx/icon.rs — keep the two in agreement.</desc>
   <defs>
     <linearGradient id="tile" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="32">

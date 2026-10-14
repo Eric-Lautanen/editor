@@ -95,7 +95,7 @@
     `SetCursor(IDC_IBEAM/IDC_HAND/IDC_ARROW)`.
   - **Status bar** always names the mode and ends with an `F1 help` hint.
   - **`--install`/`--uninstall`** (`platform/install.rs`): HKCU `Software\Classes`
-    via advapi32 — ProgID `Readitor.Document` (+ `DefaultIcon`, `shell\open\command`
+    via advapi32 — ProgID `Editor.Document` (+ `DefaultIcon`, `shell\open\command`
     `"exe" "%1"`), `OpenWithProgids` value per claimed extension, `SHChangeNotify`;
     no admin needed. Non-Windows keeps pointing at `packaging/`.
   - Fixed along the way: nested JSON `[+]` hit rects now span the key text *and* the
@@ -190,7 +190,7 @@
   selection from its start.
 - **Session persistence** (`settings.rs`): theme (dark + manual flag), view
   mode, open tabs, and active tab persist to one tiny text file
-  (`%APPDATA%\Readitor\session.txt`, XDG/`~/Library` on Unix) — written on
+  (`%APPDATA%\Editor\session.txt`, XDG/`~/Library` on Unix) — written on
   change, loaded at startup unless a file is passed on the CLI. Missing
   files are skipped; any parse error falls back to defaults.
 - **Centered window**: `CreateWindowExW` now positions the 1100×800 window
@@ -332,10 +332,10 @@ working set**, and one emoji pulled in `seguiemj.ttf` (12.9 MB) on top.
 - **X11 maximize is tracked, not guessed**: `_NET_WM_STATE` is read on
   `PropertyNotify` so a manual edge drag stands down while the WM has the
   window maximized instead of dragging a maximized window out of place.
-- **`--cfg readitor_check_linux` works from Windows** (the symmetric of the
+- **`--cfg editor_check_linux` works from Windows** (the symmetric of the
   existing Win32-from-Linux check): the Win32 module is gated on
-  `any(target_os = "windows", readitor_check_win)` instead of excluding
-  `readitor_check_linux`, and both cfgs are declared in `Cargo.toml`. The X11
+  `any(target_os = "windows", editor_check_win)` instead of excluding
+  `editor_check_linux`, and both cfgs are declared in `Cargo.toml`. The X11
   backend type-checked for the first time under that flag (a stray brace and a
   duplicated `intern` signature were blocking it).
 - **Samples are long enough to scroll** (`samples/sample.md`, `sample.txt`,
@@ -358,9 +358,9 @@ working set**, and one emoji pulled in `seguiemj.ttf` (12.9 MB) on top.
   icon renderer, `_NET_WM_STATE` toggle for maximize, `XIconifyWindow`,
   dark preference via `gsettings`, centered on the primary screen, 40 ms
   poll-loop `Tick` (XPending + sleep), arrow/xterm/hand2 cursors.
-- **`readitor_check_linux`** dev cfg: type-checks the X11 backend from
-  Windows/macOS (`RUSTFLAGS="--cfg readitor_check_linux" cargo check`) —
-  the mirror of `readitor_check_win`. `platform/mod.rs` + `install.rs` cfg
+- **`editor_check_linux`** dev cfg: type-checks the X11 backend from
+  Windows/macOS (`RUSTFLAGS="--cfg editor_check_linux" cargo check`) —
+  the mirror of `editor_check_win`. `platform/mod.rs` + `install.rs` cfg
   gating updated so exactly one backend is `use`d per configuration;
   `system_prefers_dark` now routes to the Linux backend on Linux.
 - **Not yet on Linux**: XDND drag-and-drop (the one parity gap, tracked for
@@ -376,11 +376,11 @@ The M8 work was re-checked against what CI actually runs by *simulating each
 foreign backend's values* on Windows (temporary env-var toggles, since removed)
 rather than waiting for a runner. Three defects, all fixed:
 - **The macOS release zip unpacked wrong**: `ditto -c -k --sequesterRsrc
-target/Readitor.app out.zip` without `--keepParent` archives the bundle's
+target/Editor.app out.zip` without `--keepParent` archives the bundle's
 *contents*, so the download extracts a stray `Contents/` directory instead of
-`Readitor.app` — "drag it to /Applications" could not work. `--keepParent` is
+`Editor.app` — "drag it to /Applications" could not work. `--keepParent` is
 what puts the bundle itself at the archive root.
-- **`readitor_check_macos` could not be run from Linux**: the macOS arm of
+- **`editor_check_macos` could not be run from Linux**: the macOS arm of
 `system_prefers_dark`/`map_file` was keyed on `target_os` alone, which is false
 on Linux, so a Linux host selecting the AppKit backend fell through to a
 `linux::` the configuration never compiled — the one host combination the check
@@ -396,14 +396,14 @@ reporting `0.0` — the macOS stub — so `cargo test` on macos-latest fails. It
 asserts `<=` unconditionally, the strict form only when a band exists, and pins
 the strip to `preview_view::bar_grip` at the band it was handed.
 
-**Verified with no Linux or macOS machine**: `READITOR_TEST_BAND=0` (macOS
+**Verified with no Linux or macOS machine**: `EDITOR_TEST_BAND=0` (macOS
 band), `=6` (X11), `=12`, and font mapping forced off (macOS, pre-M9) each run
 the full suite green — 234 tests, where `=0` was 233 passed / 1 failed before the
 test fix. With mapping off, 15 headless renders (four samples + a
 CJK/emoji/symbols document × three size/scale combinations) are byte-identical
 to the mapped renders, so the macOS read-through path draws the same pixels.
 `cargo test`, `cargo clippy --all-targets` (with and without `mem-census`),
-`cargo fmt --check`, and `cargo check` under all three `readitor_check_*` cfgs
+`cargo fmt --check`, and `cargo check` under all three `editor_check_*` cfgs
 are clean; the Linux tarball + `install.sh` and the Windows zip were reproduced
 exactly as the workflow builds them (the installer lays down binary, `.desktop`
 and MIME package with no source tree present).
@@ -447,7 +447,7 @@ button held, until some later click happens to end it.
   `a_lost_release_is_delivered_exactly_once` in the Win32 backend for the
   double-delivery hazard, since one Alt+Tab fires both messages.
 - 236 tests green; `cargo clippy --all-targets -- -D warnings`, `cargo fmt
-  --check` and `cargo check` under all three `readitor_check_*` cfgs clean.
+  --check` and `cargo check` under all three `editor_check_*` cfgs clean.
 - **Not verified here**: no GUI automation, so the capture fix is argued from
   the Win32 capture rules and the event traces rather than from a reproduced
   click. The window wants one manual pass: press a bar, drag the pointer out of
@@ -490,7 +490,7 @@ survived restarts (theme, mode, tabs); the window did not.
   window line dropped rather than applied (a half-written rect would open a
   window at the origin with no size).
 - **Verified end to end on the real window**, not just headlessly: a PowerShell
-  harness drove `readitor.exe` with `APPDATA` pointed at a temp dir — moved it to
+  harness drove `editor.exe` with `APPDATA` pointed at a temp dir — moved it to
   `200,150 900x700` and closed → the session file held exactly that; moved to
   `240,180 880x660`, maximized and closed → the file kept that rect with
   `maximized 1`; the next launch came up maximized and `SW_RESTORE` landed back
@@ -500,7 +500,7 @@ survived restarts (theme, mode, tabs); the window did not.
 - 246 tests (10 new, all headless: the normal-rect rule, the restore request,
   quitting, the settings round trip, and the placement guard); `cargo clippy
   --all-targets -- -D warnings`, `cargo fmt --check` and `cargo check` under all
-  three `readitor_check_*` cfgs clean.
+  three `editor_check_*` cfgs clean.
 - **Not verified**: the X11 path is type-checked only (no X server here) — it
   shares the placement rule and mirrors the reporting, but the `_NET_WM_STATE`
   restore wants one run on a real desktop. macOS has no window yet (M9), so its
@@ -537,7 +537,7 @@ survived restarts (theme, mode, tabs); the window did not.
   not churn the disk).
 - 250 tests (4 new, headless: the pending write, the same-rect re-report, the drag, the
   maximize); `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` and `cargo check`
-  under all three `readitor_check_*` cfgs clean.
+  under all three `editor_check_*` cfgs clean.
 - **Not verified**: the X11 path is type-checked only (no X server here) — it is the same
   app-side code, reached through `ConfigureNotify` → `Event::WindowGeometry` → the same `Tick`.
   macOS still has no window (M9).
@@ -571,8 +571,8 @@ survived restarts (theme, mode, tabs); the window did not.
     (`CreationTimeUtc` came back identical across the two writes), so a creation-time check proves
     nothing here — the file index does.
 - 253 tests; `cargo clippy --all-targets -- -D warnings` and `rustfmt --check` on
-  `src/settings.rs`/`src/app.rs` clean; `readitor_check_win`/`_linux` clean. At the time of
-  writing, crate-wide `cargo fmt --check` and `readitor_check_macos` fail on another agent's
+  `src/settings.rs`/`src/app.rs` clean; `editor_check_win`/`_linux` clean. At the time of
+  writing, crate-wide `cargo fmt --check` and `editor_check_macos` fail on another agent's
   in-flight `src/platform/macos.rs` (dialogs in progress there: `url_path`/`screen_visible`
   missing, and that backend has no `run`/`edge_grip`/`map_file` yet) — nothing this round touched.
 
@@ -594,11 +594,11 @@ survived restarts (theme, mode, tabs); the window did not.
   the pane edge — the end of the line could not be read at all. Rows now fold through
   `text::wrap_ranges` at the panel's inner width, with folded continuations indented so they
   cannot be mistaken for new commands (and the panel grows with them).
-- **Measured** (`readitor --render`, same file, 1920×1168): code panel 550..1369 with text
+- **Measured** (`editor --render`, same file, 1920×1168): code panel 550..1369 with text
   overflowing to 1778 **before** → panel 215..1704 with no ink past it **after**; at 1100 px the
   column is 838 (the old measure, i.e. small windows are untouched); at 2560 it stops at the
   1500 px ceiling.
-- **Verified on the real window**: maximized `readitor.exe` captured with `PrintWindow`
+- **Verified on the real window**: maximized `editor.exe` captured with `PrintWindow`
   (1936×1168): text ink 218..1717, i.e. a 1500 px column centered with 218 px margins on both
   sides — 1.83× the old measure — and nothing drawn outside it.
 - 5 new tests (the column grows and stops at the ceiling; stays centered and inside a narrow
@@ -606,7 +606,7 @@ survived restarts (theme, mode, tabs); the window did not.
   preview column grows when the window does). A negative control — the cap back at 820 — fails
   the two growth tests and only those (the theme file was restored byte-identical afterwards).
 - 258 tests; `cargo clippy --all-targets -- -D warnings`, `rustfmt --check` on every touched file
-  and `readitor_check_win`/`_linux` clean (`readitor_check_macos` still fails on another agent's
+  and `editor_check_win`/`_linux` clean (`editor_check_macos` still fails on another agent's
   in-flight `platform/macos.rs` dialogs, as before).
 - **Note for the next round**: 1500 px is a readability ceiling, not a limit on the idea — a user
   who wants the text to fill an ultrawide screen needs a setting (or `Ctrl+scroll` adjusting the
@@ -647,7 +647,7 @@ survived restarts (theme, mode, tabs); the window did not.
   `0x19` → Move, `0x14` → Up) *and* the Win32 values themselves; putting the swapped constants
   back fails exactly that one test and nothing else (windows.rs was restored byte-identical
   afterwards). 259 tests, `clippy --all-targets -- -D warnings`, `rustfmt --check` and
-  `readitor_check_win`/`_linux` clean.
+  `editor_check_win`/`_linux` clean.
 - **Not verified**: pen input (this machine has a pen digitizer; pen contacts are treated as
   touch), and the Linux backend still has no touch handling at all — it reads wheel buttons 4–7
   only, so touch scrolling on X11 remains an open gap.
@@ -675,11 +675,11 @@ survived restarts (theme, mode, tabs); the window did not.
   `open_at` reachability rule, reports `Event::WindowGeometry` on every move/resize/
   maximize (bottom-left points → top-left physical px), and a maximized session
   re-maximizes after opening at the normal rect.
-- **`readitor_check_macos`** dev cfg: the module/install/Cargo plumbing landed with the
-  memory round; this round added the missing `not(readitor_check_macos)` arms in
+- **`editor_check_macos`** dev cfg: the module/install/Cargo plumbing landed with the
+  memory round; this round added the missing `not(editor_check_macos)` arms in
   `install.rs` and the `print_*` dispatches, and collapsed `system_prefers_dark` to
   `backend::system_prefers_dark()` now that all three backends have it.
-  `RUSTFLAGS="--cfg readitor_check_macos" cargo check` type-checks the AppKit backend from
+  `RUSTFLAGS="--cfg editor_check_macos" cargo check` type-checks the AppKit backend from
   Windows/macOS; `cargo check --all-targets` under it compiles the backend's own tests.
 - **Not yet on macOS** (runtime pass pending, like M8): IME/`NSTextInputClient`
   (`characters` covers Latin-1 + composed keys), live theme-change notification (no KVO on
@@ -691,7 +691,7 @@ survived restarts (theme, mode, tabs); the window did not.
   `replyToOpenOrPrint:` path is a follow-up).
 - 4 backend tests (kVK mapping, Command→ctrl, edge bits, manual-resize frame math) run on
   macOS CI; 269 tests green, `clippy --all-targets` and `rustfmt --check` clean, and
-  `readitor_check_win`/`_linux`/`_macos` all check clean.
+  `editor_check_win`/`_linux`/`_macos` all check clean.
 
 ### Scroll-smoothness round (Oct 2026) — a wheel notch glides instead of jumping, 269 tests green
 - **The report**: scrolling "seems a little choppy or lagging just a little". Measured first, and the
@@ -744,11 +744,11 @@ survived restarts (theme, mode, tabs); the window did not.
   rounding). `app` pins the wheel → frames → landing contract including `set_animating(true)` and
   `(false)`, and that a finger pan drops a glide. `platform::windows` pins that the two `WM_TIMER`
   ids stay told apart. 269 tests, `clippy --all-targets -- -D warnings` and `rustfmt --check` clean,
-  `readitor_check_win` / `readitor_check_linux` 0.
+  `editor_check_win` / `editor_check_linux` 0.
 - **Not verified / limits**: the macOS backend implements no frame clock (the `set_animating`
   default), so its glide would advance on the 40 ms heartbeat alone — its file was another agent's
   in-flight work this round and was left untouched; the X11 frame clock is type-checked
-  (`readitor_check_linux`) but cannot be run from this machine; and the glide's tail is deliberate
+  (`editor_check_linux`) but cannot be run from this machine; and the glide's tail is deliberate
   (the last ~2 px arrive at 0.05–0.2 px per frame — invisible, but they keep the clock alive for
   ~100 ms). The *first* frame is the largest step, because exponential easing starts at full speed.
 
@@ -768,7 +768,7 @@ survived restarts (theme, mode, tabs); the window did not.
 - Tests: the settings round trip carries the list, `note_recent` moves/dedupes/caps, and an
   app-level test opens two files, checks the menu rows, and reopens one through
   `Action::Recent`. 284 tests, `clippy --all-targets` and `rustfmt --check` clean.
-- **Oversized files are refused, not frozen on** (`app.rs`): everything Readitor does —
+- **Oversized files are refused, not frozen on** (`app.rs`): everything Editor does —
   buffer, layout, render — is whole-document, so a huge file is a memory and latency trap.
   `Tab::from_path` checks the size before reading and reports "file is N MB — larger than the
   64 MB open limit" in the status bar instead (`size_error`, split out so the rule is testable
@@ -877,6 +877,24 @@ survived restarts (theme, mode, tabs); the window did not.
 - Tests: the typing sequence keeps `current` on the first match with the view at offset
   0; `land` keeps the match under the caret, wraps past the last. 331 tests,
   `clippy --all-targets` and `rustfmt --check` clean; all three platform cfgs compile.
+
+### Rename round (Oct 2026) — Readitor → Editor, 331 tests green
+
+- The name was taken, so the app is now plainly **Editor** — everywhere the name
+  appears, not just the chrome: crate/binary (`editor.exe`), window title
+  (`file — Editor`), About, help legend, context menu, CLI usage/version/error
+  strings, window class (`EditorWindow`), macOS class names and bundle id
+  (`dev.editor.app`), X11 XDND atom (`EDITOR_SEL`), Windows ProgID
+  (`Editor.Document`) and its registry strings, config dirs
+  (`%APPDATA%\Editor`, `~/.config/editor`, `~/Library/Application Support/Editor`),
+  the `editor_check_{win,linux,macos}` cfg flags (CI updated to match), packaging
+  (`Editor.app`, `editor.desktop`, `editor-fonts.bin`), release artifact names,
+  README/PLAN/docs, and the probe tools' usage lines. Deliberately untouched: the
+  repo directory and git remote (renaming the checkout breaks the working
+  environment), the `tools/chat_*.py` room name (agent-coordination protocol), and
+  the Oct 12 recovery scripts (they record real historical paths). 331 tests,
+  `clippy --all-targets` and `rustfmt --check` clean; all three cfgs compile under
+  the new `editor_check_*` names.
 
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the

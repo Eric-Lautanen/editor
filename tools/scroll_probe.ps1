@@ -1,14 +1,14 @@
 # Scroll-smoothness probe (Windows).
 #
 # Sends a *real* wheel notch (SendInput, MOUSEEVENTF_WHEEL) to a running
-# readitor and captures the window repeatedly while it moves, then reports the
+# editor and captures the window repeatedly while it moves, then reports the
 # vertical shift between consecutive captures. That sequence is what "smooth"
 # means: a view that jumps 48 px once has one step; a view that glides has a
 # dozen small ones over ~150 ms.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/scroll_probe.ps1 `
-#     -Exe target\release\readitor.exe [-Notches 1] [-SampleMs 400] [-Repeat 3]
+#     -Exe target\release\editor.exe [-Notches 1] [-SampleMs 400] [-Repeat 3]
 #
 # Traps this cost me time:
 #   * The app must be *foreground* and under the pointer: a wheel message goes
@@ -150,13 +150,13 @@ for ($i = 1; $i -le 400; $i++) {
 }
 $lines | Set-Content -Path $doc -Encoding utf8
 
-$cfg = Join-Path $T ('readitor_scroll_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$cfg = Join-Path $T ('editor_scroll_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $cfg | Out-Null
 $env:APPDATA = $cfg
 
 $traceLog = Join-Path $T 'scroll_trace.txt'
 if ($Trace) {
-    $env:READITOR_TRACE_SCROLL = '1'
+    $env:EDITOR_TRACE_SCROLL = '1'
     if (Test-Path $traceLog) { Remove-Item $traceLog -Force }
     $p = Start-Process -FilePath $exe -ArgumentList $doc -PassThru -RedirectStandardError $traceLog
 } else {
@@ -165,7 +165,7 @@ if ($Trace) {
 for ($i = 0; $i -lt 150; $i++) {
     Start-Sleep -Milliseconds 100
     $p.Refresh()
-    if ($p.HasExited) { throw "readitor exited early" }
+    if ($p.HasExited) { throw "editor exited early" }
     if ($p.MainWindowHandle -ne 0) { break }
 }
 $h = $p.MainWindowHandle

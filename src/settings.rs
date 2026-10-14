@@ -43,8 +43,8 @@ pub fn note_recent(recent: &mut Vec<PathBuf>, path: &Path) {
     recent.truncate(RECENT_MAX);
 }
 
-/// Per-user config directory (`%APPDATA%\\Readitor`, `~/.config/readitor`,
-/// `~/Library/Application Support/Readitor`), if the OS provides one.
+/// Per-user config directory (`%APPDATA%\\Editor`, `~/.config/editor`,
+/// `~/Library/Application Support/Editor`), if the OS provides one.
 pub fn config_dir() -> Option<PathBuf> {
     config_base()
 }
@@ -53,19 +53,19 @@ pub fn config_dir() -> Option<PathBuf> {
 #[cfg(not(test))]
 fn config_base() -> Option<PathBuf> {
     let base = if let Some(a) = std::env::var_os("APPDATA") {
-        Some(PathBuf::from(a).join("Readitor"))
+        Some(PathBuf::from(a).join("Editor"))
     } else if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        Some(PathBuf::from(x).join("readitor"))
+        Some(PathBuf::from(x).join("editor"))
     } else if let Some(h) = std::env::var_os("HOME") {
         if cfg!(target_os = "macos") {
             Some(
                 PathBuf::from(h)
                     .join("Library")
                     .join("Application Support")
-                    .join("Readitor"),
+                    .join("Editor"),
             )
         } else {
-            Some(PathBuf::from(h).join(".config").join("readitor"))
+            Some(PathBuf::from(h).join(".config").join("editor"))
         }
     } else {
         None
@@ -81,7 +81,7 @@ fn config_base() -> Option<PathBuf> {
 /// the last test happened to be looking at.
 #[cfg(test)]
 fn config_base() -> Option<PathBuf> {
-    Some(std::env::temp_dir().join("readitor_test_config"))
+    Some(std::env::temp_dir().join("editor_test_config"))
 }
 
 fn file_in(dir: &Path) -> PathBuf {
@@ -299,7 +299,7 @@ mod tests {
         // The file is written elsewhere and renamed over the old one, so the
         // session on disk is always a complete one, and the scratch file it was
         // staged in is gone afterwards.
-        let dir = std::env::temp_dir().join("readitor_settings_atomic");
+        let dir = std::env::temp_dir().join("editor_settings_atomic");
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = Settings {
             dark: true,
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn a_write_interrupted_before_the_rename_keeps_the_previous_session() {
-        let dir = std::env::temp_dir().join("readitor_settings_interrupted");
+        let dir = std::env::temp_dir().join("editor_settings_interrupted");
         let _ = std::fs::remove_dir_all(&dir);
         let s = Settings {
             dark: false,
@@ -350,7 +350,7 @@ mod tests {
         // Neither the rename nor the fallback can work when the session path is
         // a directory, which stands in for a locked file or an unwritable spot:
         // persisting is best effort, and reading falls back to defaults.
-        let dir = std::env::temp_dir().join("readitor_settings_unwritable");
+        let dir = std::env::temp_dir().join("editor_settings_unwritable");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(file_in(&dir)).unwrap();
         save_in(&dir, &Settings::default());
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn save_then_load() {
-        let dir = std::env::temp_dir().join("readitor_settings_test");
+        let dir = std::env::temp_dir().join("editor_settings_test");
         let _ = std::fs::remove_dir_all(&dir);
         let s = Settings {
             dark: true,

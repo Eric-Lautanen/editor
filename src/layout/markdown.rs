@@ -1031,7 +1031,7 @@ mod tests {
         let f = FontSystem::load_embedded();
         let t = Theme::light();
         let c = ctx(&f, &t);
-        let list = layout(&doc("# Readitor sample\n"), 1100.0, &c);
+        let list = layout(&doc("# Editor sample\n"), 1100.0, &c);
         let rows: Vec<String> = list
             .ops
             .iter()
@@ -1040,7 +1040,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(rows, vec!["Readitor sample".to_string()]);
+        assert_eq!(rows, vec!["Editor sample".to_string()]);
     }
 
     #[test]

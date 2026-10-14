@@ -1,6 +1,6 @@
 //! File-association registration (`--install` / `--uninstall`).
 //!
-//! Windows writes `HKCU\Software\Classes` (ProgID `Readitor.Document`, an
+//! Windows writes `HKCU\Software\Classes` (ProgID `Editor.Document`, an
 //! `OpenWithProgids` value per claimed extension, `shell\open\command`) via
 //! advapi32 FFI and then `SHChangeNotify` — no admin needed. Linux/macOS
 //! registration is owned by the `packaging/` scripts.
@@ -8,9 +8,9 @@
 use crate::error::{Error, Result};
 
 #[cfg(all(
-    any(target_os = "windows", readitor_check_win),
-    not(readitor_check_linux),
-    not(readitor_check_macos)
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
 ))]
 mod win {
     use super::*;
@@ -23,7 +23,7 @@ mod win {
     const KEY_WRITE: u32 = 0x0002_0006;
     const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
     const SHCNF_IDLIST: u32 = 0x0000;
-    const PROGID: &str = "Readitor.Document";
+    const PROGID: &str = "Editor.Document";
     const CLASSES: &str = "Software\\Classes";
 
     type Hkey = *mut c_void;
@@ -125,7 +125,7 @@ mod win {
         let exe = exe.to_string_lossy().into_owned();
 
         let key = open_key(hkcu(), PROGID)?;
-        set_sz(key, "", "Readitor Document")?;
+        set_sz(key, "", "Editor Document")?;
         unsafe { reg_close_key(key) };
         let key = open_key(hkcu(), &format!("{PROGID}\\DefaultIcon"))?;
         set_sz(key, "", &format!("\"{exe}\",0"))?;
@@ -147,12 +147,9 @@ mod win {
                 std::ptr::null(),
             )
         };
-        super::super::print_line(&format!(
-            "registered Readitor for: {}",
-            EXTENSIONS.join(", ")
-        ));
+        super::super::print_line(&format!("registered Editor for: {}", EXTENSIONS.join(", ")));
         super::super::print_line(
-            "(Windows may still ask you to pick Readitor once in Settings > Apps > Default apps.)",
+            "(Windows may still ask you to pick Editor once in Settings > Apps > Default apps.)",
         );
         Ok(())
     }
@@ -173,32 +170,32 @@ mod win {
                 std::ptr::null(),
             )
         };
-        super::super::print_line("unregistered Readitor file associations");
+        super::super::print_line("unregistered Editor file associations");
         Ok(())
     }
 }
 
 /// The exe path on Windows (FFI lives in the backend module).
 #[cfg(all(
-    any(target_os = "windows", readitor_check_win),
-    not(readitor_check_linux),
-    not(readitor_check_macos)
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
 ))]
 use super::windows::exe_path;
 
 pub fn install() -> Result<()> {
     #[cfg(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     ))]
     {
         win::install()
     }
     #[cfg(not(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     )))]
     {
         Err(Error::Platform(
@@ -209,17 +206,17 @@ pub fn install() -> Result<()> {
 
 pub fn uninstall() -> Result<()> {
     #[cfg(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     ))]
     {
         win::uninstall()
     }
     #[cfg(not(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     )))]
     {
         Err(Error::Platform(

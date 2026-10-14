@@ -14,11 +14,11 @@ fn open(name: &str, content: &str) -> App {
 
 #[test]
 fn zz_scratch_nested_toggles() {
-    if std::env::var("READITOR_SCRATCH").is_err() {
+    if std::env::var("EDITOR_SCRATCH").is_err() {
         return;
     }
     let mut app = open(
-        "readitor_scratch.json",
+        "editor_scratch.json",
         "{\"a\": {\"b\": [1, 2, 3]}, \"c\": true}",
     );
     let _ = app.render_headless(800, 600, 1.0);

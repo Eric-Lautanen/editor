@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Readitor</string>
-  <key>CFBundleIdentifier</key><string>dev.readitor.app</string>
-  <key>CFBundleExecutable</key><string>readitor</string>
+  <key>CFBundleName</key><string>Editor</string>
+  <key>CFBundleIdentifier</key><string>dev.editor.app</string>
+  <key>CFBundleExecutable</key><string>editor</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
-      <key>CFBundleTypeName</key><string>Readitor Document</string>
+      <key>CFBundleTypeName</key><string>Editor Document</string>
       <key>CFBundleTypeRole</key><string>Editor</string>
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key>

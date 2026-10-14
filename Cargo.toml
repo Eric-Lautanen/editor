@@ -1,5 +1,5 @@
 [package]
-name = "readitor"
+name = "editor"
 version = "0.1.0"
 edition = "2021"
 description = "A small native viewer/editor for Markdown, JSON, CSV, configs, logs and code. std only."
@@ -21,13 +21,13 @@ panic = "abort"
 strip = true
 
 [lints.rust]
-# `--cfg readitor_check_win` / `readitor_check_linux` / `readitor_check_macos`
+# `--cfg editor_check_win` / `editor_check_linux` / `editor_check_macos`
 # (RUSTFLAGS) type-check one platform backend from another OS — one per OS
 # backend, declared here so `cargo clippy` stays warning-free everywhere.
 # `feature = "mem-census"` gates the allocation-count allocator (src/mem.rs).
 unexpected_cfgs = { level = "warn", check-cfg = [
-    "cfg(readitor_check_win)",
-    "cfg(readitor_check_linux)",
-    "cfg(readitor_check_macos)",
+    "cfg(editor_check_win)",
+    "cfg(editor_check_linux)",
+    "cfg(editor_check_macos)",
     "cfg(feature, values(\"mem-census\"))",
 ] }

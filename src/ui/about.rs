@@ -13,7 +13,7 @@ use crate::{
 use super::overlay;
 
 /// Product name as shown in the title bar.
-const NAME: &str = "Readitor";
+const NAME: &str = "Editor";
 /// Read from Cargo so the box cannot drift from what `--version` prints.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

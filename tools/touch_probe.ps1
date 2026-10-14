@@ -1,4 +1,4 @@
-# touch_probe.ps1 — drive the real Readitor window with a synthetic finger and
+# touch_probe.ps1 — drive the real Editor window with a synthetic finger and
 # capture what it did.
 #
 # Why this exists: the touch path cannot be reached from the headless suite or
@@ -141,7 +141,7 @@ public class WindowCapture {
 }
 "@
 
-$exe = Join-Path $PSScriptRoot "..\target\debug\readitor.exe"
+$exe = Join-Path $PSScriptRoot "..\target\debug\editor.exe"
 if (-not (Test-Path $exe)) { throw "build it first: cargo build  ($exe)" }
 $T = $env:TEMP
 $doc = Join-Path $T "touchdoc.md"
@@ -149,7 +149,7 @@ $lines = @("# Touch test")
 for ($i = 1; $i -le 300; $i++) { $lines += "Paragraph $i : the quick brown fox jumps over the lazy dog." }
 $lines | Set-Content -Path $doc -Encoding utf8
 # A throwaway config dir, so the developer's own session is not touched.
-$cfg = Join-Path $T ("readitor_touch_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$cfg = Join-Path $T ("editor_touch_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Path $cfg | Out-Null
 $env:APPDATA = $cfg
 

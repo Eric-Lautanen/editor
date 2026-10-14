@@ -33,7 +33,7 @@
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/find_probe.ps1 `
-#     -Exe target\release\readitor.exe
+#     -Exe target\release\editor.exe
 #
 # Traps inherited from scroll_probe.ps1:
 #   * PrintWindow flags must be 2 (PW_RENDERFULLCONTENT) or the frame is empty.
@@ -221,7 +221,7 @@ for ($i = 1; $i -le 300; $i++) {
 $lines | Set-Content -Path $doc -Encoding utf8
 
 # Fresh settings dir so the probe is independent of the operator's session.
-$cfg = Join-Path $T ('readitor_find_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$cfg = Join-Path $T ('editor_find_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $cfg | Out-Null
 $env:APPDATA = $cfg
 
@@ -230,7 +230,7 @@ try {
     for ($i = 0; $i -lt 150; $i++) {
         Start-Sleep -Milliseconds 100
         $p.Refresh()
-        if ($p.HasExited) { throw 'readitor exited early' }
+        if ($p.HasExited) { throw 'editor exited early' }
         if ($p.MainWindowHandle -ne 0) { break }
     }
     $h = $p.MainWindowHandle

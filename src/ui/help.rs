@@ -51,7 +51,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "App",
         &[
             ("F1", "this help"),
-            ("F2", "about readitor"),
+            ("F2", "about editor"),
             ("right-click", "context menu"),
             ("Ctrl+Q", "quit"),
         ],

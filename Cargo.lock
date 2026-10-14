@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "readitor"
+name = "editor"
 version = "0.1.0"

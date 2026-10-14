@@ -1,4 +1,4 @@
-# Readitor sample config
+# Editor sample config
 [server]
 host = "localhost"
 port = 8080
@@ -7,7 +7,7 @@ timeout = 30.5
 
 [server.tls]
 enabled = false
-cert = "/etc/readitor/cert.pem"
+cert = "/etc/editor/cert.pem"
 
 [database]
 url = "postgres://localhost:5432/app"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dev tool: pre-rasterize Liberation fonts (SIL OFL 1.1) into assets/readitor-fonts.bin.
+"""Dev tool: pre-rasterize Liberation fonts (SIL OFL 1.1) into assets/editor-fonts.bin.
 
 The app embeds the result with include_bytes!, so there is no runtime dependency.
 Run:  python3 tools/gen_font.py        (needs Pillow + fontTools, dev machine only)
@@ -51,6 +51,6 @@ for path in FACES:
     out += struct.pack("<I", len(blob)) + blob
     print(f"{os.path.basename(path):30s} glyphs={len(recs):3d} data={len(blob):7d}B asc={asc} desc={desc}")
 
-dst = os.path.join(os.path.dirname(__file__), "..", "assets", "readitor-fonts.bin")
+dst = os.path.join(os.path.dirname(__file__), "..", "assets", "editor-fonts.bin")
 open(dst, "wb").write(out)
 print("wrote", os.path.normpath(dst), len(out), "bytes")

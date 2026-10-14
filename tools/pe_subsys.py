@@ -8,6 +8,6 @@ def sub(path):
     s = struct.unpack_from('<H', d, opt + 68)[0]
     print(path, 'subsystem', s)
 
-sub(r'target\debug\readitor.exe')
-sub(r'target\release\readitor.exe')
+sub(r'target\debug\editor.exe')
+sub(r'target\release\editor.exe')
 sub(r'C:\Users\user\AppData\Local\Temp\contest\target\release\contest.exe')

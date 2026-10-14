@@ -138,7 +138,7 @@ public class Coast {
 }
 "@
 
-$exe = Join-Path (Resolve-Path "$PSScriptRoot\..") "target\release\readitor.exe"
+$exe = Join-Path (Resolve-Path "$PSScriptRoot\..") "target\release\editor.exe"
 if (-not (Test-Path $exe)) { throw "build it first: cargo build --release" }
 $T = $env:TEMP
 
@@ -156,7 +156,7 @@ for ($i = 1; $i -le 700; $i++) {
 $doc = Join-Path $T 'coast_probe.md'
 $lines | Set-Content -Path $doc -Encoding utf8
 
-$cfg = Join-Path $T ('readitor_coast_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$cfg = Join-Path $T ('editor_coast_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $cfg | Out-Null
 $env:APPDATA = $cfg
 
@@ -164,7 +164,7 @@ $p = Start-Process -FilePath $exe -ArgumentList $doc -PassThru
 for ($i = 0; $i -lt 150; $i++) {
     Start-Sleep -Milliseconds 100
     $p.Refresh()
-    if ($p.HasExited) { throw 'readitor exited early' }
+    if ($p.HasExited) { throw 'editor exited early' }
     if ($p.MainWindowHandle -ne 0) { break }
 }
 $h = $p.MainWindowHandle

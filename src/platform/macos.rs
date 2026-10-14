@@ -977,7 +977,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
 
         let view_cls = make_class(
             "NSView",
-            "ReaditorView",
+            "EditorView",
             &[
                 MethodDef {
                     name: "isFlipped",
@@ -1058,7 +1058,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         )?;
         let win_cls = make_class(
             "NSWindow",
-            "ReaditorWindow",
+            "EditorWindow",
             &[MethodDef {
                 name: "canBecomeKeyWindow",
                 imp: tr!(win_can_become_key as unsafe extern "C" fn(Id, Sel) -> i8),
@@ -1067,7 +1067,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         )?;
         let del_cls = make_class(
             "NSObject",
-            "ReaditorDelegate",
+            "EditorDelegate",
             &[
                 MethodDef {
                     name: "applicationDidFinishLaunching:",

@@ -17,11 +17,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: readitor-${{ github.ref_name }}-windows-x86_64.zip
+            artifact: editor-${{ github.ref_name }}-windows-x86_64.zip
           - os: ubuntu-latest
-            artifact: readitor-${{ github.ref_name }}-linux-x86_64.tar.gz
+            artifact: editor-${{ github.ref_name }}-linux-x86_64.tar.gz
           - os: macos-latest
-            artifact: readitor-${{ github.ref_name }}-macos.zip
+            artifact: editor-${{ github.ref_name }}-macos.zip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,13 +41,13 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/readitor.exe -DestinationPath ${{ matrix.artifact }}
+          Compress-Archive -Path target/release/editor.exe -DestinationPath ${{ matrix.artifact }}
 
       - name: package (linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           mkdir -p dist/packaging
-          cp target/release/readitor dist/
+          cp target/release/editor dist/
           # Keep the repo-relative path: `cp -r packaging/linux dist/packaging`
           # would flatten the script to `packaging/install.sh`, giving the
           # tarball a path that matches neither the README nor a checkout.
@@ -58,12 +58,12 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           sh packaging/macos/bundle.sh
-          # `--keepParent` is what puts `Readitor.app` itself at the root of the
+          # `--keepParent` is what puts `Editor.app` itself at the root of the
           # zip; without it `ditto -c -k` archives the bundle's *contents*, and
           # the download unzips to a stray `Contents/` folder that cannot be
           # dragged to /Applications. `--sequesterRsrc` keeps the bundle's
           # resource forks/extended attributes.
-          ditto -c -k --sequesterRsrc --keepParent target/Readitor.app ${{ matrix.artifact }}
+          ditto -c -k --sequesterRsrc --keepParent target/Editor.app ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -87,18 +87,18 @@ jobs:
         with:
           files: dist/*
           body: |
-            ## Readitor ${{ github.ref_name }}
+            ## Editor ${{ github.ref_name }}
 
             | File | OS | Install |
             |---|---|---|
-            | `*-windows-x86_64.zip` | Windows 10/11 | Unzip anywhere, run `readitor.exe --install` once to claim file associations (HKCU, no admin). |
+            | `*-windows-x86_64.zip` | Windows 10/11 | Unzip anywhere, run `editor.exe --install` once to claim file associations (HKCU, no admin). |
             | `*-linux-x86_64.tar.gz` | Linux (X11/XWayland) | Unpack, run `packaging/linux/install.sh` (~/.local install + MIME defaults). |
-            | `*-macos.zip` | macOS | Unzip, drag `Readitor.app` to /Applications. |
+            | `*-macos.zip` | macOS | Unzip, drag `Editor.app` to /Applications. |
 
             **Updating**: replace the binary (or the whole `.app` / zip
             contents) — associations keep pointing at the same path, so no
             re-registration is needed unless you move the executable. Run
-            `readitor --version` to check what you have.
+            `editor --version` to check what you have.
 
             Note: the Linux and macOS GUI backends (M8/M9) are in progress;
             those builds currently compile and pass the full headless test

@@ -487,7 +487,7 @@ struct Atoms {
     targets: Atom,
     utf8_string: Atom,
     /// Scratch property for selection transfers.
-    readitor_sel: Atom,
+    editor_sel: Atom,
 }
 
 unsafe fn intern(d: *mut Display, name: &str) -> Atom {
@@ -771,7 +771,7 @@ unsafe fn read_clipboard(x: *mut X) -> Option<String> {
         x.d,
         x.atoms.clipboard,
         x.atoms.utf8_string,
-        x.atoms.readitor_sel,
+        x.atoms.editor_sel,
         x.win,
         CURRENT_TIME,
     );
@@ -1328,7 +1328,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             clipboard: intern(d, "CLIPBOARD"),
             targets: intern(d, "TARGETS"),
             utf8_string: intern(d, "UTF8_STRING"),
-            readitor_sel: intern(d, "READITOR_SEL"),
+            editor_sel: intern(d, "EDITOR_SEL"),
         };
         let mut protocols = [atoms.wm_delete];
         XSetWMProtocols(d, win, protocols.as_mut_ptr(), 1);

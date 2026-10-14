@@ -15,9 +15,9 @@ pub mod install;
 /// default open size cannot drift per OS.
 pub const DEFAULT_SIZE: (usize, usize) = (1280, 720);
 
-// The `readitor_check_*` cfgs (RUSTFLAGS) type-check one backend from another
-// OS: `readitor_check_win` the Win32 backend, `readitor_check_linux` the X11
-// one, `readitor_check_macos` the AppKit one. Dev-only: they never link the
+// The `editor_check_*` cfgs (RUSTFLAGS) type-check one backend from another
+// OS: `editor_check_win` the Win32 backend, `editor_check_linux` the X11
+// one, `editor_check_macos` the AppKit one. Dev-only: they never link the
 // foreign GUI libraries (which is also why a `cargo check`, not a build, is
 // what they are for). Each selects *exactly* one module as `backend`, and the
 // CI jobs for the other two OSes are what a local check stands in for.
@@ -26,47 +26,47 @@ pub const DEFAULT_SIZE: (usize, usize) = (1280, 720);
 // selection cannot drift from these cfgs. Where the set of backends differs
 // (`print_*`) the arm has to name a module directly, and then its cfg must
 // *imply* that module's cfg — the `windows::print_out` arms are gated on
-// `any(target_os = "windows", readitor_check_win)` plus the other two check
+// `any(target_os = "windows", editor_check_win)` plus the other two check
 // cfgs, which is exactly what compiles `mod windows` in the first place.
 #[cfg(any(
     all(
         unix,
         not(target_os = "macos"),
-        not(readitor_check_win),
-        not(readitor_check_macos)
+        not(editor_check_win),
+        not(editor_check_macos)
     ),
-    readitor_check_linux
+    editor_check_linux
 ))]
 mod linux;
 #[cfg(all(
-    any(target_os = "macos", readitor_check_macos),
-    not(readitor_check_win),
-    not(readitor_check_linux)
+    any(target_os = "macos", editor_check_macos),
+    not(editor_check_win),
+    not(editor_check_linux)
 ))]
 mod macos;
-#[cfg(any(target_os = "windows", readitor_check_win))]
+#[cfg(any(target_os = "windows", editor_check_win))]
 mod windows;
 
 #[cfg(any(
     all(
         unix,
         not(target_os = "macos"),
-        not(readitor_check_win),
-        not(readitor_check_macos)
+        not(editor_check_win),
+        not(editor_check_macos)
     ),
-    readitor_check_linux
+    editor_check_linux
 ))]
 use linux as backend;
 #[cfg(all(
-    any(target_os = "macos", readitor_check_macos),
-    not(readitor_check_win),
-    not(readitor_check_linux)
+    any(target_os = "macos", editor_check_macos),
+    not(editor_check_win),
+    not(editor_check_linux)
 ))]
 use macos as backend;
 #[cfg(all(
-    any(target_os = "windows", readitor_check_win),
-    not(readitor_check_linux),
-    not(readitor_check_macos)
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
 ))]
 use windows as backend;
 
@@ -241,17 +241,17 @@ pub fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
 /// console, so the backend attaches to the parent console first.
 pub fn print_line(s: &str) {
     #[cfg(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     ))]
     {
         windows::print_out(&format!("{s}\n"));
     }
     #[cfg(not(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     )))]
     {
         println!("{s}");
@@ -261,17 +261,17 @@ pub fn print_line(s: &str) {
 /// Print raw text (no trailing newline) to stdout; see `print_line`.
 pub fn print_text(s: &str) {
     #[cfg(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     ))]
     {
         windows::print_out(s);
     }
     #[cfg(not(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     )))]
     {
         print!("{s}");
@@ -281,17 +281,17 @@ pub fn print_text(s: &str) {
 /// Print a line to stderr; see `print_line`.
 pub fn print_err_line(s: &str) {
     #[cfg(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     ))]
     {
         windows::print_err(&format!("{s}\n"));
     }
     #[cfg(not(all(
-        any(target_os = "windows", readitor_check_win),
-        not(readitor_check_linux),
-        not(readitor_check_macos)
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
     )))]
     {
         eprintln!("{s}");

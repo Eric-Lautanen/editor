@@ -1,4 +1,4 @@
-# Readitor
+# Editor
 
 Native, dependency-free (std-only) Rust app for reading and lightly editing
 Markdown, JSON, JSONL, CSV, configs (YAML/TOML/INI), logs, code and text
@@ -7,7 +7,7 @@ files. See [docs/PLAN.md](docs/PLAN.md).
 ```
 cargo run -- samples/sample.md
 cargo test
-readitor --install      # register file associations (Windows: HKCU, no admin)
+editor --install      # register file associations (Windows: HKCU, no admin)
 ```
 
 Status: **M7 done (live TTF fonts) — Windows feature-complete; Linux/macOS
@@ -22,17 +22,17 @@ open tabs, window size/place/maximized), `--install` file associations.
 
 | OS | How |
 |---|---|
-| Windows | Unzip `readitor.exe` anywhere and run `readitor.exe --install` once — registers `Readitor.Document` for `.md .markdown .json .jsonl .ndjson .txt .log .csv .tsv .yaml .yml .toml .ini .cfg .conf` and code extensions under `HKCU` (no admin). Readitor then shows up in "Open with" and can be set as the default. `--uninstall` removes it. |
+| Windows | Unzip `editor.exe` anywhere and run `editor.exe --install` once — registers `Editor.Document` for `.md .markdown .json .jsonl .ndjson .txt .log .csv .tsv .yaml .yml .toml .ini .cfg .conf` and code extensions under `HKCU` (no admin). Editor then shows up in "Open with" and can be set as the default. `--uninstall` removes it. |
 | Linux | `packaging/linux/install.sh` — installs to `~/.local/bin`, a `.desktop` entry, a MIME package for `.jsonl`/`.ndjson`, and sets `xdg-mime` defaults for markdown/JSON/NDJSON/plain text/CSV/YAML/TOML. |
-| macOS | `Readitor.app` (built by `packaging/macos/bundle.sh`) declares `CFBundleDocumentTypes` for the same extensions, so it appears in "Open With". |
+| macOS | `Editor.app` (built by `packaging/macos/bundle.sh`) declares `CFBundleDocumentTypes` for the same extensions, so it appears in "Open With". |
 
 ## Updating
 
 There is no in-app updater: releases are version-numbered overwrites. Replace
-the binary (Windows/Linux) or the whole `Readitor.app` (macOS) with the newer
+the binary (Windows/Linux) or the whole `Editor.app` (macOS) with the newer
 one — associations keep pointing at the same path, so nothing needs
 re-registering unless you *move* the executable (then re-run `--install` /
-`install.sh`). `readitor --version` prints what you have.
+`install.sh`). `editor --version` prints what you have.
 
 ## CI & releases (GitHub Actions)
 
@@ -46,5 +46,5 @@ re-registering unless you *move* the executable (then re-run `--install` /
   GitHub Release.
 
 Dev tip: type-check the Win32 backend from any OS with
-`RUSTFLAGS="--cfg readitor_check_win" cargo check`. Allocation census:
+`RUSTFLAGS="--cfg editor_check_win" cargo check`. Allocation census:
 `cargo run --features mem-census -- --mem-report FILE`.

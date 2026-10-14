@@ -7,7 +7,7 @@ use crate::{
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: readitor [FILE]\n\
+const USAGE: &str = "usage: editor [FILE]\n\
   --version | -V       print version\n\
   --install | --uninstall   register/remove file associations\n\
   --pretty             print FILE (.json/.jsonl) canonicalized to stdout\n\
@@ -49,7 +49,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         };
         match a.as_str() {
             "--version" | "-V" => {
-                platform::print_line(&format!("readitor {}", env!("CARGO_PKG_VERSION")));
+                platform::print_line(&format!("editor {}", env!("CARGO_PKG_VERSION")));
                 return Ok(());
             }
             "--help" | "-h" => {

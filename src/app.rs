@@ -119,7 +119,7 @@ pub struct Tab {
 }
 
 /// Files above this are refused rather than opened (see [`size_error`]):
-/// everything Readitor does — buffer, layout, render — is whole-document, so
+/// everything Editor does — buffer, layout, render — is whole-document, so
 /// a huge file is a memory and latency trap, and windowing it is not in this
 /// milestone.
 const MAX_OPEN_BYTES: u64 = 64 * 1024 * 1024;
@@ -575,7 +575,7 @@ impl App {
     /// Window title. Unsaved state is *not* encoded here any more — the tab's
     /// save button carries it (the status bar and window title stay clean).
     pub fn title(&self) -> String {
-        format!("{} — Readitor", self.name())
+        format!("{} — Editor", self.name())
     }
     // ------------------------------------------------------------ tabs
 
@@ -2721,9 +2721,9 @@ mod tests {
 
     #[test]
     fn recent_files_track_opens_and_the_menu_reopens_them() {
-        let a = std::env::temp_dir().join("readitor_test_recent_a.md");
+        let a = std::env::temp_dir().join("editor_test_recent_a.md");
         std::fs::write(&a, "a\n").unwrap();
-        let b = std::env::temp_dir().join("readitor_test_recent_b.md");
+        let b = std::env::temp_dir().join("editor_test_recent_b.md");
         std::fs::write(&b, "b\n").unwrap();
         let mut app = App::new(None).unwrap();
         let mut host = NullHost::default();
@@ -2744,7 +2744,7 @@ mod tests {
         );
         assert_eq!(menu.items[6].0, menu::Action::Header);
         assert_eq!(menu.items[7].0, menu::Action::Recent(0));
-        assert_eq!(menu.items[7].1, "readitor_test_recent_a.md");
+        assert_eq!(menu.items[7].1, "editor_test_recent_a.md");
         // Picking the second recent focuses that file's tab…
         app.run_menu_action(menu::Action::Recent(1), &mut host);
         assert_eq!(app.path.as_deref(), Some(b.as_path()));
@@ -2852,7 +2852,7 @@ mod tests {
     #[test]
     fn find_bar_in_preview_counts_and_jumps_to_the_row() {
         let text = format!("{}the needle\n", "filler row of text\n".repeat(80));
-        let mut app = open("readitor_test_findprev.txt", &text);
+        let mut app = open("editor_test_findprev.txt", &text);
         let _ = app.render_headless(400, 300, 1.0);
         let mut host = NullHost::default();
         app.on_event(ctrl('f'), &mut host);
@@ -2891,7 +2891,7 @@ mod tests {
                 lines.push(format!("line {i} bravo charlie delta echo"));
             }
         }
-        let mut app = open("readitor_test_findfast.txt", &lines.join("\n"));
+        let mut app = open("editor_test_findfast.txt", &lines.join("\n"));
         let _ = app.render_headless(1100, 800, 1.0);
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
@@ -3031,7 +3031,7 @@ mod tests {
 
     #[test]
     fn headless_render_draws_text_and_statusbar() {
-        let mut app = open("readitor_test_a.txt", "Hello Readitor\nsecond line");
+        let mut app = open("editor_test_a.txt", "Hello Editor\nsecond line");
         let c = app.render_headless(640, 400, 1.0);
         let bg = app.theme.bg.pack() | 0xFF00_0000;
         let dark_px = c.pixels[..640 * 372].iter().filter(|&&p| p != bg).count();
@@ -3056,10 +3056,7 @@ mod tests {
     #[test]
     fn json_renders_tinted_tree() {
         use crate::layout::display_list::DrawOp;
-        let mut app = open(
-            "readitor_test_b.json",
-            "{\"name\": \"readitor\", \"n\": 42}",
-        );
+        let mut app = open("editor_test_b.json", "{\"name\": \"editor\", \"n\": 42}");
         assert_eq!(app.kind, FileKind::Json);
         let c = app.render_headless(800, 600, 1.0);
         assert!(app.status_extra.is_empty(), "valid JSON flagged");
@@ -3085,7 +3082,7 @@ mod tests {
     #[test]
     fn invalid_json_shows_error_banner() {
         use crate::layout::display_list::DrawOp;
-        let mut app = open("readitor_test_c.json", "{\"a\": }");
+        let mut app = open("editor_test_c.json", "{\"a\": }");
         let c = app.render_headless(800, 600, 1.0);
         assert!(
             app.status_extra.contains("error"),
@@ -3107,7 +3104,7 @@ mod tests {
     #[test]
     fn clicking_toggle_collapses_tree() {
         let mut app = open(
-            "readitor_test_d.json",
+            "editor_test_d.json",
             "{\"a\": {\"b\": [1, 2, 3]}, \"c\": true}",
         );
         let _ = app.render_headless(800, 600, 1.0);
@@ -3149,7 +3146,7 @@ mod tests {
     #[test]
     fn untitled_tabs_switch_to_edit_mode() {
         // Closing the last tab leaves a fresh Untitled, which drops into Edit.
-        let mut app = open("readitor_test_untitled.txt", "hello");
+        let mut app = open("editor_test_untitled.txt", "hello");
         let mut host = NullHost::default();
         assert_eq!(app.mode, Mode::Preview);
         app.on_event(ctrl('w'), &mut host);
@@ -3158,7 +3155,7 @@ mod tests {
         // Give it content so the next open stacks a tab instead of replacing it.
         app.on_event(Event::Text("draft".into()), &mut host);
         app.mode = Mode::Preview; // as if the user flipped to Preview
-        let out = std::env::temp_dir().join("readitor_test_untitled2.txt");
+        let out = std::env::temp_dir().join("editor_test_untitled2.txt");
         std::fs::write(&out, "x").unwrap();
         app.open_path(out.clone(), &mut host);
         assert_eq!(app.path.as_ref(), Some(&out));
@@ -3183,7 +3180,7 @@ mod tests {
     #[test]
     fn markdown_renders_document() {
         let mut app = open(
-            "readitor_test_e.md",
+            "editor_test_e.md",
             "# Title\n\nHello **world**.\n\n- a\n- b\n",
         );
         assert_eq!(app.kind, FileKind::Markdown);
@@ -3199,7 +3196,7 @@ mod tests {
     #[test]
     fn new_kinds_render_with_status() {
         // CSV: table + row/col counts.
-        let mut app = open("readitor_test_kinds.csv", "a,b\n1,2\n3,4\n");
+        let mut app = open("editor_test_kinds.csv", "a,b\n1,2\n3,4\n");
         assert_eq!(app.kind, FileKind::Csv);
         let c = app.render_headless(800, 600, 1.0);
         assert!(app.status_extra.contains("2 rows"), "{}", app.status_extra);
@@ -3207,14 +3204,10 @@ mod tests {
         assert!(c.pixels.iter().filter(|&&p| p != bg).count() > 200);
         // Configs: tinted preview, clean bar.
         for (name, content, kind) in [
-            ("readitor_test_kinds.yaml", "port: 8080\n", FileKind::Yaml),
-            ("readitor_test_kinds.toml", "port = 8080\n", FileKind::Toml),
-            (
-                "readitor_test_kinds.ini",
-                "[s]\nport = 8080\n",
-                FileKind::Ini,
-            ),
-            ("readitor_test_kinds.rs", "fn main() {}\n", FileKind::Code),
+            ("editor_test_kinds.yaml", "port: 8080\n", FileKind::Yaml),
+            ("editor_test_kinds.toml", "port = 8080\n", FileKind::Toml),
+            ("editor_test_kinds.ini", "[s]\nport = 8080\n", FileKind::Ini),
+            ("editor_test_kinds.rs", "fn main() {}\n", FileKind::Code),
         ] {
             let mut app = open(name, content);
             assert_eq!(app.kind, kind);
@@ -3225,10 +3218,7 @@ mod tests {
             );
         }
         // Logs: level counts in the bar.
-        let mut app = open(
-            "readitor_test_kinds.log",
-            "INFO up\nERROR boom\nWARN slow\n",
-        );
+        let mut app = open("editor_test_kinds.log", "INFO up\nERROR boom\nWARN slow\n");
         assert_eq!(app.kind, FileKind::Log);
         let _ = app.render_headless(800, 600, 1.0);
         assert!(app.status_extra.contains("1 error"), "{}", app.status_extra);
@@ -3238,7 +3228,7 @@ mod tests {
     fn clicking_link_shows_href_in_status() {
         use crate::layout::display_list::HitAction;
         let mut app = open(
-            "readitor_test_f.md",
+            "editor_test_f.md",
             "See [example](https://example.com/x).\n",
         );
         let _ = app.render_headless(800, 600, 1.0);
@@ -3270,7 +3260,7 @@ mod tests {
 
     #[test]
     fn typing_edits_buffer_in_edit_mode() {
-        let mut app = open("readitor_test_g.txt", "hello");
+        let mut app = open("editor_test_g.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         assert_eq!(app.mode, Mode::Edit);
@@ -3287,7 +3277,7 @@ mod tests {
 
     #[test]
     fn typing_in_preview_mode_is_ignored() {
-        let mut app = open("readitor_test_h.txt", "hello");
+        let mut app = open("editor_test_h.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(Event::Text("X".into()), &mut host);
         assert_eq!(app.buffer.text(), "hello");
@@ -3296,7 +3286,7 @@ mod tests {
 
     #[test]
     fn enter_and_backspace_split_join_lines() {
-        let mut app = open("readitor_test_i.txt", "one two");
+        let mut app = open("editor_test_i.txt", "one two");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.editor.caret = Pos { line: 0, col: 3 };
@@ -3323,7 +3313,7 @@ mod tests {
 
     #[test]
     fn clipboard_copy_cut_paste_flow() {
-        let mut app = open("readitor_test_j.txt", "hello world");
+        let mut app = open("editor_test_j.txt", "hello world");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         let tab = &mut *app;
@@ -3339,17 +3329,17 @@ mod tests {
 
     #[test]
     fn save_marks_buffer_clean() {
-        let mut app = open("readitor_test_k.txt", "hello");
+        let mut app = open("editor_test_k.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(Event::Text("!".into()), &mut host);
         // The dirty marker lives on the tab's save button now, not the title.
         assert!(app.buffer.dirty);
-        assert_eq!(app.title(), "readitor_test_k.txt — Readitor");
+        assert_eq!(app.title(), "editor_test_k.txt — Editor");
         assert_eq!(app.buffer.text(), "!hello");
         app.on_event(ctrl('s'), &mut host);
         assert!(!app.buffer.dirty);
-        assert_eq!(app.title(), "readitor_test_k.txt — Readitor");
+        assert_eq!(app.title(), "editor_test_k.txt — Editor");
         assert_eq!(
             std::fs::read_to_string(app.path.as_ref().unwrap()).unwrap(),
             "!hello"
@@ -3372,21 +3362,21 @@ mod tests {
         assert!(app.buffer.dirty);
         assert_eq!(app.status_extra, "save cancelled");
         // Choosing a path writes the file and re-homes the tab.
-        let out = std::env::temp_dir().join("readitor_test_saveas.md");
+        let out = std::env::temp_dir().join("editor_test_saveas.md");
         let _ = std::fs::remove_file(&out);
         host.save_file = Some(out.clone());
         app.on_event(ctrl('s'), &mut host);
         assert_eq!(app.path.as_ref(), Some(&out));
         assert_eq!(app.kind, FileKind::Markdown, "kind follows the suffix");
         assert!(!app.buffer.dirty);
-        assert_eq!(app.title(), "readitor_test_saveas.md — Readitor");
+        assert_eq!(app.title(), "editor_test_saveas.md — Editor");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "draft");
         let _ = std::fs::remove_file(&out);
     }
 
     #[test]
     fn tab_save_button_saves_the_tab() {
-        let mut app = open("readitor_test_savebtn.txt", "hello");
+        let mut app = open("editor_test_savebtn.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(Event::Text("!".into()), &mut host);
@@ -3426,7 +3416,7 @@ mod tests {
         // The report: type, see the save button pop up, undo it all — and
         // the button stayed up. Dirty now means "differs from saved",
         // recomputed on every edit, so it clears again.
-        let mut app = open("readitor_test_undoclean.txt", "hello");
+        let mut app = open("editor_test_undoclean.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host); // Edit
         assert!(!app.buffer.dirty, "a just-opened file is clean");
@@ -3475,7 +3465,7 @@ mod tests {
             (open_btn.x - find_btn.right()).abs() < 8.0,
             "Open sits right of Find"
         );
-        let out = std::env::temp_dir().join("readitor_test_openbtn.txt");
+        let out = std::env::temp_dir().join("editor_test_openbtn.txt");
         std::fs::write(&out, "opened").unwrap();
         host.picked_file = Some(out.clone());
         app.on_event(
@@ -3493,7 +3483,7 @@ mod tests {
 
     #[test]
     fn arrow_keys_move_caret_in_edit_mode() {
-        let mut app = open("readitor_test_l.txt", "first\nsecond");
+        let mut app = open("editor_test_l.txt", "first\nsecond");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(
@@ -3516,7 +3506,7 @@ mod tests {
 
     #[test]
     fn shift_select_and_delete_selection() {
-        let mut app = open("readitor_test_m.txt", "abcdef");
+        let mut app = open("editor_test_m.txt", "abcdef");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(
@@ -3557,7 +3547,7 @@ mod tests {
 
     #[test]
     fn split_renders_both_panes_and_keeps_place() {
-        let mut app = open("readitor_test_n.txt", &"word line\n".repeat(40));
+        let mut app = open("editor_test_n.txt", &"word line\n".repeat(40));
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host); // Edit
         app.on_event(ctrl('e'), &mut host); // Split
@@ -3579,7 +3569,7 @@ mod tests {
     #[test]
     fn nested_toggles_collapse_and_reexpand() {
         let mut app = open(
-            "readitor_test_p.json",
+            "editor_test_p.json",
             "{\"a\":{\"x\":1},\"list\":[{\"in\":true}],\"s\":\"end\"}",
         );
         let _ = app.render_headless(800, 600, 1.0);
@@ -3633,8 +3623,8 @@ mod tests {
 
     #[test]
     fn tabs_open_dedupe_and_cycle() {
-        let mut app = open("readitor_test_q.txt", "one");
-        let second = std::env::temp_dir().join("readitor_test_r.md");
+        let mut app = open("editor_test_q.txt", "one");
+        let second = std::env::temp_dir().join("editor_test_r.md");
         std::fs::write(&second, "# two\n").unwrap();
         let mut host = NullHost::default();
         assert_eq!(app.tabs.len(), 1);
@@ -3677,7 +3667,7 @@ mod tests {
 
     #[test]
     fn close_tab_warns_when_dirty_then_discards() {
-        let mut app = open("readitor_test_s.txt", "keep me");
+        let mut app = open("editor_test_s.txt", "keep me");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(Event::Text("X".into()), &mut host);
@@ -3695,7 +3685,7 @@ mod tests {
     #[test]
     fn ctrl_o_opens_host_picked_file() {
         let mut app = App::new(None).unwrap();
-        let pick = std::env::temp_dir().join("readitor_test_t.json");
+        let pick = std::env::temp_dir().join("editor_test_t.json");
         std::fs::write(&pick, "{\"a\": 1}").unwrap();
         let mut host = NullHost {
             picked_file: Some(pick.clone()),
@@ -3713,7 +3703,7 @@ mod tests {
 
     #[test]
     fn help_overlay_toggles_and_click_closes() {
-        let mut app = open("readitor_test_u.txt", "hello");
+        let mut app = open("editor_test_u.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(
             Event::KeyDown {
@@ -3753,7 +3743,7 @@ mod tests {
 
     #[test]
     fn about_overlay_toggles_with_f2_and_closes() {
-        let mut app = open("readitor_test_ab.txt", "hello");
+        let mut app = open("editor_test_ab.txt", "hello");
         let mut host = NullHost::default();
         let f2 = || Event::KeyDown {
             key: Key::F(2),
@@ -3779,7 +3769,7 @@ mod tests {
 
     #[test]
     fn about_and_help_overlays_are_mutually_exclusive() {
-        let mut app = open("readitor_test_ab2.txt", "hello");
+        let mut app = open("editor_test_ab2.txt", "hello");
         let mut host = NullHost::default();
         let key = |k| Event::KeyDown {
             key: k,
@@ -3806,7 +3796,7 @@ mod tests {
 
     #[test]
     fn status_bar_about_button_opens_the_box() {
-        let mut app = open("readitor_test_ab3.txt", "hello");
+        let mut app = open("editor_test_ab3.txt", "hello");
         let mut host = NullHost::default();
         let _ = app.render_headless(900, 600, 1.0);
         let about = app
@@ -3828,7 +3818,7 @@ mod tests {
 
     #[test]
     fn menu_about_item_opens_the_box() {
-        let mut app = open("readitor_test_ab4.txt", "hello");
+        let mut app = open("editor_test_ab4.txt", "hello");
         let mut host = NullHost::default();
         let _ = app.render_headless(900, 600, 1.0);
         app.on_event(
@@ -3861,7 +3851,7 @@ mod tests {
 
     #[test]
     fn right_click_menu_copy_all_and_dismiss() {
-        let mut app = open("readitor_test_v.txt", "whole document");
+        let mut app = open("editor_test_v.txt", "whole document");
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         app.on_event(
@@ -3915,8 +3905,8 @@ mod tests {
 
     #[test]
     fn title_bar_clicks_switch_and_close_tabs() {
-        let mut app = open("readitor_test_w.txt", "one");
-        let second = std::env::temp_dir().join("readitor_test_x.txt");
+        let mut app = open("editor_test_w.txt", "one");
+        let second = std::env::temp_dir().join("editor_test_x.txt");
         std::fs::write(&second, "two").unwrap();
         let mut host = NullHost::default();
         app.on_event(Event::FileOpen(second), &mut host);
@@ -3948,7 +3938,7 @@ mod tests {
 
     #[test]
     fn cursor_shapes_over_panes_and_chrome() {
-        let mut app = open("readitor_test_y.json", "{\"a\": {\"b\": 1}, \"c\": [1, 2]}");
+        let mut app = open("editor_test_y.json", "{\"a\": {\"b\": 1}, \"c\": [1, 2]}");
         let _ = app.render_headless(800, 600, 1.0);
         // Hand over a tree toggle in Preview.
         let toggle = app.preview.list.hits[0].rect;
@@ -3969,7 +3959,7 @@ mod tests {
 
     #[test]
     fn caret_bar_paints_in_edit_mode() {
-        let mut app = open("readitor_test_caret.txt", "hello world");
+        let mut app = open("editor_test_caret.txt", "hello world");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         let c = app.render_headless(800, 600, 1.0);
@@ -3996,7 +3986,7 @@ mod tests {
 
     #[test]
     fn click_in_edit_pane_places_caret() {
-        let mut app = open("readitor_test_o.txt", &"second line of text\n".repeat(20));
+        let mut app = open("editor_test_o.txt", &"second line of text\n".repeat(20));
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         let _ = app.render_headless(800, 600, 1.0);
@@ -4024,7 +4014,7 @@ mod tests {
 
     #[test]
     fn preview_drag_selects_rows_and_copies() {
-        let mut app = open("readitor_test_sel.txt", "alpha\nbeta\ngamma\ndelta\n");
+        let mut app = open("editor_test_sel.txt", "alpha\nbeta\ngamma\ndelta\n");
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         assert!(app.preview_rows.len() >= 4, "want a row per line");
@@ -4061,7 +4051,7 @@ mod tests {
 
     #[test]
     fn status_bar_buttons_switch_modes_and_help() {
-        let mut app = open("readitor_test_sb.txt", "hello");
+        let mut app = open("editor_test_sb.txt", "hello");
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         let edit = app
@@ -4098,7 +4088,7 @@ mod tests {
 
     #[test]
     fn clean_file_reloads_when_changed_on_disk() {
-        let path = std::env::temp_dir().join("readitor_test_rc.txt");
+        let path = std::env::temp_dir().join("editor_test_rc.txt");
         std::fs::write(&path, "original").unwrap();
         let mut app = App::new(Some(path.clone())).unwrap();
         let mut host = NullHost::default();
@@ -4118,7 +4108,7 @@ mod tests {
 
     #[test]
     fn dirty_file_gets_reload_hint_not_silent_reload() {
-        let path = std::env::temp_dir().join("readitor_test_rh.txt");
+        let path = std::env::temp_dir().join("editor_test_rh.txt");
         std::fs::write(&path, "original").unwrap();
         let mut app = App::new(Some(path.clone())).unwrap();
         let mut host = NullHost::default();
@@ -4140,7 +4130,7 @@ mod tests {
 
     #[test]
     fn theme_follows_os_until_manual_override() {
-        let mut app = open("readitor_test_theme.txt", "hello");
+        let mut app = open("editor_test_theme.txt", "hello");
         let mut host = NullHost::default();
         assert!(!app.dark);
         app.on_event(Event::ThemeChanged { dark: true }, &mut host);
@@ -4154,7 +4144,7 @@ mod tests {
 
     #[test]
     fn tick_auto_scrolls_editor_drag() {
-        let mut app = open("readitor_test_tick.txt", &"line\n".repeat(200));
+        let mut app = open("editor_test_tick.txt", &"line\n".repeat(200));
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         let _ = app.render_headless(800, 600, 1.0);
@@ -4176,7 +4166,7 @@ mod tests {
 
     #[test]
     fn caret_blinks_on_tick_and_resets_on_activity() {
-        let mut app = open("readitor_test_blink.txt", "hello");
+        let mut app = open("editor_test_blink.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         assert!(app.caret_visible(), "caret starts solid");
@@ -4215,7 +4205,7 @@ mod tests {
 
     #[test]
     fn theme_button_toggles_dark() {
-        let mut app = open("readitor_test_themebtn.txt", "hello");
+        let mut app = open("editor_test_themebtn.txt", "hello");
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         let btn = app
@@ -4255,7 +4245,7 @@ mod tests {
 
     #[test]
     fn split_panes_are_half_half_with_divider() {
-        let mut app = open("readitor_test_splitdiv.txt", "hello");
+        let mut app = open("editor_test_splitdiv.txt", "hello");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(ctrl('e'), &mut host); // Split
@@ -4278,10 +4268,7 @@ mod tests {
     fn split_preview_wraps_at_pane_width() {
         // A long single line: in Split the preview column must fit the left
         // pane (it used to lay out at the full window width and clip).
-        let mut app = open(
-            "readitor_test_splitwrap.txt",
-            "word ".repeat(120).trim_end(),
-        );
+        let mut app = open("editor_test_splitwrap.txt", "word ".repeat(120).trim_end());
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(ctrl('e'), &mut host); // Split
@@ -4344,7 +4331,7 @@ mod tests {
         // The report: with a long preview the shared pixel offset sailed the
         // short editor pane past its own end (phantom gutter rows, pinned
         // thumb). Each pane now paints its own share of one ratio.
-        let mut app = open_long_preview("readitor_test_splitratio.md");
+        let mut app = open_long_preview("editor_test_splitratio.md");
         let _ = app.render_headless(1000, 700, 1.0);
         assert!(
             app.preview_max() > app.editor_max() * 1.5,
@@ -4397,7 +4384,7 @@ mod tests {
     fn split_thumb_drag_drives_both_panes_by_ratio() {
         // Dragging either thumb sets the shared ratio, so the other pane
         // follows: grab the short editor bar and pull it to the bottom.
-        let mut app = open_long_preview("readitor_test_splitdrag.md");
+        let mut app = open_long_preview("editor_test_splitdrag.md");
         let mut host = NullHost::default();
         let _ = app.render_headless(1000, 700, 1.0);
         let g = app.sb_geom(true, false).expect("editor bar");
@@ -4468,7 +4455,7 @@ mod tests {
         // fixed 820 px measure however wide the window got, so maximizing left
         // most of the screen empty instead of reflowing the text into it.
         let mut app = open(
-            "readitor_test_column.txt",
+            "editor_test_column.txt",
             &format!("# Wide\n\n{}\n", "word ".repeat(400)),
         );
         let _ = app.render_headless(1100, 800, 1.0);
@@ -4502,7 +4489,7 @@ mod tests {
         let doc = (0..1200)
             .map(|i| format!("## Section {i}\n\n{body}\n"))
             .collect::<String>();
-        let mut app = open("readitor_bench.md", &doc);
+        let mut app = open("editor_bench.md", &doc);
         let mut host = NullHost::default();
         for (w, h) in [(1100usize, 800usize), (1920, 1168)] {
             let _ = app.render_headless(w, h, 1.0);
@@ -4537,7 +4524,7 @@ mod tests {
     #[test]
     fn cursor_over_scrollbars_is_arrow_not_ibeam() {
         let mut app = open(
-            "readitor_test_sbcur.txt",
+            "editor_test_sbcur.txt",
             &"long line without scrolling\n".repeat(60),
         );
         app.on_event(ctrl('e'), &mut NullHost::default()); // Edit (=> editor pane)
@@ -4559,7 +4546,7 @@ mod tests {
         );
         // Horizontal bar zone (long line in Edit => h_max > 0). One file:
         // re-use with a wide line via a fresh tab.
-        let wide = std::env::temp_dir().join("readitor_test_sbcursor_h.txt");
+        let wide = std::env::temp_dir().join("editor_test_sbcursor_h.txt");
         std::fs::write(&wide, format!("x{}", "y".repeat(300))).unwrap();
         app.open_path(wide, &mut NullHost::default());
         let _ = app.render_headless(800, 600, 1.0);
@@ -4581,7 +4568,7 @@ mod tests {
     #[test]
     fn editor_does_not_wrap_and_scrolls_horizontally() {
         let long = format!("{} end", "word ".repeat(200));
-        let mut app = open("readitor_test_nw.txt", &long);
+        let mut app = open("editor_test_nw.txt", &long);
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host); // Edit
         let _ = app.render_headless(600, 400, 1.0);
@@ -4668,7 +4655,7 @@ mod tests {
         // The report: the horizontal bar felt choppy next to the vertical
         // one, because every tilt landed in one jump while vertical notches
         // glide. Same easing, same clock discipline now.
-        let (mut app, mut host) = open_wide("readitor_test_hglide.txt");
+        let (mut app, mut host) = open_wide("editor_test_hglide.txt");
         app.on_event(Event::Scroll { dx: -90.0, dy: 0.0 }, &mut host);
         assert_eq!(app.h_scroll, 0.0, "a tilt must not land in one jump");
         assert_eq!(app.h_target, 90.0);
@@ -4702,7 +4689,7 @@ mod tests {
     fn fine_horizontal_tilt_applies_directly() {
         // Trackpad-grade deltas are already smooth: gliding them would only
         // add latency, exactly like the vertical fine path.
-        let (mut app, mut host) = open_wide("readitor_test_hfine.txt");
+        let (mut app, mut host) = open_wide("editor_test_hfine.txt");
         app.on_event(Event::Scroll { dx: -3.0, dy: 0.0 }, &mut host);
         assert_eq!(app.h_scroll, 3.0);
         assert_eq!(app.h_target, 3.0);
@@ -4713,7 +4700,7 @@ mod tests {
     fn touch_pan_stays_on_the_finger_and_ends_the_h_glide() {
         // A finger landing mid-glide takes the view over horizontally too:
         // the tilt's leftover travel is dropped, not resumed under the finger.
-        let (mut app, mut host) = open_wide("readitor_test_hpan.txt");
+        let (mut app, mut host) = open_wide("editor_test_hpan.txt");
         app.on_event(Event::Scroll { dx: -90.0, dy: 0.0 }, &mut host);
         assert!(app.scrolling);
         app.on_event(Event::Pan { dx: -17.0, dy: 0.0 }, &mut host);
@@ -4724,7 +4711,7 @@ mod tests {
     #[test]
     fn horizontal_thumb_drag_tracks_the_pointer_exactly() {
         // Pointer-driven input never glides: the thumb is the pointer.
-        let (mut app, mut host) = open_wide("readitor_test_hdrag.txt");
+        let (mut app, mut host) = open_wide("editor_test_hdrag.txt");
         let g = app.sb_geom(true, true).expect("horizontal bar");
         app.on_event(
             Event::MouseDown {
@@ -4752,7 +4739,7 @@ mod tests {
     fn h_glide_target_clamps_when_the_line_shrinks() {
         // A relayout or frame that narrows the range must not leave the
         // target unreachable past the end.
-        let (mut app, mut host) = open_wide("readitor_test_hclamp.txt");
+        let (mut app, mut host) = open_wide("editor_test_hclamp.txt");
         app.h_scroll = app.h_max - 100.0;
         app.h_target = app.h_max + 500.0;
         app.scrolling = true;
@@ -4774,7 +4761,7 @@ mod tests {
 
     #[test]
     fn preview_still_wraps_in_split() {
-        let mut app = open("readitor_test_pw.txt", "word ".repeat(120).trim_end());
+        let mut app = open("editor_test_pw.txt", "word ".repeat(120).trim_end());
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         app.on_event(ctrl('e'), &mut host); // Split
@@ -4799,7 +4786,7 @@ mod tests {
         // One block per paragraph guarantees a document taller than any pane.
         let content = "a paragraph of text\n\n".repeat(120);
         for (presses, mode) in [(0u8, Mode::Preview), (1, Mode::Edit), (2, Mode::Split)] {
-            let mut app = open("readitor_test_sbedge.txt", &content);
+            let mut app = open("editor_test_sbedge.txt", &content);
             let mut host = NullHost::default();
             for _ in 0..presses {
                 app.on_event(ctrl('e'), &mut host); // Preview -> Edit -> Split
@@ -4915,7 +4902,7 @@ mod tests {
         let near_edge = w as f32 - 1.0;
         // A document that fits: no bar at all, so the whole edge is resizable
         // at the platform's full band rather than the bar-safe share.
-        let mut short = open("readitor_test_grip.txt", "one short line\n");
+        let mut short = open("editor_test_grip.txt", "one short line\n");
         let _ = short.render_headless(w, h, 1.0);
         assert!(
             short.sb_geom(false, false).is_none(),
@@ -4928,7 +4915,7 @@ mod tests {
         );
         let content = "a paragraph of text\n\n".repeat(120);
         for (presses, mode) in [(0u8, Mode::Preview), (1, Mode::Edit), (2, Mode::Split)] {
-            let mut app = open("readitor_test_grip2.txt", &content);
+            let mut app = open("editor_test_grip2.txt", &content);
             let mut host = NullHost::default();
             for _ in 0..presses {
                 app.on_event(ctrl('e'), &mut host); // Preview -> Edit -> Split
@@ -4993,7 +4980,7 @@ mod tests {
         // one frame is four or five visible jumps. Nothing moves on the
         // notch's own frame, the host is asked for a clock fast enough to
         // animate on, and the travel arrives over several frames.
-        let mut app = open("readitor_test_glide.txt", &"line\n".repeat(400));
+        let mut app = open("editor_test_glide.txt", &"line\n".repeat(400));
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         assert_eq!(app.scroll.offset, 0.0);
@@ -5031,7 +5018,7 @@ mod tests {
 
     #[test]
     fn a_finger_pan_follows_the_input_and_drops_a_glide() {
-        let mut app = open("readitor_test_pan.txt", &"line\n".repeat(400));
+        let mut app = open("editor_test_pan.txt", &"line\n".repeat(400));
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         // Direct manipulation tracks the input exactly: gliding a finger's own
@@ -5062,7 +5049,7 @@ mod tests {
         // PanEnd carries the finger's release velocity; the app hands it to
         // the scroller and runs the frame clock, and the view keeps moving
         // with no further input until the momentum is spent.
-        let mut app = open("readitor_test_fling.txt", &"line\n".repeat(400));
+        let mut app = open("editor_test_fling.txt", &"line\n".repeat(400));
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         // Drag down (dy < 0 → content down … see Pan's sign) then lift with
@@ -5104,7 +5091,7 @@ mod tests {
     fn a_release_that_held_still_stops_the_ride() {
         // The finger arrived, paused, then lifted: ~0 velocity, no coast. The
         // clock ends and the view stays exactly where the finger left it.
-        let mut app = open("readitor_test_stop.txt", &"line\n".repeat(400));
+        let mut app = open("editor_test_stop.txt", &"line\n".repeat(400));
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         app.on_event(Event::Pan { dx: 0.0, dy: -30.0 }, &mut host);
@@ -5120,7 +5107,7 @@ mod tests {
         // Mid-coast, the wheel speaks: the ride must end and the glide start
         // *from where the view now is* — a glide to the coast's stale target
         // would yank the view backwards under the user's hand.
-        let mut app = open("readitor_test_wc.txt", &"line\n".repeat(400));
+        let mut app = open("editor_test_wc.txt", &"line\n".repeat(400));
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         app.on_event(Event::PanEnd { vx: 0.0, vy: -2.0 }, &mut host);
@@ -5144,7 +5131,7 @@ mod tests {
 
     #[test]
     fn scrollbar_thumb_drag_scrolls() {
-        let mut app = open("readitor_test_sbd.txt", &"line\n".repeat(200));
+        let mut app = open("editor_test_sbd.txt", &"line\n".repeat(200));
         let _ = app.render_headless(800, 600, 1.0);
         let area = app.viewport();
         let g = app
@@ -5207,7 +5194,7 @@ mod tests {
         // *before* maximizing: a maximized report carries the work area, and
         // restoring that would hand back a screen-sized window as soon as it
         // was un-maximized.
-        let mut app = open("readitor_test_win.txt", "hello\n");
+        let mut app = open("editor_test_win.txt", "hello\n");
         let mut host = NullHost::default();
         let normal = WindowGeometry {
             x: -1200,
@@ -5254,7 +5241,7 @@ mod tests {
         // `persist` runs from many places, but the window's rect is only
         // readable while the window exists, so the way *out* is the one that
         // has to write the last one.
-        let mut app = open("readitor_test_quit.txt", "hello\n");
+        let mut app = open("editor_test_quit.txt", "hello\n");
         let mut host = NullHost::default();
         app.on_event(
             Event::WindowGeometry(WindowGeometry {
@@ -5288,7 +5275,7 @@ mod tests {
         // or a power cut never gets there — so the heartbeat has to write a
         // reported geometry on its own, or the next launch reopens at the rect
         // of the last *clean* exit.
-        let mut app = open("readitor_test_geom_beat.txt", "hello\n");
+        let mut app = open("editor_test_geom_beat.txt", "hello\n");
         let mut host = NullHost::default();
         app.on_event(
             Event::WindowGeometry(geometry(300, 200, 900, 700)),
@@ -5313,7 +5300,7 @@ mod tests {
         // change the window manager echoes back). If every report restarted
         // the wait, a window that only ever re-reported would never reach the
         // file at all.
-        let mut app = open("readitor_test_geom_repeat.txt", "hello\n");
+        let mut app = open("editor_test_geom_repeat.txt", "hello\n");
         let mut host = NullHost::default();
         let g = geometry(10, 20, 800, 600);
         app.on_event(Event::WindowGeometry(g), &mut host);
@@ -5333,7 +5320,7 @@ mod tests {
         // A move reports every intermediate rect. Each one defers the write
         // (so a long drag is not a write per frame), and the one that lands is
         // the rect the gesture ended on.
-        let mut app = open("readitor_test_geom_drag.txt", "hello\n");
+        let mut app = open("editor_test_geom_drag.txt", "hello\n");
         let mut host = NullHost::default();
         for i in 0..6 {
             app.on_event(
@@ -5361,7 +5348,7 @@ mod tests {
         // without changing the rect it reopens at, so the change has to be
         // queued on its own — the rect of a maximized report is the work area,
         // which must not replace the one to restore.
-        let mut app = open("readitor_test_geom_max.txt", "hello\n");
+        let mut app = open("editor_test_geom_max.txt", "hello\n");
         let mut host = NullHost::default();
         app.restore_window(Some((120, 80, 1100, 800)), false);
         app.on_event(
@@ -5380,7 +5367,7 @@ mod tests {
         assert!(app.settings().maximized);
         // A first report that only confirms the restored state is not a change,
         // so a session reopened maximized does not rewrite itself on launch.
-        let mut again = open("readitor_test_geom_max2.txt", "hello\n");
+        let mut again = open("editor_test_geom_max2.txt", "hello\n");
         again.restore_window(Some((120, 80, 1100, 800)), true);
         again.on_event(
             Event::WindowGeometry(WindowGeometry {
@@ -5394,7 +5381,7 @@ mod tests {
 
     #[test]
     fn a_saved_window_is_what_the_platform_is_asked_to_open_at() {
-        let mut app = open("readitor_test_win2.txt", "hello\n");
+        let mut app = open("editor_test_win2.txt", "hello\n");
         let mut host = NullHost::default();
         // Nothing saved yet (a first run): the platform places the window.
         assert_eq!(app.initial_window(), None);
@@ -5414,7 +5401,7 @@ mod tests {
         let round_tripped = app.settings();
         assert_eq!(round_tripped.window, Some((120, 80, 1100, 800)));
         assert!(round_tripped.maximized);
-        let mut next = open("readitor_test_win3.txt", "hello\n");
+        let mut next = open("editor_test_win3.txt", "hello\n");
         next.restore_window(round_tripped.window, round_tripped.maximized);
         next.on_event(
             Event::WindowGeometry(WindowGeometry {
@@ -5448,7 +5435,7 @@ mod tests {
         // scrolling on every move with no button held, until a later click
         // happened to free it. The click that starts the next gesture is where
         // that has to end, so a stranded drag can never outlive one press.
-        let mut app = open("readitor_test_stranded.txt", &"line\n".repeat(200));
+        let mut app = open("editor_test_stranded.txt", &"line\n".repeat(200));
         let mut host = NullHost::default();
         let _ = app.render_headless(800, 600, 1.0);
         let area = app.viewport();
@@ -5506,7 +5493,7 @@ mod tests {
 
     #[test]
     fn gutter_click_does_not_place_caret() {
-        let mut app = open("readitor_test_gut.txt", "hello world\nsecond line");
+        let mut app = open("editor_test_gut.txt", "hello world\nsecond line");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         let _ = app.render_headless(800, 600, 1.0);
@@ -5535,7 +5522,7 @@ mod tests {
 
     #[test]
     fn double_and_triple_click_select_word_and_line() {
-        let mut app = open("readitor_test_dbl.txt", "hello world\nsecond line");
+        let mut app = open("editor_test_dbl.txt", "hello world\nsecond line");
         let mut host = NullHost::default();
         app.on_event(ctrl('e'), &mut host);
         let _ = app.render_headless(800, 600, 1.0);
