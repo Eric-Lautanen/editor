@@ -65,14 +65,19 @@ impl Find {
         }
     }
 
-    /// Land on the first match at or after `from` (the caret), so extending
-    /// the query keeps the current match instead of teleporting back to the
-    /// top of the document.
+    /// Land on the match under the caret, so extending the query keeps the
+    /// current match instead of teleporting. `find_jump` leaves the caret at
+    /// the END of the current match, so comparing match starts alone skips
+    /// forward one match per keystroke — and once that lands below the fold,
+    /// `follow_caret` scrolls the view (the runtime probe caught exactly
+    /// that). Falls back to the first match at or after `from` when the
+    /// caret sits outside every match.
     fn land(&mut self, from: Pos) {
         self.current = self
             .matches
             .iter()
-            .position(|&(a, _)| a >= from)
+            .position(|&(a, b)| a <= from && from <= b)
+            .or_else(|| self.matches.iter().position(|&(a, _)| a >= from))
             .unwrap_or(0);
     }
 
@@ -339,15 +344,22 @@ mod tests {
     }
 
     #[test]
-    fn refresh_lands_on_the_first_match_at_or_after_the_caret() {
-        let buf = Buffer::from_text("one two\nthree one\none");
+    fn refresh_lands_on_the_match_under_the_caret() {
+        let buf = Buffer::from_text("one two\nthree one\none\nzz");
         let mut f = Find {
             query: "one".into(),
             ..Default::default()
         };
+        // Between matches: the first match at or after the caret.
         f.refresh(&buf, Pos { line: 1, col: 0 });
         assert_eq!(f.current, 1, "skips the match on line 0");
-        f.refresh(&buf, buf.end());
+        // At a match's end — where `find_jump` leaves the caret after
+        // showing a match — that match wins, so typing extends the query
+        // without the selection skipping ahead one match per keystroke.
+        f.refresh(&buf, Pos { line: 2, col: 3 });
+        assert_eq!(f.current, 2, "the match under the caret keeps it");
+        // Past every match wraps to the first.
+        f.refresh(&buf, Pos { line: 3, col: 0 });
         assert_eq!(f.current, 0, "past the last match wraps to the first");
     }
 

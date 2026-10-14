@@ -2876,6 +2876,43 @@ mod tests {
     }
 
     #[test]
+    fn typing_in_the_find_bar_keeps_the_current_match_and_view_still() {
+        // The runtime probe caught the view jumping while a query was typed
+        // quickly: `Find::land` compared match STARTS against the caret,
+        // which `find_jump` puts at the current match's END, so every
+        // keystroke skipped ahead one match — and once that landed below the
+        // fold, `follow_caret` scrolled. One Text event per character is
+        // exactly what WM_CHAR delivers.
+        let mut lines = vec!["find probe document".to_string()];
+        for i in 1..=300u32 {
+            if i % 10 == 5 {
+                lines.push(format!("alpha marker {i}"));
+            } else {
+                lines.push(format!("line {i} bravo charlie delta echo"));
+            }
+        }
+        let mut app = open("readitor_test_findfast.txt", &lines.join("\n"));
+        let _ = app.render_headless(1100, 800, 1.0);
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host);
+        let _ = app.render_headless(1100, 800, 1.0);
+        app.on_event(ctrl('f'), &mut host);
+        for ch in "alpha".chars() {
+            app.on_event(Event::Text(ch.to_string()), &mut host);
+            assert_eq!(
+                app.find.as_ref().unwrap().current,
+                0,
+                "typing '{ch}' must keep the current match"
+            );
+        }
+        assert_eq!(app.editor.caret.line, 5, "the selection stays on the match");
+        assert_eq!(
+            app.scroll.offset, 0.0,
+            "typing in the find bar must not scroll the editor"
+        );
+    }
+
+    #[test]
     fn find_button_and_bar_close_button_toggle_the_bar() {
         let mut app = App::new(None).unwrap();
         let mut host = NullHost::default();

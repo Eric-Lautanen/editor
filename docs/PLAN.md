@@ -856,6 +856,28 @@ survived restarts (theme, mode, tabs); the window did not.
   The preview's find jump reuses one lowercase scratch buffer across rows for the same
   reason. 330 tests, `clippy --all-targets` and `rustfmt --check` clean.
 
+### M10 find round 3 (Oct 2026) — real-window probe + the land fix, 331 tests green
+
+- **A runtime probe for the find bar** (`tools/find_probe.ps1`): launches a release build
+  on a generated document and drives it through the same window proc the OS uses
+  (PostMessage `WM_CHAR`/`WM_KEYDOWN`/`WM_LBUTTONDOWN` — SendInput needs a foreground
+  window, and this desktop has none while locked), verifying each step by pixel-diffing
+  PrintWindow captures. The status-bar buttons are located by pixel analysis (the bar's
+  text clusters; the block is right-aligned in a known order), not hardcoded x. Twelve
+  checks: window renders, buttons found, Edit switch, bar appears, tints drawn, count
+  updates, narrowing clears tints and drops the count, backspace restores, bar closes,
+  strip returns to its pre-bar look, Enter advances the match. All 12 pass.
+- **The probe caught a real bug**: `Find::land` compared match *starts* against the
+  caret, but `find_jump` leaves the caret at the current match's *end* — so every
+  keystroke extended the query and skipped the selection ahead one match (line 5 → 15 →
+  25 → 35 while typing "alpha"), and once that landed below the fold `follow_caret`
+  scrolled the view mid-word. `land` now prefers the match *containing* the caret and
+  falls back to the first match at or after it, so typing keeps the selection put and
+  the view still. `tools/find_dump_diff.py` (kept) analyses probe dumps offline.
+- Tests: the typing sequence keeps `current` on the first match with the view at offset
+  0; `land` keeps the match under the caret, wraps past the last. 331 tests,
+  `clippy --all-targets` and `rustfmt --check` clean; all three platform cfgs compile.
+
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the
   published copy — keep them in sync until one is declared canonical (suggest: root wins, M10).
