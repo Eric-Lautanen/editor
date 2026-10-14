@@ -338,6 +338,44 @@ pub fn selection_rects(
     rects
 }
 
+/// Highlight rectangles for many ranges at once (the find bar's matches) on
+/// the no-wrap editor grid: one row per line, so each range is a single
+/// horizontal band and only the matched characters are measured — the cost
+/// follows the match count, not the document size. `ranges` must be sorted
+/// in reading order and non-overlapping (find's matches are both).
+pub fn match_rects(buf: &Buffer, ranges: &[(Pos, Pos)], viewport_w: f32, ctx: &Ctx) -> Vec<Rect> {
+    let p = plain_params(viewport_w, ctx, false);
+    let mut rects = Vec::new();
+    for &(from, to) in ranges {
+        let (from, to) = if from <= to { (from, to) } else { (to, from) };
+        if from == to || from.line != to.line {
+            continue;
+        }
+        let line = buf.line(from.line);
+        let exp = expand_line(line);
+        let y = p.pad + from.line as f32 * p.line_h;
+        let x0 = exp_x(&exp, line, from.col, ctx, p.size);
+        let x1 = exp_x(&exp, line, to.col, ctx, p.size);
+        if x1 > x0 {
+            rects.push(Rect::new(p.x0 + x0, y, (x1 - x0).max(2.0), p.line_h));
+        }
+    }
+    rects
+}
+
+/// Document-space x of a byte column on an expanded (tabs -> 4 spaces) line.
+fn exp_x(exp: &ExpLine, line: &str, ob: usize, ctx: &Ctx, size: f32) -> f32 {
+    let eb = orig_to_exp(line, ob);
+    let mut w = 0.0;
+    for k in 0..exp.chars.len() {
+        if exp.byte_at[k] >= eb {
+            break;
+        }
+        w += advance_of(ctx, exp.chars[k], size);
+    }
+    w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

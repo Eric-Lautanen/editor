@@ -818,6 +818,38 @@ survived restarts (theme, mode, tabs); the window did not.
 - M10 is feature-complete; what remains are the runtime passes (real-window test, Linux
   X11, macOS) tracked above.
 
+### M10 find round 2 (Oct 2026) — touch + responsiveness, 329 tests green
+- **The bar grew a × close button** (`ui/find.rs`): a 32 px zone flush with the bar's right
+  edge (the bar itself is taller now), Hand cursor, closes on press. `close_rect` is pure
+  like `bar_rect`, so painting and hit-testing agree.
+- **Typing no longer rescans the buffer** (`ui/find.rs`): every match of the longer query
+  starts where a match of the shorter one did, so appending chars *narrows* the previous
+  match list (`Find::refresh`, O(matches)) instead of rescanning (`Find::rescan`,
+  O(buffer)). Backspace and content/tab changes still rescan — a shorter query's matches
+  are a superset, and a stale list must never be trusted. The scan itself reuses one
+  scratch buffer across lines instead of allocating per line.
+- **Match tints are one pass** (`layout/text.rs::match_rects`): the editor pane never
+  wraps, so each match is a single horizontal band and only the matched characters are
+  measured — the paint cost follows the match count, not the document size (it was one
+  whole-buffer `selection_rects` call per visible match).
+- **A Find button on the status bar** (`ui/statusbar.rs`, `app.rs`): leftmost, next to
+  Open, toggling the bar for touch users; the bar's × and Escape still close it.
+- **Touch targets everywhere**: status-bar buttons hit-test at the full bar height (the
+  pill still paints inset), the tab close/save zones are 20 px and the tab's full height,
+  and the find bar's × is 32 px wide.
+- **Double-tap drag-select** (`app.rs`): a double-tap selects the word (it always did —
+  taps promote to clicks); a finger that pans within ~1 s of the tap now *extends the
+  selection* instead of scrolling, riding a virtual pointer from the tap spot (a moving
+  finger reports `Pan`, never `MouseMove`). `PanEnd` retires the gesture with no coast —
+  a selection drag is not a flick. A later drag scrolls as before.
+- **A Copy button on the status bar** (`ui/statusbar.rs`, `app.rs`): far left, only while
+  a selection exists (editor selection or preview rows), accent-tinted, full bar height;
+  pressing it copies and says "copied" in the status text.
+- Tests: narrowing equals the full search (append, append, backspace, edit-then-rescan),
+  the × and Find button toggle the bar, double-tap-drag extends without scrolling or
+  coasting, the Copy button appears with a selection and copies. 329 tests,
+  `clippy --all-targets` and `rustfmt --check` clean.
+
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the
   published copy — keep them in sync until one is declared canonical (suggest: root wins, M10).

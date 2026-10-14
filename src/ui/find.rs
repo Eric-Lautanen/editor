@@ -25,14 +25,50 @@ pub struct Find {
     pub matches: Vec<(Pos, Pos)>,
     /// Index into `matches` of the current match.
     pub current: usize,
+    /// Byte length of the query `matches` was computed for. Typing extends
+    /// the query a char at a time, and every match of the longer query starts
+    /// where a match of the shorter one did — so the common case narrows the
+    /// old list instead of rescanning the buffer (see [`Find::refresh`]).
+    matched: usize,
 }
 
 impl Find {
-    /// Recompute the matches for `buf` and land on the first one at or after
-    /// `from` (the caret), so extending the query keeps the current match
-    /// instead of teleporting back to the top of the document.
-    pub fn refresh(&mut self, buf: &Buffer, from: Pos) {
+    /// Full rescan: the buffer, tab, or view changed, so the match list
+    /// cannot be trusted. `relayout` and a fresh query go through here.
+    pub fn rescan(&mut self, buf: &Buffer, from: Pos) {
         self.matches = search(buf, &self.query);
+        self.matched = self.query.len();
+        self.land(from);
+    }
+
+    /// Live update from typing. When the query only grew, the new matches
+    /// start where the old ones did, so each old match is extended by the
+    /// appended chars — O(matches), not O(buffer). Anything else (a fresh
+    /// query, a backspace) falls back to [`Self::rescan`].
+    pub fn refresh(&mut self, buf: &Buffer, from: Pos) {
+        if self.matched > 0
+            && self.query.len() > self.matched
+            && self.query.is_char_boundary(self.matched)
+        {
+            let ext: Vec<char> = self.query[self.matched..].chars().collect();
+            let mut narrowed = Vec::with_capacity(self.matches.len());
+            for &(a, b) in &self.matches {
+                if let Some(end) = extend_match(buf, a, b, &ext) {
+                    narrowed.push((a, end));
+                }
+            }
+            self.matches = narrowed;
+            self.matched = self.query.len();
+            self.land(from);
+        } else {
+            self.rescan(buf, from);
+        }
+    }
+
+    /// Land on the first match at or after `from` (the caret), so extending
+    /// the query keeps the current match instead of teleporting back to the
+    /// top of the document.
+    fn land(&mut self, from: Pos) {
         self.current = self
             .matches
             .iter()
@@ -71,6 +107,24 @@ impl Find {
     }
 }
 
+/// The tail of an old match must equal the appended query chars for the match
+/// to survive the longer query; returns its new end. Case-insensitive the
+/// same way typing is: per char, full lowercase expansions must agree. (A
+/// rescan can still find matches whose foldings *interlock* — ß vs "ss" —
+/// that this per-char compare drops; those need the whole-needle scan and
+/// are vanishingly rare.)
+fn extend_match(buf: &Buffer, a: Pos, b: Pos, ext: &[char]) -> Option<Pos> {
+    let mut col = b.col;
+    for &n in ext {
+        let h = buf.line(a.line)[col..].chars().next()?;
+        if !n.to_lowercase().eq(h.to_lowercase()) {
+            return None;
+        }
+        col += h.len_utf8();
+    }
+    Some(Pos { line: a.line, col })
+}
+
 /// Case-insensitive substring matches of `query` in `buf`, in reading order.
 /// A match never spans a newline: find is line-oriented for v1.
 pub fn search(buf: &Buffer, query: &str) -> Vec<(Pos, Pos)> {
@@ -79,8 +133,12 @@ pub fn search(buf: &Buffer, query: &str) -> Vec<(Pos, Pos)> {
         return Vec::new();
     }
     let mut out = Vec::new();
+    // One scratch buffer for every line: the scan is whole-buffer, so
+    // per-line allocation is the difference between churning the heap for
+    // every line of a big file and not.
+    let mut hay = Vec::with_capacity(64);
     for line in 0..buf.line_count() {
-        for (start, end) in search_line(buf.line(line), &needle) {
+        for (start, end) in search_line(buf.line(line), &needle, &mut hay) {
             out.push((Pos { line, col: start }, Pos { line, col: end }));
         }
     }
@@ -88,11 +146,13 @@ pub fn search(buf: &Buffer, query: &str) -> Vec<(Pos, Pos)> {
 }
 
 /// Byte ranges of the non-overlapping matches of `needle` (lowercased chars)
-/// in `line`. Each haystack char is tagged with the byte offset of the char
-/// it was folded from, so columns stay on char boundaries even when case
-/// folding expands (İ -> "i" + combining dot).
-fn search_line(line: &str, needle: &[char]) -> Vec<(usize, usize)> {
-    let mut hay: Vec<(usize, char)> = Vec::with_capacity(line.len());
+/// in `line`, written into the reusable `hay` scratch. Each haystack char is
+/// tagged with the byte offset of the char it was folded from, so columns
+/// stay on char boundaries even when case folding expands (İ -> "i" +
+/// combining dot).
+fn search_line(line: &str, needle: &[char], hay: &mut Vec<(usize, char)>) -> Vec<(usize, usize)> {
+    hay.clear();
+    hay.reserve(line.len());
     for (i, ch) in line.char_indices() {
         for lc in ch.to_lowercase() {
             hay.push((i, lc));
@@ -124,10 +184,13 @@ fn search_line(line: &str, needle: &[char]) -> Vec<(usize, usize)> {
 
 // ------------------------------------------------------------- the bar
 
-/// Bar height and insets, logical px before `scale`.
-const BAR_H: f32 = 30.0;
+/// Bar height and insets, logical px before `scale`. Tall enough that the ×
+/// is a comfortable finger target.
+const BAR_H: f32 = 34.0;
 const BAR_PAD: f32 = 10.0;
 const TEXT_SIZE: f32 = 12.5;
+/// The × close zone at the bar's right edge, logical px — wide for a finger.
+const CLOSE_W: f32 = 32.0;
 
 /// The bar rect for the current query/status: docked at the viewport's
 /// top-right. Pure, so hit-testing and painting always agree.
@@ -140,7 +203,7 @@ pub fn bar_rect(fonts: &FontSystem, view: Rect, scale: f32, query: &str, status:
         .measure(FontStyle::Mono, query, size)
         .max(120.0 * scale);
     let status_w = fonts.measure(FontStyle::Regular, status, size);
-    let w = (pad + label_w + gap + query_w + gap + status_w + pad)
+    let w = (pad + label_w + gap + query_w + gap + status_w + gap + CLOSE_W * scale)
         .min((view.w - 16.0 * scale).max(0.0));
     Rect::new(
         view.right() - w - 8.0 * scale,
@@ -148,6 +211,11 @@ pub fn bar_rect(fonts: &FontSystem, view: Rect, scale: f32, query: &str, status:
         w,
         BAR_H * scale,
     )
+}
+
+/// The × close zone inside a painted bar: the bar's right edge, full height.
+pub fn close_rect(bar: Rect, scale: f32) -> Rect {
+    Rect::new(bar.right() - CLOSE_W * scale, bar.y, CLOSE_W * scale, bar.h)
 }
 
 /// Paint the bar over the viewport's top-right corner; returns its rect
@@ -206,10 +274,24 @@ pub fn paint(
         );
     }
     let sw = fonts.measure(FontStyle::Regular, &status, size);
+    // The count sits just left of the × close zone at the right edge.
     canvas.draw_text(
         fonts,
         &status,
-        r.right() - pad - sw,
+        close_rect(r, scale).x - gap - sw,
+        baseline,
+        TextSpec {
+            size,
+            style: FontStyle::Regular,
+            color: theme.muted,
+        },
+    );
+    let close = close_rect(r, scale);
+    let xw = fonts.measure(FontStyle::Regular, "×", size);
+    canvas.draw_text(
+        fonts,
+        "×",
+        close.x + (close.w - xw) / 2.0,
         baseline,
         TextSpec {
             size,
@@ -270,6 +352,36 @@ mod tests {
     }
 
     #[test]
+    fn typing_narrows_the_previous_matches_instead_of_rescanning() {
+        let buf = Buffer::from_text("one two\nthree one\nOnE\nonex");
+        let mut f = Find {
+            query: "on".into(),
+            ..Default::default()
+        };
+        f.rescan(&buf, Pos::default());
+        assert_eq!(f.matches.len(), 4, "\"on\" and \"OnE\" both match");
+        // Appending "e" must give exactly what a full search of "one" gives.
+        f.query.push('e');
+        f.refresh(&buf, Pos::default());
+        assert_eq!(f.matches, search(&buf, "one"));
+        // Appending again keeps narrowing, char by char.
+        f.query.push('x');
+        f.refresh(&buf, Pos::default());
+        assert_eq!(f.matches, search(&buf, "onex"));
+        // A backspace cannot narrow: the shorter query's matches are a
+        // superset, so it falls back to the full scan.
+        f.query.pop();
+        f.refresh(&buf, Pos::default());
+        assert_eq!(f.matches, search(&buf, "one"));
+        // A stale list is never narrowed against a changed buffer: rescan
+        // is what relayout uses after an edit.
+        let mut edited = Buffer::from_text("one two\nthree one\nOnE\nonex");
+        edited.insert(Pos { line: 0, col: 0 }, "one ");
+        f.rescan(&edited, Pos::default());
+        assert_eq!(f.matches, search(&edited, "one"));
+    }
+
+    #[test]
     fn step_wraps_in_both_directions_and_survives_no_matches() {
         let buf = Buffer::from_text("a a a");
         let mut f = Find {
@@ -301,6 +413,7 @@ mod tests {
             query: "query".into(),
             matches: vec![(Pos::default(), Pos::default()); 7],
             current: 1,
+            ..Default::default()
         };
         let r = paint(&mut c, &fonts, &theme, view, 1.0, &find, true);
         assert!(
@@ -316,5 +429,18 @@ mod tests {
         let r = bar_rect(&fonts, view, 1.0, &long, "1/1");
         assert!(r.right() <= view.right() + 0.5);
         assert!(r.w <= view.w);
+    }
+
+    #[test]
+    fn the_close_zone_rides_the_bar_right_edge() {
+        let fonts = FontSystem::load_embedded();
+        let view = Rect::new(0.0, 40.0, 800.0, 500.0);
+        let r = bar_rect(&fonts, view, 1.0, "query", "2/7");
+        let close = close_rect(r, 1.0);
+        assert!(close.right() <= r.right() + 0.5, "flush with the bar");
+        assert!(close.h == r.h, "full bar height");
+        // The count never runs under the ×.
+        let sw = fonts.measure(FontStyle::Regular, "2/7", TEXT_SIZE);
+        assert!(close.x - 8.0 - sw > r.x, "status overlaps the label");
     }
 }

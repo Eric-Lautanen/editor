@@ -78,13 +78,11 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
             w.clamp(TAB_MIN_W * scale, TAB_MAX_W * scale)
         };
         tabs.push(Rect::new(x, tab_y, w, TAB_H * scale));
-        let cs = 16.0 * scale;
-        let close = Rect::new(
-            x + w - cs - 4.0 * scale,
-            tab_y + (TAB_H * scale - cs) / 2.0,
-            cs,
-            cs,
-        );
+        // Close/save zones: 20 px wide and the tab's full height, so a
+        // finger that lands high or low still hits them (the painted glyph
+        // stays centered).
+        let cs = 20.0 * scale;
+        let close = Rect::new(x + w - cs - 4.0 * scale, tab_y, cs, TAB_H * scale);
         // The save button sits just left of the close ×, and only exists for
         // a tab with unsaved edits.
         saves.push(if names[i].1 {

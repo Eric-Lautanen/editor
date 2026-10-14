@@ -53,6 +53,23 @@ struct SbDrag {
     grab: f32,
 }
 
+/// A double-tap's selection, armed for a finger drag: the touch counterpart
+/// of double-click-and-drag. The tap made the selection (word or line); a
+/// finger that comes down soon after and pans extends it — the pan deltas
+/// drive a virtual pointer from where the tap landed, because a moving
+/// finger reports `Pan`, never `MouseMove`. Retired by `PanEnd` (no coast —
+/// a selection drag is not a flick) and by the next press.
+#[derive(Clone, Copy)]
+struct TouchSel {
+    /// Selection anchor the drag extends from.
+    anchor: Pos,
+    /// The finger's virtual window position: the double-tap's spot plus the
+    /// pan deltas since.
+    pointer: (f32, f32),
+    /// The drag has begun — the recency window only gates the start.
+    active: bool,
+}
+
 /// Caret blink half-period, in 40 ms `Event::Tick`s (~0.5 s).
 const BLINK_TICKS: u32 = 12;
 
@@ -204,6 +221,9 @@ pub struct App {
     hover_title: Option<TitleHit>,
     /// Clickable status-bar segments, refreshed on every paint.
     status_buttons: Vec<statusbar::StatusButton>,
+    /// The status bar's Copy button, present only while a selection exists.
+    /// Rect refreshed on every paint, hit-tested on press.
+    copy_btn: Option<statusbar::StatusButton>,
     /// Visual rows of the active tab's preview (for drag-selection).
     preview_rows: Vec<PreviewRow>,
     /// Preview selection: (anchor row, caret row).
@@ -250,6 +270,8 @@ pub struct App {
     geometry_idle: u32,
     /// Live overlay-scrollbar drag, if any.
     sb_drag: Option<SbDrag>,
+    /// A double-tap's selection armed for a finger drag (see [`TouchSel`]).
+    touch_sel: Option<TouchSel>,
     /// Click counting for double/triple selection: the running count and
     /// where/when (tick) the last press landed.
     clicks: u8,
@@ -302,6 +324,7 @@ impl App {
             close_armed: false,
             hover_title: None,
             status_buttons: Vec::new(),
+            copy_btn: None,
             preview_rows: Vec::new(),
             preview_sel: None,
             preview_drag: false,
@@ -317,6 +340,7 @@ impl App {
             geometry_dirty: false,
             geometry_idle: 0,
             sb_drag: None,
+            touch_sel: None,
             clicks: 0,
             last_click: None,
         })
@@ -983,10 +1007,12 @@ impl App {
         self.preview_rows = self.preview.rows(&self.fonts);
         // The find bar's matches belong to the active buffer: re-run the
         // search whenever the content, tab, or view changed (all of which
-        // dirty layout). No jump — paint must not move the view.
+        // dirty layout). A full rescan, not the incremental narrow — the
+        // buffer may have moved under the old match list. No jump — paint
+        // must not move the view.
         if let Some(mut f) = self.find.take() {
             let caret = self.tabs[self.active].editor.caret;
-            f.refresh(&self.tabs[self.active].buffer, caret);
+            f.rescan(&self.tabs[self.active].buffer, caret);
             self.find = Some(f);
         }
         self.layout_dirty = false;
@@ -1192,6 +1218,8 @@ impl App {
         self.drag_anchor = None;
         self.preview_drag = false;
         self.sb_drag = None;
+        // A fresh press retires any armed double-tap selection.
+        self.touch_sel = None;
         // A live menu consumes the click (item or dismiss).
         if let Some(m) = &self.menu {
             let action = m.hit(x, y);
@@ -1209,9 +1237,14 @@ impl App {
             host.request_redraw();
             return;
         }
-        // The find bar swallows presses on itself; Escape and Ctrl+F own
-        // closing it, so a click elsewhere just does what it normally does.
+        // The find bar swallows presses on itself — except the × at its
+        // right edge, which closes it. A click elsewhere just does what it
+        // normally does.
         if self.find.is_some() && self.find_bar_rect().contains(Point { x, y }) {
+            let bar = self.find_bar_rect();
+            if find::close_rect(bar, self.scale).contains(Point { x, y }) {
+                self.find = None;
+            }
             host.request_redraw();
             return;
         }
@@ -1241,9 +1274,25 @@ impl App {
             host.request_redraw();
             return;
         }
-        // Status bar: clickable mode/theme/help/open buttons.
+        // Status bar: clickable mode/theme/help/open/find buttons, plus the
+        // Copy button that appears while something is selected.
         if y >= self.viewport().bottom() {
             let p = Point { x, y };
+            // Copy first: it is the leftmost thing on the bar and only
+            // exists while there is a selection to copy.
+            if let Some(cb) = &self.copy_btn {
+                if cb.rect.contains(p) {
+                    if let Some(text) = self
+                        .preview_selection_text()
+                        .or_else(|| self.editor.copy(&self.buffer))
+                    {
+                        host.clipboard_set(&text);
+                        self.status_extra = "copied".into();
+                    }
+                    host.request_redraw();
+                    return;
+                }
+            }
             let hit = self
                 .status_buttons
                 .iter()
@@ -1265,6 +1314,17 @@ impl App {
                     5 => {
                         if let Some(p) = host.open_file_dialog() {
                             self.open_path(p, host);
+                        }
+                    }
+                    // The bar's on-screen counterpart: opens it, or closes it
+                    // when it is already up (a touch-friendly way out).
+                    7 => {
+                        if self.find.is_some() {
+                            self.find = None;
+                        } else {
+                            self.find = Some(find::Find::default());
+                            self.help_open = false;
+                            self.about_open = false;
                         }
                     }
                     // Same as Ctrl+T: manual toggle, stops following the OS.
@@ -1355,11 +1415,13 @@ impl App {
                     let tab = &mut self.tabs[self.active];
                     tab.editor.select_word(&tab.buffer, pos);
                     self.drag_anchor = tab.editor.selection().map(|(a, _)| a);
+                    self.arm_touch_sel(x, y);
                 }
                 3.. => {
                     let tab = &mut self.tabs[self.active];
                     tab.editor.select_line(&tab.buffer, pos);
                     self.drag_anchor = tab.editor.selection().map(|(a, _)| a);
+                    self.arm_touch_sel(x, y);
                 }
                 _ => {
                     self.editor.caret = pos;
@@ -1513,6 +1575,59 @@ impl App {
             self.sb_drag = None;
         }
         host.request_redraw();
+    }
+
+    /// Arm the double-tap selection for a finger drag (see [`TouchSel`]):
+    /// called from the double/triple-click branches, which have just made the
+    /// selection the drag would extend.
+    fn arm_touch_sel(&mut self, x: f32, y: f32) {
+        if let Some(anchor) = self.editor.selection().map(|(a, _)| a) {
+            self.touch_sel = Some(TouchSel {
+                anchor,
+                pointer: (x, y),
+                active: false,
+            });
+        }
+    }
+
+    /// A finger drag while a double-tap's selection is armed extends that
+    /// selection instead of scrolling. Returns `true` when the pan was
+    /// consumed. The virtual pointer starts where the tap landed and rides
+    /// the pan deltas — a moving finger reports `Pan`, never `MouseMove`.
+    fn on_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
+        let Some(mut ts) = self.touch_sel.take() else {
+            return false;
+        };
+        // Only the *start* is gated: a finger that comes down within ~1 s of
+        // the double-tap extends the selection; a later drag scrolls.
+        if !ts.active {
+            let recent = self
+                .last_click
+                .is_some_and(|(_, t)| self.ticks.wrapping_sub(t) <= 25);
+            if !recent {
+                return false;
+            }
+            ts.active = true;
+        }
+        ts.pointer.0 += dx;
+        ts.pointer.1 += dy;
+        let (px, py) = ts.pointer;
+        if let Some((doc_x, doc_y)) = self.editor_point(px, py) {
+            let ctx = self.ctx();
+            let pos =
+                self.editor
+                    .caret_for_point(&self.buffer, doc_x, doc_y, self.editor_area().w, &ctx);
+            self.editor.caret = pos;
+            self.editor.anchor = Some(ts.anchor);
+            self.poke_caret();
+            self.touch_sel = Some(ts);
+            host.request_redraw();
+            return true;
+        }
+        // Off the editor pane (over the gutter rail, say): keep the gesture
+        // armed but do nothing with this delta.
+        self.touch_sel = Some(ts);
+        true
     }
 
     /// Host heartbeat: auto-scroll (and keep extending the selection) while a
@@ -1963,26 +2078,27 @@ impl App {
             );
             let line_h = self.editor.line_height(area.w + self.h_scroll + rail, &ctx);
             // The editor pane never wraps, so line i sits at pad + i*line_h:
-            // only the matches whose rows can be on screen pay for rects.
+            // only the matches whose rows can be on screen pay for rects,
+            // and one `match_rects` pass measures them all.
             let first = ((scroll / line_h) as usize).saturating_sub(1);
             let last = (((scroll + area.h) / line_h) as usize).saturating_add(1);
-            let mut painted = false;
-            for (i, &(from, to)) in f.matches.iter().enumerate() {
-                if from.line < first || from.line > last || i == f.current {
-                    continue;
-                }
-                for rect in layout::text::selection_rects(
+            let ranges: Vec<(Pos, Pos)> = f
+                .matches
+                .iter()
+                .enumerate()
+                .filter(|&(i, &(from, _))| {
+                    from.line >= first && from.line <= last && i != f.current
+                })
+                .map(|(_, &(from, to))| (from, to))
+                .collect();
+            if !ranges.is_empty() {
+                canvas.set_clip(Some(area));
+                for rect in layout::text::match_rects(
                     &self.buffer,
-                    from,
-                    to,
+                    &ranges,
                     area.w + self.h_scroll + rail,
                     &ctx,
-                    false,
                 ) {
-                    if !painted {
-                        canvas.set_clip(Some(area));
-                        painted = true;
-                    }
                     canvas.fill_rect(
                         Rect::new(
                             rect.x + area.x - self.h_scroll + rail,
@@ -1993,8 +2109,6 @@ impl App {
                         tint,
                     );
                 }
-            }
-            if painted {
                 canvas.set_clip(None);
             }
         }
@@ -2165,17 +2279,18 @@ impl App {
     }
 
     /// Status-bar buttons. Ids: 0=Preview, 1=Edit, 2=Split, 3=Help, 4=Theme,
-    /// 5=Open, 6=About. The vec is in left-to-right order (paint walks it in
-    /// reverse), giving `Open | Preview Edit Split | Help About | Dark/Light`.
-    /// Rects are filled in by `statusbar::paint`.
+    /// 5=Open, 6=About, 7=Find. The vec is in left-to-right order (paint
+    /// walks it in reverse), giving `Find Open | Preview Edit Split | Help
+    /// About | Dark/Light`. Rects are filled in by `statusbar::paint`.
     fn status_buttons(&self) -> Vec<statusbar::StatusButton> {
         let active = match self.mode {
             Mode::Preview => 0,
             Mode::Edit => 1,
             Mode::Split => 2,
         };
-        let rows: [(u8, &'static str, bool, bool); 7] = [
+        let rows: [(u8, &'static str, bool, bool); 8] = [
             // id, label, active, starts-a-group
+            (7, "Find", self.find.is_some(), false),
             (5, "Open", false, false),
             (0, "Preview", active == 0, true),
             (1, "Edit", active == 1, false),
@@ -2196,6 +2311,20 @@ impl App {
                 },
             )
             .collect()
+    }
+
+    /// The status bar's Copy button: present only while there is a
+    /// selection to copy (editor selection in Edit/Split, preview rows in
+    /// Preview). Rect is filled in by `statusbar::paint`.
+    fn copy_button(&self) -> Option<statusbar::StatusButton> {
+        let selected = self.preview_selection_text().is_some() || self.editor.selection().is_some();
+        selected.then(|| statusbar::StatusButton {
+            id: 8,
+            label: "Copy",
+            active: false,
+            group_start: false,
+            rect: Rect::default(),
+        })
     }
 
     fn status_bar_text(&self) -> (String, String) {
@@ -2302,13 +2431,27 @@ impl Handler for App {
                 self.scroll_input(-dy, host);
             }
             Event::Pan { dx, dy } => {
-                // Direct manipulation: follow the finger exactly, no glide —
-                // and drop any glide that was in flight (its remaining
-                // distance belongs to the wheel, not to the finger).
+                // A double-tap's finger drag extends the selection the tap
+                // made (the touch counterpart of double-click-and-drag);
+                // every other finger is direct manipulation: follow it
+                // exactly, no glide — and drop any glide that was in flight
+                // (its remaining distance belongs to the wheel, not to the
+                // finger).
+                if self.on_touch_pan(dx, dy, host) {
+                    return;
+                }
                 self.pan_horizontal_direct(dx);
                 self.scroll_direct(-dy, host);
             }
-            Event::PanEnd { vx, vy } => self.coast(vx, vy, host),
+            Event::PanEnd { vx, vy } => {
+                // A selection drag is not a flick: it retires the gesture
+                // without a coast.
+                if self.touch_sel.take().is_some() {
+                    host.request_redraw();
+                    return;
+                }
+                self.coast(vx, vy, host);
+            }
             Event::KeyDown { key, mods } => self.on_key(key, mods, host),
             Event::Frame => self.on_frame(host),
             Event::MouseDown { x, y, button } => self.on_mouse_down(x, y, button, host),
@@ -2359,16 +2502,18 @@ impl Handler for App {
         );
         let (left, right) = self.status_bar_text();
         let mut buttons = self.status_buttons();
+        let mut copy = self.copy_button();
         statusbar::paint(
             canvas,
             &self.fonts,
             &self.theme,
             sb,
-            self.scale,
             (&left, &right),
             &mut buttons,
+            &mut copy,
         );
         self.status_buttons = buttons;
+        self.copy_btn = copy;
         let labels = self.tab_labels();
         let lay = titlebar::layout(&self.fonts, &labels, self.size.0 as f32, self.scale);
         titlebar::paint(
@@ -2458,9 +2603,15 @@ impl Handler for App {
         if self.menu.is_some() || self.help_open || self.about_open {
             return CursorShape::Arrow;
         }
-        // The find bar is chrome, not text (the query has no click-to-place).
+        // The find bar is chrome, not text (the query has no click-to-place)
+        // — except the ×, which is a button.
         if self.find.is_some() && self.find_bar_rect().contains(Point { x, y }) {
-            return CursorShape::Arrow;
+            let bar = self.find_bar_rect();
+            return if find::close_rect(bar, self.scale).contains(Point { x, y }) {
+                CursorShape::Hand
+            } else {
+                CursorShape::Arrow
+            };
         }
         if y < titlebar::HEIGHT * self.scale {
             let labels = self.tab_labels();
@@ -2472,7 +2623,9 @@ impl Handler for App {
         }
         if y >= self.viewport().bottom() {
             let p = Point { x, y };
-            return if self.status_buttons.iter().any(|b| b.rect.contains(p)) {
+            return if self.status_buttons.iter().any(|b| b.rect.contains(p))
+                || self.copy_btn.is_some_and(|b| b.rect.contains(p))
+            {
                 CursorShape::Hand
             } else {
                 CursorShape::Arrow
@@ -2710,6 +2863,128 @@ mod tests {
         // Escape closes the bar there too.
         app.on_event(plain(Key::Escape), &mut host);
         assert!(app.find.is_none());
+    }
+
+    /// The middle of a rect, for mouse-event tests.
+    fn mid(r: Rect) -> (f32, f32) {
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    #[test]
+    fn find_button_and_bar_close_button_toggle_the_bar() {
+        let mut app = App::new(None).unwrap();
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        let (fx, fy) = mid(app
+            .status_buttons
+            .iter()
+            .find(|b| b.id == 7)
+            .expect("Find")
+            .rect);
+        app.on_event(
+            Event::MouseDown {
+                x: fx,
+                y: fy,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.find.is_some(), "the Find button opens the bar");
+        // The × on the bar's right edge closes it.
+        let bar = app.find_bar_rect();
+        let (cx, cy) = mid(find::close_rect(bar, 1.0));
+        app.on_event(
+            Event::MouseDown {
+                x: cx,
+                y: cy,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.find.is_none(), "the × closes the bar");
+        // The Find button toggles both ways.
+        app.on_event(
+            Event::MouseDown {
+                x: fx,
+                y: fy,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.find.is_some());
+        app.on_event(
+            Event::MouseDown {
+                x: fx,
+                y: fy,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.find.is_none());
+    }
+
+    #[test]
+    fn double_tap_drag_extends_the_selection_like_double_click() {
+        let mut app = App::new(None).unwrap();
+        app.buffer = Buffer::from_text("hello world\nsecond line here\n");
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        let down = Event::MouseDown {
+            x: 100.0,
+            y: 60.0,
+            button: MouseButton::Left,
+        };
+        let up = Event::MouseUp {
+            x: 100.0,
+            y: 60.0,
+            button: MouseButton::Left,
+        };
+        // Tap, tap: the second press is a double-tap and selects the word.
+        app.on_event(down.clone(), &mut host);
+        app.on_event(up.clone(), &mut host);
+        app.on_event(down.clone(), &mut host);
+        app.on_event(up.clone(), &mut host);
+        assert!(
+            !app.editor.sel_text(&app.buffer).is_empty(),
+            "double-tap selects a word"
+        );
+        // The finger drags: Pan extends the selection instead of scrolling.
+        let before = app.scroll.offset;
+        app.on_event(Event::Pan { dx: 0.0, dy: 120.0 }, &mut host);
+        let sel = app.editor.selection().expect("selection survives the drag");
+        assert!(sel.1.line >= 1, "drag extended onto a later line");
+        assert_eq!(
+            app.scroll.offset, before,
+            "a selection drag does not scroll"
+        );
+        // PanEnd retires the gesture without a coast.
+        app.on_event(Event::PanEnd { vx: 0.0, vy: -3.0 }, &mut host);
+        assert!(app.touch_sel.is_none());
+        assert_eq!(app.scroll.offset, before, "no coast after a selection drag");
+    }
+
+    #[test]
+    fn copy_button_appears_with_a_selection_and_copies() {
+        let mut app = App::new(None).unwrap();
+        app.buffer = Buffer::from_text("hello world\n");
+        let mut host = NullHost::default();
+        let _ = app.render_headless(800, 600, 1.0);
+        assert!(app.copy_btn.is_none(), "no selection, no button");
+        app.on_event(ctrl('a'), &mut host);
+        let _ = app.render_headless(800, 600, 1.0);
+        let cb = app.copy_btn.expect("Copy button with a selection").rect;
+        assert!(cb.x < 60.0, "far left of the bar, at {}", cb.x);
+        assert_eq!(cb.h, statusbar::HEIGHT, "full bar height for a finger");
+        let (cx, cy) = mid(cb);
+        app.on_event(
+            Event::MouseDown {
+                x: cx,
+                y: cy,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert_eq!(host.clipboard.as_deref(), Some("hello world\n"));
     }
 
     #[test]
@@ -3141,13 +3416,23 @@ mod tests {
             .find(|b| b.id == 5)
             .expect("Open button")
             .rect;
-        // Leftmost in the row: Open | Preview Edit Split | Help | Theme.
+        // Leftmost in the row: Find Open | Preview Edit Split | Help | Theme.
+        let find_btn = app
+            .status_buttons
+            .iter()
+            .find(|b| b.id == 7)
+            .expect("Find button")
+            .rect;
         let leftmost = app
             .status_buttons
             .iter()
             .map(|b| b.rect.x)
             .fold(f32::MAX, f32::min);
-        assert!((open_btn.x - leftmost).abs() < 0.5, "Open is leftmost");
+        assert!((find_btn.x - leftmost).abs() < 0.5, "Find is leftmost");
+        assert!(
+            (open_btn.x - find_btn.right()).abs() < 8.0,
+            "Open sits right of Find"
+        );
         let out = std::env::temp_dir().join("readitor_test_openbtn.txt");
         std::fs::write(&out, "opened").unwrap();
         host.picked_file = Some(out.clone());
