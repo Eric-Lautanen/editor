@@ -290,11 +290,13 @@ mod ffi {
     /// `end_gesture` is the reconciliation point for this and `WM_KILLFOCUS`.
     pub const WM_CAPTURECHANGED: u32 = 0x0215;
     pub const WM_DROPFILES: u32 = 0x0233;
-    /// Second-instance handoff message (app-defined, WM_USER range): `lParam`
-    /// carries the fresh instance's file path, NUL-terminated, in the same
-    /// UTF-16 `arg` allocation the process was passed. Registered at runtime
-    /// so only messages from our own registered class name ever match.
-    pub const WM_OPEN_FROM_SECOND: u32 = 0x8000; // WM_APP
+    /// Inter-process buffer transfer: lParam points at a `CopyDataStruct`
+    /// whose data the kernel copies into the receiver for the call.
+    pub const WM_COPYDATA: u32 = 0x004A;
+    /// The dwData tag a genuine editor-to-editor handoff carries; anything
+    /// else in a WM_COPYDATA aimed at our window is ignored at the receiver
+    /// (another app may legitimately send WM_COPYDATA with its own tag).
+    pub const HANDOFF_TAG: u32 = 0x00ED_17E5;
     pub const WM_TIMER: u32 = 0x0113;
     /// `WM_TIMER` ids. `TIMER_TICK` is the app's slow heartbeat (caret blink,
     /// drag auto-scroll). Frame pacing is a waitable timer, not a user timer,
@@ -308,6 +310,17 @@ mod ffi {
     #[repr(C)]
     pub struct LargeInteger {
         pub quad: i64,
+    }
+    /// `COPYDATASTRUCT` (winuser.h): the WM_COPYDATA payload descriptor. `data`
+    /// points into the *sender's* address space; the kernel copies `size`
+    /// bytes from it into the receiver for the duration of the call.
+    #[repr(C)]
+    pub struct CopyDataStruct {
+        /// Sender's private tag (our HANDOFF_TAG).
+        pub dw_data: usize,
+        /// Payload size in bytes.
+        pub size: u32,
+        pub data: *const c_void,
     }
     /// `WM_APP` — the base for application-private messages.
     pub const WM_APP: u32 = 0x8000;
@@ -1802,20 +1815,31 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             }
             0
         }
-        WM_OPEN_FROM_SECOND => {
+        WM_COPYDATA => {
             // Another instance of editor.exe was started with a file; its
             // argv gave this window a path and died before it drew anything.
             // Open it as a new tab — exactly what a drag onto the window does
             // (Event::FileOpen → app.open_path, which handles recent-list and
             // session persistence).
-            let s = lp as *const u16;
-            let mut len = 0usize;
-            while *s.add(len) != 0 {
-                len += 1;
+            //
+            // lParam is a WM_COPYDATA CopyDataStruct: the kernel has already
+            // copied the sender's buffer into our address space for the
+            // duration of this call, so dereferencing it is safe HERE and
+            // only here — never after the handler returns. A NULL lparam or a
+            // mismatched dwData is not ours; ignore rather than guess.
+            if lp != 0 {
+                let cds = &*(lp as *const CopyDataStruct);
+                if cds.dw_data == HANDOFF_TAG as usize && cds.size.is_multiple_of(2) {
+                    let bytes = std::slice::from_raw_parts(
+                        cds.data as *const u16,
+                        cds.size as usize / 2, // byte count → UTF-16 units; NUL written
+                    );
+                    let path = String::from_utf16_lossy(bytes);
+                    if !path.is_empty() {
+                        dispatch(st, hwnd, Event::FileOpen(std::path::PathBuf::from(path)));
+                    }
+                }
             }
-            let slice = std::slice::from_raw_parts(s, len);
-            let path = String::from_utf16_lossy(slice);
-            dispatch(st, hwnd, Event::FileOpen(std::path::PathBuf::from(path)));
             0
         }
         WM_DROPFILES => {
@@ -2039,9 +2063,10 @@ unsafe fn make_icon() -> Handle {
 /// ERROR_ALREADY_EXISTS, from `GetLastError` after `CreateMutexW` finds the
 /// mutex already owned by another instance.
 const ERROR_ALREADY_EXISTS: u32 = 183;
-/// Windows message the running instance listens for (WM_USER range, app-
-/// defined); see the ffi mod's `WM_OPEN_FROM_SECOND` handler in `wndproc`.
-use ffi::WM_OPEN_FROM_SECOND;
+/// The tag a handoff carries inside its WM_COPYDATA payload, and the app-
+/// defined check the receiver makes before trusting `lp`. See `ffi::
+/// HANDOFF_TAG`.
+use ffi::HANDOFF_TAG;
 
 /// Single-instance handoff: if an editor window of this class is already
 /// running, hand it the file this process was started with and exit before
@@ -2054,14 +2079,35 @@ pub(crate) unsafe fn handoff_to_running(file: Option<&std::path::Path>) -> Resul
     let marker = wide("EditorWindow.Instance");
     let mutex = create_mutex_w(null_mut(), 0, marker.as_ptr());
     if !mutex.is_null() && get_last_error() == ERROR_ALREADY_EXISTS {
-        // Someone else holds it: find their window and forward. The path is
-        // passed as the *message* pointer directly — the fresh process is
-        // alive for the (synchronous) send, so the buffer stays valid.
+        // Someone else holds it: find their window and forward. WM_COPYDATA
+        // (never a raw lparam pointer!) is the only safe way to pass a buffer
+        // across processes with SendMessage: the kernel marshals a snapshot
+        // of `arg` into the receiver for the call, so the sender may free or
+        // exit the instant send_message_w returns — which the second process
+        // does immediately after. `dwData` tags the payload so junk messages
+        // (or another app's WM_COPYDATA to a shared window) are rejected.
         let class = wide("EditorWindow");
         let target = find_window_w(class.as_ptr(), null());
         if !target.is_null() {
-            let arg = file.and_then(|p| p.to_str()).map(wide).unwrap_or_default();
-            send_message_w(target, WM_OPEN_FROM_SECOND, 0, arg.as_ptr() as isize);
+            let arg = file
+                .and_then(|p| p.as_os_str().to_str())
+                .map(wide)
+                .unwrap_or_default();
+            let payload = arg.as_ptr() as *const c_void;
+            let cds = ffi::CopyDataStruct {
+                dw_data: HANDOFF_TAG as usize,
+                size: (arg.len() * 2) as u32, // bytes, NUL included by `wide`
+                data: payload,
+            };
+            // wParam is nominally the sender's window; the second instance
+            // has none (it exits before creating one), and the receiver only
+            // trusts the tag + payload shape, so null it is.
+            send_message_w(
+                target,
+                ffi::WM_COPYDATA,
+                0,
+                &cds as *const ffi::CopyDataStruct as Lparam,
+            );
             if is_iconic(target) != 0 {
                 show_window(target, 9); /* SW_RESTORE */
             }

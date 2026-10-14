@@ -24,7 +24,8 @@
     repo test that pins one against drift lives nowhere, so check both when
     editing either (search for `EXTENSIONS`).
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
       Name="Editor"
       Manufacturer="Eric-Lautanen"
@@ -53,6 +54,8 @@
         Schedule="afterInstallInitialize" />
 
     <Icon Id="editor.ico" SourceFile="$(var.Icon)" />
+    <!-- The welcome page's icon control reads from the Binary table. -->
+    <Binary Id="editor.ico" SourceFile="$(var.Icon)" />
     <Property Id="ARPPRODUCTICON" Value="editor.ico" />
     <!-- Sensible defaults for ARP metadata. -->
     <Property Id="ARPNOMODIFY" Value="1" /> <!-- replace-don't-tweak: updates come as new MSIs -->
@@ -102,20 +105,25 @@
         <ComponentRef Id="ExtSh" />
       </Feature>
     </Feature>
-    <!-- The setup UI: one page, two checkboxes. Checked by default (the
-         properties are preset to 1), so Install takes everything with zero
-         clicks beyond the button; unchecking either box simply refuses that
-         group of associations. No feature tree, no dropdowns - exactly the
-         two questions a viewer has to ask. -->
+    <!-- The setup UI: one welcome page with two checkboxes, then the stock
+         WiX progress/exit dialogs. Checked by default (the properties are
+         preset to 1), so Install takes everything with zero clicks beyond
+         the button; unchecking either box simply refuses that group of
+         associations. -->
     <Property Id="DOCUMENT_TYPES" Value="1" />
     <Property Id="CODE_TYPES" Value="1" />
     <UI Id="EditorOnePageUi">
-      <Dialog Id="EditorWelcomeDlg" Width="370" Height="200" Title="Editor setup">
-        <Control Id="Title" Type="Text" X="25" Y="15" Width="320" Height="20" Transparent="yes" NoPrefix="yes" Text="Install Editor" />
-        <Control Id="Subtitle" Type="Text" X="25" Y="40" Width="320" Height="25" Transparent="yes" NoPrefix="yes" Text="A fast viewer/editor for Markdown, JSON, CSV and code. Per-user install, no admin." />
-        <Control Id="DocumentsCheck" Type="CheckBox" X="25" Y="75" Width="320" Height="15" Property="DOCUMENT_TYPES" CheckBoxValue="1" Text="Associate document and config files (md, json, csv, yaml, toml, ...)" />
-        <Control Id="CodeCheck" Type="CheckBox" X="25" Y="95" Width="320" Height="15" Property="CODE_TYPES" CheckBoxValue="1" Text="Associate code files (rs, py, js, ts, c, cpp, ...)" />
-        <Control Id="Install" Type="PushButton" X="236" Y="160" Width="56" Height="17" Default="yes" Text="Install">
+      <Dialog Id="EditorWelcomeDlg" Width="404" Height="238" Title="Install Editor">
+        <!-- App icon + heading. -->
+        <Control Id="AppIcon" Type="Icon" X="20" Y="22" Width="48" Height="48" Text="editor.ico" />
+        <Control Id="Title" Type="Text" X="80" Y="24" Width="300" Height="24" Transparent="yes" NoPrefix="yes" Text="Install Editor" />
+        <Control Id="Subtitle" Type="Text" X="80" Y="50" Width="300" Height="34" Transparent="yes" NoPrefix="yes" Text="A fast viewer for Markdown, JSON, CSV, logs and code. Per-user install — no admin rights needed." />
+        <!-- The only two questions: both default to checked. Height 30 so
+             the wrapping second line shows instead of clipping mid-word. -->
+        <Control Id="DocumentsCheck" Type="CheckBox" X="25" Y="104" Width="354" Height="30" Property="DOCUMENT_TYPES" CheckBoxValue="1" Text="Associate document and config files\n(md, json, csv, log, yaml, toml, ...)" />
+        <Control Id="CodeCheck" Type="CheckBox" X="25" Y="140" Width="354" Height="30" Property="CODE_TYPES" CheckBoxValue="1" Text="Associate code files (rs, py, js, ts, c, cpp, ...)" />
+        <Control Id="Hint" Type="Text" X="25" Y="178" Width="354" Height="14" Transparent="yes" NoPrefix="yes" Text=" associations are offered in Explorer’s “Open with” menu. You can change these any time." />
+        <Control Id="Install" Type="PushButton" X="254" Y="200" Width="70" Height="22" Default="yes" Text="Install">
           <!-- The checkbox pattern: the check state lands in the property
                (CheckBoxValue), and these events turn it into feature state.
                Unchecked -> Remove (absent); checked -> AddLocal (installed).
@@ -128,14 +136,23 @@
           <Publish Event="Remove" Value="CodeTypes" Condition="NOT CODE_TYPES" Order="4" />
           <Publish Event="EndDialog" Value="Return" Order="5" />
         </Control>
-        <Control Id="Cancel" Type="PushButton" X="304" Y="160" Width="56" Height="17" Cancel="yes" Text="Cancel">
+        <Control Id="Cancel" Type="PushButton" X="330" Y="200" Width="60" Height="22" Cancel="yes" Text="Cancel">
           <Publish Event="EndDialog" Value="Exit" />
         </Control>
-        <Control Id="BottomLine" Type="Line" X="0" Y="150" Width="373" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="196" Width="404" Height="0" />
       </Dialog>
       <InstallUISequence>
         <Show Dialog="EditorWelcomeDlg" Before="ExecuteAction" />
       </InstallUISequence>
+      <!-- The stock WiX progress + completion dialogs: after Install the
+           installer shows a real progress bar, then an "Installation
+           complete / Finish" page. Cancelling surfaces UserExit; failures
+           ErrorDlg. Referencing each dialog links its stock scheduling —
+           no <Show> entries here (they would conflict). -->
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ExitDialog" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="ErrorDlg" />
       <!-- Maintenance mode (repair/change/uninstall over an existing install)
            needs no page; Windows Installer own dialogs handle it. -->
     </UI>
