@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>Readitor icon</title>
+  <desc>Slate document page with folded corner and ruled lines (one blue) on a light tile. Vector source of src/gfx/icon.rs — keep the two in agreement.</desc>
+  <defs>
+    <linearGradient id="tile" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="32">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D9E0E9"/>
+    </linearGradient>
+  </defs>
+  <!-- tile -->
+  <rect x="0" y="0" width="32" height="32" rx="7" fill="url(#tile)"/>
+  <!-- document page -->
+  <rect x="9" y="7" width="14" height="18" rx="1.5" fill="#24292F"/>
+  <!-- ruled lines -->
+  <rect x="11" y="12" width="10" height="2" fill="#C7D0DC"/>
+  <rect x="11" y="16" width="10" height="2" fill="#C7D0DC"/>
+  <rect x="12.5" y="20" width="7" height="2" fill="#2F81F7"/>
+  <!-- folded corner -->
+  <polygon points="18,7 23,7 23,12" fill="url(#tile)"/>
+  <line x1="18" y1="12" x2="23" y2="7" stroke="#161C24" stroke-opacity="0.55" stroke-width="1"/>
+  <!-- hairline border -->
+  <rect x="0.75" y="0.75" width="30.5" height="30.5" rx="6.25" fill="none" stroke="#24292F" stroke-opacity="0.45" stroke-width="1"/>
+</svg>

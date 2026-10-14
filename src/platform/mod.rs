@@ -10,6 +10,11 @@ use crate::{
 
 pub mod install;
 
+/// Default window size when the last session left no geometry: true 16:9.
+/// One definition for every backend plus the app/CLI fallbacks, so the
+/// default open size cannot drift per OS.
+pub const DEFAULT_SIZE: (usize, usize) = (1280, 720);
+
 // The `readitor_check_*` cfgs (RUSTFLAGS) type-check one backend from another
 // OS: `readitor_check_win` the Win32 backend, `readitor_check_linux` the X11
 // one, `readitor_check_macos` the AppKit one. Dev-only: they never link the

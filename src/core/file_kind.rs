@@ -48,6 +48,36 @@ impl FileKind {
     }
 }
 
+/// `*.ext` globs for every claimed extension, joined by `sep`: the single
+/// source for open-dialog filters on all three backends (`;` on Windows,
+/// spaces for zenity), so the dialogs never drift from what the app opens
+/// and the installer registers.
+pub fn globs(sep: &str) -> String {
+    EXTENSIONS
+        .iter()
+        .map(|e| format!("*.{e}"))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// Save-dialog groups: `(label, extensions)`, mirroring [`FileKind`].
+/// Every [`EXTENSIONS`] entry appears in exactly one group (pinned by test).
+pub const SAVE_GROUPS: &[(&str, &[&str])] = &[
+    ("Markdown", &["md", "markdown"]),
+    ("JSON", &["json"]),
+    ("JSON Lines", &["jsonl", "ndjson"]),
+    ("CSV", &["csv", "tsv"]),
+    ("Config", &["yaml", "yml", "toml", "ini", "cfg", "conf"]),
+    (
+        "Code",
+        &[
+            "rs", "py", "js", "ts", "c", "h", "cpp", "hpp", "cs", "java", "go", "rb", "php", "css",
+            "html", "xml", "sh",
+        ],
+    ),
+    ("Text", &["txt", "log"]),
+];
+
 impl FileKind {
     pub fn label(self) -> &'static str {
         match self {
@@ -116,5 +146,25 @@ mod tests {
         assert_eq!(FileKind::from_path(Path::new("x.ini")), FileKind::Ini);
         assert_eq!(FileKind::from_path(Path::new("x.cfg")), FileKind::Ini);
         assert_eq!(FileKind::from_path(Path::new("x.rs")), FileKind::Code);
+    }
+
+    #[test]
+    fn dialog_filters_cover_every_claimed_extension() {
+        // Open filter: one glob per claimed extension.
+        let pattern = globs(";");
+        assert_eq!(pattern.matches("*.").count(), EXTENSIONS.len());
+        for ext in ["csv", "tsv", "yaml", "toml", "ini", "log", "rs", "py", "sh"] {
+            assert!(pattern.contains(&format!("*.{ext}")), "missing {ext}");
+        }
+        // Save groups: every claimed extension in exactly one group.
+        let mut seen = std::collections::HashSet::new();
+        for (_, exts) in SAVE_GROUPS {
+            for e in *exts {
+                assert!(seen.insert(*e), "duplicate group entry: {e}");
+            }
+        }
+        for ext in EXTENSIONS {
+            assert!(seen.contains(ext), "no save group claims .{ext}");
+        }
     }
 }

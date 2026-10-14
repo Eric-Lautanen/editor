@@ -773,7 +773,50 @@ survived restarts (theme, mode, tabs); the window did not.
   `Tab::from_path` checks the size before reading and reports "file is N MB — larger than the
   64 MB open limit" in the status bar instead (`size_error`, split out so the rule is testable
   without a 64 MB fixture). Windowing/streaming a huge file stays out of scope for now.
-- Still open in M10: find (`Ctrl+F`).
+- Find (`Ctrl+F`) closed M10 — see the next section.
+
+### M10 find (Oct 2026) — Ctrl+F, 324 tests green
+- **Find bar** (`ui/find.rs`, new): `Find` holds the query, the match list, and the current
+  index; `search` is a case-insensitive, line-oriented substring scan whose haystack chars
+  are tagged with the byte offset of the char they were folded from, so columns stay on
+  char boundaries even when case folding expands (İ → "i" + combining dot). Matches never
+  span a newline and never overlap.
+- **The bar** (`ui/find.rs::paint`): a small strip docked at the viewport's top-right —
+  "Find", the query (mono, with a blinking caret), and an `n/m` count ("0 matches" when the
+  query hits nothing). `bar_rect` is pure, so painting and hit-testing cannot drift. Clicks
+  on the bar are swallowed; Escape and Ctrl+F own closing it.
+- **Wiring** (`app.rs`): Ctrl+F opens (and closes the full-window overlays); while open the
+  bar owns the plain keys — typing goes to the query via `Event::Text`, Backspace edits it,
+  Enter/F3 step (Shift = back, wrapping), Tab/Delete are consumed, Ctrl chords stay app
+  chords. `relayout` re-runs the search whenever the content, tab, or view changed.
+- **Showing matches**: Edit/Split tints every match over the editor pane (accent at low
+  alpha, through the `selection_rects` path, only paying for rows that can be on screen)
+  and makes the current one the editor selection, with `follow_caret` scrolling to it.
+  Preview has no buffer-offset geometry, so it gets the honest count plus a best-effort
+  jump: the view scrolls to the preview row containing that occurrence of the query.
+- **Concurrent round — Split scroll lock**: the two Split panes share a 0..1 scroll
+  *ratio* instead of one pixel offset, so the short pane can never sail past its own end
+  (phantom gutter rows, pinned thumb); each pane paints and hit-tests its own share, and
+  dragging either thumb drives both. The gutter stops drawing numbers past the last line.
+- **Concurrent round — dialog filters**: the open/save dialogs on all three backends build
+  their filters from `core::file_kind` (`globs()` / `SAVE_GROUPS`), so what the dialogs
+  offer can never drift from what the app opens and the installer registers; pinned by
+  test.
+- **Concurrent round — horizontal wheel glide**: tilt-wheel steps on the editor pane now
+  glide over frames toward an `h_target` (same easing, same frame-clock discipline as the
+  vertical ride), fine deltas still land at once, and pointer/finger input takes the view
+  over and ends the glide. `scroll::glide_step` is the shared easing.
+- **Concurrent round — procedural app icon**: the taskbar/`CreateIconIndirect` mark is no
+  longer a font glyph — it is drawn as a slate document page with a folded corner and one
+  brand-blue ruled line on a light gradient tile (signed-distance anti-aliasing), so it
+  reads as a page at 16 px and separates from dark and light taskbars alike.
+- Tests: `ui::find` covers the scan (case, multibyte, folding, non-overlap), refresh
+  landing at/after the caret, wrap in both directions, and the bar's geometry; app-level
+  tests cover open/type/count/select, Enter/F3 wrap, Backspace editing the query live,
+  zero-match reporting, case-insensitivity, and the Preview count+jump. 324 tests,
+  `clippy --all-targets` and `rustfmt --check` clean.
+- M10 is feature-complete; what remains are the runtime passes (real-window test, Linux
+  X11, macOS) tracked above.
 
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the

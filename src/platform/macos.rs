@@ -248,8 +248,8 @@ const PASTEBOARD_TEXT: &str = "public.utf8-plain-text";
 /// `NSFilenamesPboardType` — Finder drags still populate it.
 const DRAG_TYPE: &str = "NSFilenamesPboardType";
 
-const WIN_W: f64 = 1100.0;
-const WIN_H: f64 = 800.0;
+const WIN_W: f64 = super::DEFAULT_SIZE.0 as f64;
+const WIN_H: f64 = super::DEFAULT_SIZE.1 as f64;
 /// Widest manual edge-resize band (logical px), matching the X11 backend.
 const RESIZE_BAND: f32 = 6.0;
 const MIN_W: f64 = 200.0;
@@ -361,6 +361,15 @@ impl Host for MacHost {
             }
             msg1::<i8, ()>(panel, sel("setCanChooseFiles:"), 1);
             msg1::<i8, ()>(panel, sel("setAllowsMultipleSelection:"), 0);
+            // Same claimed set as the app and Info.plist, derived from
+            // EXTENSIONS so the dialog cannot drift (see `core::file_kind`).
+            let types = msg::<Id>(class("NSMutableArray"), sel("array"));
+            if !types.is_null() {
+                for ext in crate::core::file_kind::EXTENSIONS {
+                    msg1::<Id, ()>(types, sel("addObject:"), ns_str(ext));
+                }
+                msg1::<Id, ()>(panel, sel("setAllowedFileTypes:"), types);
+            }
             if msg::<i64>(panel, sel("runModal")) != 1 {
                 return None;
             }

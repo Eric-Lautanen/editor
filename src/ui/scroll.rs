@@ -22,7 +22,25 @@ const GLIDE_TAU_MS: f32 = 55.0;
 const GLIDE_MAX_PX_PER_MS: f32 = 6.0;
 /// Travel below which a glide is over: sub-pixel motion is invisible, and
 /// chasing it would keep the frame clock running forever.
-const GLIDE_SETTLED: f32 = 0.5;
+pub(crate) const GLIDE_SETTLED: f32 = 0.5;
+
+/// One frame of the shared glide easing: exponential ease-out toward
+/// `target`, capped in speed so a huge delta reads as motion rather than a
+/// teleport. Snaps onto the target inside [`GLIDE_SETTLED`]. Both scroll
+/// axes ride this so wheel input feels identical horizontally and
+/// vertically.
+pub(crate) fn glide_step(offset: f32, target: f32, dt_ms: f32) -> f32 {
+    let d = target - offset;
+    if d.abs() <= GLIDE_SETTLED {
+        return target;
+    }
+    // Exponential ease-out, capped in speed: `1 - e^-x` never reaches 1, so
+    // the view always approaches the target from behind and can never
+    // overshoot it.
+    let want = d * (1.0 - (-dt_ms / GLIDE_TAU_MS).exp());
+    let max = GLIDE_MAX_PX_PER_MS * dt_ms.max(0.0);
+    offset + want.clamp(-max, max)
+}
 
 /// Fraction of a coast's speed kept per millisecond. The velocity decays
 /// geometrically from wherever the finger let go — the rolodex feel, cranked
@@ -137,19 +155,9 @@ impl ScrollState {
             }
             return true;
         }
-        let d = self.target - self.offset;
-        if d.abs() <= GLIDE_SETTLED {
-            let was = self.offset;
-            self.offset = self.target;
-            return self.offset != was;
-        }
-        // Exponential ease-out, capped in speed: `1 - e^-x` never reaches 1, so
-        // the view always approaches the target from behind and can never
-        // overshoot it.
-        let want = d * (1.0 - (-dt_ms / GLIDE_TAU_MS).exp());
-        let max = GLIDE_MAX_PX_PER_MS * dt_ms.max(0.0);
-        self.offset += want.clamp(-max, max);
-        true
+        let was = self.offset;
+        self.offset = glide_step(self.offset, self.target, dt_ms);
+        self.offset != was
     }
 }
 

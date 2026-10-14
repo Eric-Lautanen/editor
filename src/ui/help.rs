@@ -40,6 +40,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "View",
         &[
             ("wheel, arrows", "scroll"),
+            ("Ctrl+F", "find bar (Enter/F3 next, Shift back)"),
             ("Ctrl + / - / 0", "zoom in / out / reset"),
             ("Ctrl+T", "light / dark theme"),
             ("click [+]", "fold / unfold JSON nodes"),

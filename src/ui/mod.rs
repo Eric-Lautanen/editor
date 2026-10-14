@@ -1,6 +1,7 @@
 pub mod about;
 pub mod editor_view;
 pub mod event;
+pub mod find;
 pub mod gutter;
 pub mod help;
 pub mod menu;

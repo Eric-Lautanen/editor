@@ -408,8 +408,8 @@ const ZPOINTER: i32 = 2; // ZPixmap
 const PROP_MODE_REPLACE: i32 = 0;
 const CURRENT_TIME: Time = 0;
 
-const WIN_W: c_uint = 1100;
-const WIN_H: c_uint = 800;
+const WIN_W: c_uint = super::DEFAULT_SIZE.0 as c_uint;
+const WIN_H: c_uint = super::DEFAULT_SIZE.1 as c_uint;
 /// `_NET_WM_STATE` client-message actions (`_NET_WM_STATE_ADD` / `_TOGGLE`).
 const WM_STATE_ADD: i32 = 1;
 const WM_STATE_TOGGLE: i32 = 2;
@@ -715,6 +715,14 @@ fn file_dialog(save: bool, default_name: &str) -> Option<std::path::PathBuf> {
     z.arg("--file-selection");
     if save {
         z.arg("--save").arg("--confirm-overwrite");
+    } else {
+        // Same claimed set as the app and the .desktop entry, derived from
+        // EXTENSIONS so the dialog cannot drift (see `core::file_kind`).
+        z.arg(format!(
+            "--file-filter=Documents | {}",
+            crate::core::file_kind::globs(" ")
+        ));
+        z.arg("--file-filter=All files | *");
     }
     if !default_name.is_empty() {
         z.arg(format!("--filename={default_name}"));
@@ -739,7 +747,10 @@ fn file_dialog(save: bool, default_name: &str) -> Option<std::path::PathBuf> {
             default_name
         });
     } else {
-        k.arg("--getopenfilename");
+        k.arg("--getopenfilename").arg(".").arg(format!(
+            "{} | Documents",
+            crate::core::file_kind::globs(" ")
+        ));
     }
     match k.output() {
         Ok(out) if out.status.success() => {

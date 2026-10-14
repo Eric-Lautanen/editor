@@ -153,7 +153,10 @@ impl FontSystem {
     }
 
     /// Rasterized glyph at `size` px (cached). `None` for blank glyphs
-    /// (space) or codepoints nothing can draw.
+    /// (space) or codepoints nothing can draw. Test-facing shortcut for
+    /// [`Self::glyph_at`]; the app itself always goes through `glyph_at`
+    /// (a variation selector may follow the char).
+    #[cfg(test)]
     pub fn glyph(&self, style: FontStyle, ch: char, size: f32) -> Option<Rc<Glyph>> {
         self.glyph_at(style, ch, None, size)
     }

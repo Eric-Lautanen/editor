@@ -35,7 +35,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         file: None,
         render: None,
         pretty: false,
-        size: (1100, 800),
+        size: platform::DEFAULT_SIZE,
         scale: 1.0,
         dark: false,
         scroll: 0.0,

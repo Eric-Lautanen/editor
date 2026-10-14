@@ -1,4 +1,4 @@
-import json, urllib.request
+import json, sys, urllib.request
 
 BASE = 'http://127.0.0.1:5757'
 TOK = {}
@@ -19,7 +19,7 @@ r = json.loads(urllib.request.urlopen(urllib.request.Request(
 TOK['X-Agent-Token'] = r['agent_token']
 
 resp = json.loads(call('/messages?room=readitor'))
-pt = resp.get('post_token')
-msgs = resp.get('messages', [])
+print(json.dumps(resp)[:2000])
+msgs = resp.get('messages', resp if isinstance(resp, list) else [])
 for m in msgs[-25:]:
-    print('---', m.get('time', ''), m.get('name', ''), ':', m.get('message', '')[:400])
+    print(f"[{m.get('time','')}] {m.get('name','?')}: {m.get('message','')}")

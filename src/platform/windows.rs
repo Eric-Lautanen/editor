@@ -950,13 +950,12 @@ impl Host for WinHost {
     fn open_file_dialog(&mut self) -> Option<std::path::PathBuf> {
         unsafe {
             // Filter pairs, double-NUL terminated: label\0pattern\0…\0\0.
+            // Built from EXTENSIONS so the dialog never drifts from what the
+            // app and the installer claim (see `core::file_kind::globs`).
+            let pattern = crate::core::file_kind::globs(";");
+            let label = format!("Documents ({pattern})");
             let mut filter: Vec<u16> = Vec::new();
-            for s in [
-                "Documents (*.md;*.markdown;*.json;*.jsonl;*.ndjson;*.txt;*.log)",
-                "*.md;*.markdown;*.json;*.jsonl;*.ndjson;*.txt;*.log",
-                "All files (*.*)",
-                "*.*",
-            ] {
+            for s in [&label, &pattern, "All files (*.*)", "*.*"] {
                 filter.extend(s.encode_utf16());
                 filter.push(0);
             }
@@ -983,19 +982,22 @@ impl Host for WinHost {
     fn save_file_dialog(&mut self, default_name: &str) -> Option<std::path::PathBuf> {
         unsafe {
             // Filter pairs, double-NUL terminated: label\0pattern\0…\0\0.
+            // Groups come from SAVE_GROUPS so they cannot drift from the
+            // claimed set (see `core::file_kind`).
+            let mut pairs: Vec<String> = Vec::new();
+            for (label, exts) in crate::core::file_kind::SAVE_GROUPS {
+                let pattern = exts
+                    .iter()
+                    .map(|e| format!("*.{e}"))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                pairs.push(format!("{label} ({pattern})"));
+                pairs.push(pattern);
+            }
+            pairs.push("All files (*.*)".to_string());
+            pairs.push("*.*".to_string());
             let mut filter: Vec<u16> = Vec::new();
-            for s in [
-                "Markdown (*.md;*.markdown)",
-                "*.md;*.markdown",
-                "JSON (*.json)",
-                "*.json",
-                "JSON Lines (*.jsonl;*.ndjson)",
-                "*.jsonl;*.ndjson",
-                "Text (*.txt;*.log)",
-                "*.txt;*.log",
-                "All files (*.*)",
-                "*.*",
-            ] {
+            for s in &pairs {
                 filter.extend(s.encode_utf16());
                 filter.push(0);
             }
@@ -2035,7 +2037,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         // corner). Read before the handler moves into `State`.
         let asked = handler.initial_window();
         let maximized = asked.is_some_and(|g| g.maximized);
-        let (win_w, win_h) = (1100, 800);
+        let (win_w, win_h) = (super::DEFAULT_SIZE.0 as i32, super::DEFAULT_SIZE.1 as i32);
         let (sx, sy) = (
             get_system_metrics(SM_CXSCREEN),
             get_system_metrics(SM_CYSCREEN),

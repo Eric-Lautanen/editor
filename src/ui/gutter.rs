@@ -80,8 +80,13 @@ pub fn paint_with(canvas: &mut Canvas, g: Gutter, area: Rect, scroll: f32) -> f3
     }
 
     // Numbers. Text ops run top-down; skip work when the whole loop would
-    // draw off-pane.
+    // draw off-pane. Rows stop at the file's end: a pane scrolled by a
+    // taller sibling (Split's shared progress) must not invent line numbers
+    // past the last real row.
     for n in first_row..first_row + visible {
+        if n >= line_count {
+            break;
+        }
         let y = area.y + (n as f32 * p.line_h + p.pad) - scroll;
         if y + p.line_h < area.y || y > area.bottom() || y > area.bottom() + p.line_h {
             continue;
@@ -181,6 +186,46 @@ mod tests {
                 .any(|&p| (p & 0xFFFFFF) != c.theme.bg.pack()),
             "rail bar itself must paint"
         );
+    }
+
+    #[test]
+    fn no_phantom_numbers_past_the_last_line() {
+        // Split's shared progress can hand this pane an offset from a much
+        // taller sibling; rows must still stop at the file's end.
+        let (fonts, theme) = ctx();
+        let c = Ctx {
+            fonts: &fonts,
+            theme: &theme,
+            scale: 1.0,
+            zoom: 1.0,
+        };
+        let mut canvas = Canvas::new(200, 120);
+        canvas.fill_rect(Rect::new(0.0, 0.0, 200.0, 120.0), theme.bg);
+        let area = Rect::new(0.0, 0.0, 200.0, 120.0);
+        let rail = paint_with(
+            &mut canvas,
+            Gutter {
+                fonts: c.fonts,
+                theme: c.theme,
+                ctx: &c,
+                caret_line: 99,
+                line_count: 3,
+            },
+            area,
+            1e6,
+        );
+        let rail_ink = theme.code_bg.pack() & 0xFFFFFF;
+        // Inside the rail, clear of its hairline separator: rail bar only,
+        // never digit ink for lines 4+.
+        for y in 0..120 {
+            for x in 0..(rail as usize).saturating_sub(2) {
+                assert_eq!(
+                    canvas.pixels[y * 200 + x] & 0xFFFFFF,
+                    rail_ink,
+                    "phantom number at {x},{y}"
+                );
+            }
+        }
     }
 
     #[test]

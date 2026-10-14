@@ -4,7 +4,7 @@ use crate::{
         file_kind::FileKind,
     },
     error::Result,
-    gfx::{canvas::Canvas, font::FontSystem, geom::Point, geom::Rect},
+    gfx::{canvas::Canvas, color::Color, font::FontSystem, geom::Point, geom::Rect},
     layout::{
         self,
         display_list::{DisplayList, DrawOp},
@@ -18,7 +18,7 @@ use crate::{
         about,
         editor_view::EditorView,
         event::{CursorShape, Event, Key, Modifiers, MouseButton, WindowGeometry},
-        gutter, help, menu,
+        find, gutter, help, menu,
         preview_view::{self, PaneMetrics, PaneScroll, PreviewView, Row as PreviewRow, SbGeom},
         scroll::ScrollState,
         statusbar,
@@ -81,13 +81,21 @@ pub struct Tab {
     pub editor: EditorView,
     /// Plain-text pane backing Edit mode and the bottom half of Split.
     pub editor_pane: PreviewView,
+    /// Last saved (or loaded) text, normalized exactly as the buffer holds
+    /// it. `dirty` is recomputed against this after every edit, so undoing
+    /// back to the saved content clears the tab's save button again.
+    pub saved_text: String,
     /// Collapsed JSON tree nodes (pre-order ids, stable across toggles).
     pub collapsed: HashSet<usize>,
     /// Right-side status suffix set by layout (`error 2:5`, `3 records`, …).
     pub status_extra: String,
     pub scroll: ScrollState,
-    /// Horizontal scroll of the editor pane (no-wrap lines) and its max.
+    /// Horizontal scroll of the editor pane (no-wrap lines), its glide
+    /// destination, and its max. Mirrors the vertical scroller: coarse
+    /// wheel steps glide `h_scroll` toward `h_target` over frames, while
+    /// pointer-driven input (thumb drag, finger, caret) sets both at once.
     pub h_scroll: f32,
+    pub h_target: f32,
     pub h_max: f32,
     /// File modification time as last seen or written (reload detection).
     pub mtime: Option<std::time::SystemTime>,
@@ -119,10 +127,12 @@ impl Tab {
             buffer: Buffer::from_text(""),
             editor: EditorView::default(),
             editor_pane: PreviewView::default(),
+            saved_text: String::new(),
             collapsed: HashSet::new(),
             status_extra: String::new(),
             scroll: ScrollState::default(),
             h_scroll: 0.0,
+            h_target: 0.0,
             h_max: 0.0,
             mtime: None,
         }
@@ -135,9 +145,14 @@ impl Tab {
         if let Some(msg) = size_error(std::fs::metadata(&p)?.len()) {
             return Err(crate::error::Error::Platform(msg));
         }
+        let buffer = Buffer::from_text(&std::fs::read_to_string(&p)?);
+        // Snapshot the normalized text (line endings are stripped on load),
+        // so a file the user never touches never compares dirty.
+        let saved_text = buffer.text();
         Ok(Self {
             kind: FileKind::from_path(&p),
-            buffer: Buffer::from_text(&std::fs::read_to_string(&p)?),
+            buffer,
+            saved_text,
             mtime: std::fs::metadata(&p).and_then(|m| m.modified()).ok(),
             path: Some(p),
             ..Self::untitled()
@@ -179,6 +194,8 @@ pub struct App {
     help_open: bool,
     /// F2 about box visible.
     about_open: bool,
+    /// Live Ctrl+F find bar, if open.
+    find: Option<find::Find>,
     /// Live right-click context menu, if any.
     menu: Option<menu::Menu>,
     /// Second Ctrl+W on a dirty tab discards it; any other action clears.
@@ -273,13 +290,14 @@ impl App {
             fonts: FontSystem::load_embedded(),
             preview: PreviewView::default(),
             drag_anchor: None,
-            size: (1100, 800),
+            size: platform::DEFAULT_SIZE,
             scale: 1.0,
             edge: platform::edge_grip(),
             zoom: 1.0,
             layout_dirty: true,
             help_open: false,
             about_open: false,
+            find: None,
             menu: None,
             close_armed: false,
             hover_title: None,
@@ -401,18 +419,48 @@ impl App {
         host.quit();
     }
 
-    /// Horizontal wheel/trackpad movement pans the no-wrap editor lines;
-    /// preview panes wrap, so they have nothing to pan.
-    fn pan_horizontal(&mut self, dx: f32) {
+    /// Set the horizontal position outright: thumb drags, track pages, the
+    /// finger, caret follow. Pointer-driven, so any wheel glide ends with it.
+    fn set_h_scroll(&mut self, offset: f32) {
+        self.h_scroll = offset.clamp(0.0, self.h_max);
+        self.h_target = self.h_scroll;
+    }
+
+    /// Horizontal wheel/trackpad movement pans the no-wrap editor lines with
+    /// the same glide coarse steps get vertically; fine deltas go straight
+    /// through. Preview panes wrap, so they have nothing to pan.
+    fn pan_horizontal(&mut self, dx: f32, host: &mut dyn Host) {
+        if self.mode == Mode::Preview {
+            return;
+        }
+        let step = -dx;
+        if step.abs() >= GLIDE_MIN_STEP {
+            self.h_target = (self.h_target + step).clamp(0.0, self.h_max);
+            self.h_scroll = self.h_scroll.clamp(0.0, self.h_max);
+            if (self.h_target - self.h_scroll).abs() <= crate::ui::scroll::GLIDE_SETTLED {
+                self.h_scroll = self.h_target;
+            }
+            self.start_glide_clock(host);
+        } else {
+            self.set_h_scroll(self.h_scroll + step);
+        }
+        host.request_redraw();
+    }
+
+    /// Touch panning stays exactly on the finger: direct, and any wheel glide
+    /// in flight ends (its remaining distance belongs to the wheel, not to
+    /// the finger) — the horizontal half of what `scroll_direct` does
+    /// vertically.
+    fn pan_horizontal_direct(&mut self, dx: f32) {
         if self.mode != Mode::Preview {
-            self.h_scroll = (self.h_scroll - dx).clamp(0.0, self.h_max);
+            self.set_h_scroll(self.h_scroll - dx);
         }
     }
 
     /// Start (or refresh) the animation clock: the glide or coast needs
     /// frames, and on a host without one the 40 ms heartbeat steps it.
     fn start_glide_clock(&mut self, host: &mut dyn Host) {
-        if self.scroll.animating() && !self.scrolling {
+        if (self.scroll.animating() || self.h_scroll != self.h_target) && !self.scrolling {
             // A zero-velocity release leaves nothing to animate; don't start
             // the host's frame clock for it.
             self.scrolling = true;
@@ -457,34 +505,41 @@ impl App {
 
     /// Move the view *now*, because the pointer is driving it — a scrollbar
     /// drag, drag auto-scroll, a finger. Any glide in flight is over (the view
-    /// is where the pointer puts it), and the host's fast clock goes with it.
+    /// is where the pointer puts it), and the host's fast clock goes with it
+    /// unless the horizontal glide still needs frames.
     fn scroll_direct(&mut self, dy: f32, host: &mut dyn Host) {
         self.scroll.scroll_by(dy);
         self.end_glide(host);
         host.request_redraw();
     }
 
-    /// Stop the animation clock. Safe when nothing is animating.
+    /// Stop the animation clock. Safe when anything is still animating: the
+    /// clock stays up until both axes have arrived.
     fn end_glide(&mut self, host: &mut dyn Host) {
-        if self.scrolling {
+        if self.scrolling && !self.scroll.animating() && self.h_scroll == self.h_target {
             self.scrolling = false;
             host.set_animating(false);
         }
     }
 
-    /// One animation frame: advance an in-flight glide, and stop asking for
-    /// frames once it has arrived (the last frame is still painted).
+    /// One animation frame: advance in-flight glides, and stop asking for
+    /// frames once everything has arrived (the last frame is still painted).
     fn on_frame(&mut self, host: &mut dyn Host) {
         if !self.scrolling {
             return;
         }
         let now = Instant::now();
-        let dt_ms = (now - self.last_frame).as_secs_f32() * 1000.0;
-        self.last_frame = now;
         // A long gap (a stall, a host that only runs the heartbeat) is clamped:
         // the easing must not jump the whole distance because a frame was late.
-        self.scroll.step(dt_ms.clamp(1.0, 100.0));
-        if self.scroll.animating() {
+        let dt_ms = ((now - self.last_frame).as_secs_f32() * 1000.0).clamp(1.0, 100.0);
+        self.last_frame = now;
+        self.scroll.step(dt_ms);
+        // The horizontal glide rides the same clock with the same easing.
+        self.h_target = self.h_target.clamp(0.0, self.h_max);
+        if self.h_scroll != self.h_target {
+            self.h_scroll = crate::ui::scroll::glide_step(self.h_scroll, self.h_target, dt_ms);
+        }
+        if self.scroll.animating() || self.h_scroll != self.h_target {
             host.request_redraw();
         } else {
             self.scrolling = false;
@@ -666,14 +721,14 @@ impl App {
                 let view = self.viewport();
                 Some((
                     x - view.x - rail + self.h_scroll,
-                    y - view.y + self.scroll.offset,
+                    y - view.y + self.editor_scroll(),
                 ))
             }
             Mode::Split => {
                 let right = self.split_panes().1;
                 (x >= right.x).then_some((
                     x - right.x - rail + self.h_scroll,
-                    y - right.y + self.scroll.offset,
+                    y - right.y + self.editor_scroll(),
                 ))
             }
             Mode::Preview => None,
@@ -685,28 +740,80 @@ impl App {
     fn toggle_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
         let view = self.viewport();
         match self.mode {
-            Mode::Preview => Some((x - view.x, y - view.y + self.scroll.offset)),
+            Mode::Preview => Some((x - view.x, y - view.y + self.preview_scroll())),
             Mode::Split if x < self.split_panes().0.right() => {
-                Some((x - view.x, y - view.y + self.scroll.offset))
+                Some((x - view.x, y - view.y + self.preview_scroll()))
             }
             _ => None,
         }
     }
 
+    /// Shared 0..1 progress through the document: the thing both Split
+    /// thumbs stay locked to. One pixel offset cannot serve two panes of
+    /// different heights — the short pane would sail past its own end — so
+    /// each pane paints its own share of this ratio instead.
+    fn scroll_ratio(&self) -> f32 {
+        let max = self.scroll.max();
+        if max <= 0.0 {
+            0.0
+        } else {
+            (self.scroll.offset / max).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Max scrollable pixels of the preview pane.
+    fn preview_max(&self) -> f32 {
+        (self.preview.list.height - self.viewport().h).max(0.0)
+    }
+
+    /// Max scrollable pixels of the editor pane.
+    fn editor_max(&self) -> f32 {
+        (self.editor_pane.list.height - self.editor_area().h).max(0.0)
+    }
+
+    /// What the preview pane paints and hit-tests at: its own share of the
+    /// shared progress. Identity outside Split.
+    fn preview_scroll(&self) -> f32 {
+        if self.mode == Mode::Split {
+            self.scroll_ratio() * self.preview_max()
+        } else {
+            self.scroll.offset
+        }
+    }
+
+    /// What the editor pane paints and hit-tests at (text, gutter, caret,
+    /// thumb): its own share of the shared progress, so it only ever shows
+    /// real lines. Identity outside Split.
+    fn editor_scroll(&self) -> f32 {
+        if self.mode == Mode::Split {
+            self.scroll_ratio() * self.editor_max()
+        } else {
+            self.scroll.offset
+        }
+    }
+
+    /// A pane-space position back onto the shared scroller (thumb drag,
+    /// caret follow): keep the ratio, end any ride, like `scroll_by(0)`.
+    fn set_scroll_ratio(&mut self, ratio: f32) {
+        let max = self.scroll.max();
+        self.scroll.offset = (ratio.clamp(0.0, 1.0) * max).clamp(0.0, max);
+        self.scroll.scroll_by(0.0);
+    }
+
     /// Current geometry of one pane's scrollbar (editor pane?, horizontal?).
     fn sb_geom(&self, editor: bool, horizontal: bool) -> Option<SbGeom> {
         let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
-        let ps = PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail);
+        let ps = PaneScroll::editor(self.editor_scroll(), self.h_scroll, self.h_max, rail);
         match (self.mode, editor, horizontal) {
             (Mode::Preview, _, false) => {
                 self.preview
-                    .v_sb(self.viewport(), self.scroll.offset, self.metrics())
+                    .v_sb(self.viewport(), self.preview_scroll(), self.metrics())
             }
             (Mode::Edit, true, true) => self.editor_pane.h_sb(self.viewport(), ps, self.metrics()),
             (Mode::Edit, _, false) => self.editor_pane.v_sb(self.viewport(), ps.y, self.metrics()),
             (Mode::Split, false, false) => {
                 self.preview
-                    .v_sb(self.split_panes().0, self.scroll.offset, self.metrics())
+                    .v_sb(self.split_panes().0, self.preview_scroll(), self.metrics())
             }
             (Mode::Split, true, true) => {
                 self.editor_pane
@@ -861,6 +968,7 @@ impl App {
             // farther before hitting the right edge.
             tab.h_max = (extent + rail + 32.0 * self.scale - edit_w).max(0.0);
             tab.h_scroll = tab.h_scroll.min(tab.h_max);
+            tab.h_target = tab.h_target.min(tab.h_max);
         }
         let content = match self.mode {
             Mode::Preview => list.height,
@@ -873,6 +981,14 @@ impl App {
         tab.scroll.scroll_by(0.0);
         self.preview.list = list;
         self.preview_rows = self.preview.rows(&self.fonts);
+        // The find bar's matches belong to the active buffer: re-run the
+        // search whenever the content, tab, or view changed (all of which
+        // dirty layout). No jump — paint must not move the view.
+        if let Some(mut f) = self.find.take() {
+            let caret = self.tabs[self.active].editor.caret;
+            f.refresh(&self.tabs[self.active].buffer, caret);
+            self.find = Some(f);
+        }
         self.layout_dirty = false;
     }
 
@@ -880,8 +996,18 @@ impl App {
     /// screen. (Split's top pane re-renders through `relayout` on paint.)
     fn after_edit(&mut self) {
         self.layout_dirty = true;
+        self.sync_dirty();
         self.poke_caret();
         self.follow_caret();
+    }
+
+    /// Recompute the dirty flag against the last saved text: every mutation
+    /// (typing, delete, paste, cut, undo, redo) funnels through
+    /// `after_edit`, so undoing back to the saved content clears the tab's
+    /// save button again instead of leaving it stuck on.
+    fn sync_dirty(&mut self) {
+        let dirty = self.buffer.text() != self.saved_text;
+        self.buffer.dirty = dirty;
     }
 
     /// Caret blink phase: visible for the first half of each blink window.
@@ -907,6 +1033,7 @@ impl App {
                 self.menu = None;
                 self.help_open = false;
                 self.about_open = false;
+                self.find = None;
                 self.clear_preview_sel();
             }
             // The two overlays are mutually exclusive.
@@ -948,6 +1075,29 @@ impl App {
                 self.layout_dirty = true;
                 self.persist();
             }
+            Key::Char('f') if mods.ctrl => {
+                // Opening the bar closes the full-window overlays; an already
+                // open bar keeps its query (Ctrl+F is "focus", not "reset").
+                if self.find.is_none() {
+                    self.find = Some(find::Find::default());
+                    self.help_open = false;
+                    self.about_open = false;
+                }
+            }
+            // -- find bar (while open) ---------------------------------------
+            // The bar owns the plain editing keys: typing goes to the query
+            // (via `Event::Text`), Backspace edits it, Enter/F3 step through
+            // the matches. Ctrl chords stay app chords.
+            Key::Backspace | Key::Delete if self.find.is_some() && !mods.ctrl && !mods.alt => {
+                if key == Key::Backspace {
+                    self.find_pop();
+                }
+            }
+            Key::Enter if self.find.is_some() && !mods.ctrl && !mods.alt => {
+                self.find_step(mods.shift, host);
+            }
+            Key::Tab if self.find.is_some() && !mods.ctrl && !mods.alt => {}
+            Key::F(3) if self.find.is_some() => self.find_step(mods.shift, host),
             // -- editing chords (need the editor pane) -----------------------
             Key::Char('a') if mods.ctrl && self.mode != Mode::Preview => {
                 let tab = &mut self.tabs[self.active];
@@ -1059,6 +1209,12 @@ impl App {
             host.request_redraw();
             return;
         }
+        // The find bar swallows presses on itself; Escape and Ctrl+F own
+        // closing it, so a click elsewhere just does what it normally does.
+        if self.find.is_some() && self.find_bar_rect().contains(Point { x, y }) {
+            host.request_redraw();
+            return;
+        }
         // Title bar: tabs and window buttons.
         if y < titlebar::HEIGHT * self.scale {
             let lay = titlebar::layout(
@@ -1167,7 +1323,7 @@ impl App {
                 };
                 let delta = if lead > pointer { -page } else { page };
                 if horizontal {
-                    self.h_scroll = (self.h_scroll + delta).clamp(0.0, self.h_max);
+                    self.set_h_scroll(self.h_scroll + delta);
                 } else {
                     self.scroll_direct(delta, host);
                 }
@@ -1307,16 +1463,17 @@ impl App {
             self.hover_title = hit;
             host.request_redraw();
         }
-        // Overlay-scrollbar drag: the thumb follows the pointer.
+        // Overlay-scrollbar drag: the thumb follows the pointer. A vertical
+        // drag sets the shared ratio through whichever pane's bar is held,
+        // so both Split thumbs stay locked together.
         if let Some(drag) = self.sb_drag.as_ref().copied() {
             if let Some(g) = self.sb_geom(drag.editor, drag.horizontal) {
                 let pointer = if drag.horizontal { x } else { y };
                 let offset = g.offset_for(pointer - drag.grab);
                 if drag.horizontal {
-                    self.h_scroll = offset;
-                } else {
-                    self.scroll.offset = offset;
-                    self.scroll.scroll_by(0.0);
+                    self.set_h_scroll(offset);
+                } else if g.max > 0.0 {
+                    self.set_scroll_ratio(offset / g.max);
                 }
                 host.request_redraw();
             }
@@ -1440,7 +1597,17 @@ impl App {
     }
 
     fn on_text(&mut self, s: &str, host: &mut dyn Host) {
-        if self.mode == Mode::Preview || s.chars().any(char::is_control) {
+        if s.chars().any(char::is_control) {
+            return;
+        }
+        // The find bar owns plain typing while it is open.
+        if let Some(f) = self.find.as_mut() {
+            f.query.push_str(s);
+            self.find_refresh_and_jump();
+            host.request_redraw();
+            return;
+        }
+        if self.mode == Mode::Preview {
             return;
         }
         self.close_armed = false;
@@ -1448,6 +1615,107 @@ impl App {
         tab.editor.insert_text(&mut tab.buffer, s);
         self.after_edit();
         host.request_redraw();
+    }
+
+    /// Find-bar glue (the bar's state lives in `ui::find`; these are the App
+    /// side effects the key/text bindings call).
+    /// Backspace in the query: drop a char and re-land on a match.
+    fn find_pop(&mut self) {
+        let Some(f) = self.find.as_mut() else { return };
+        f.query.pop();
+        self.find_refresh_and_jump();
+    }
+
+    /// Enter/F3: step to the next (Shift: previous) match and show it.
+    fn find_step(&mut self, back: bool, _host: &mut dyn Host) {
+        let Some(f) = self.find.as_mut() else { return };
+        f.step(back);
+        self.find_jump();
+    }
+
+    /// Typing in the query: recompute matches from the caret and show one.
+    /// The state is taken out and put back so `refresh` can see the buffer:
+    /// both reach through the tab `Deref`, which the borrow checker reads
+    /// as a whole-`App` borrow either way.
+    fn find_refresh_and_jump(&mut self) {
+        let caret = self.editor.caret;
+        if let Some(mut f) = self.find.take() {
+            f.refresh(&self.buffer, caret);
+            self.find = Some(f);
+        } else {
+            return;
+        }
+        self.find_jump();
+    }
+
+    /// Show the current find match: the editor selection in Edit/Split (with
+    /// the caret following it). Preview has no buffer-offset geometry, so
+    /// there the view scrolls to the row containing the current occurrence.
+    fn find_jump(&mut self) {
+        if self.mode == Mode::Preview {
+            if let Some(n) = self
+                .find
+                .as_ref()
+                .filter(|f| !f.query.is_empty())
+                .map(|f| f.current)
+            {
+                self.find_scroll_preview(n);
+            }
+            return;
+        }
+        let Some((a, b)) = self.find.as_ref().and_then(|f| f.current_match()) else {
+            return;
+        };
+        self.editor.anchor = Some(a);
+        self.editor.caret = b;
+        self.follow_caret();
+    }
+
+    /// Preview's best effort at "go to the current match": scroll to the row
+    /// holding that occurrence of the query, counting occurrences across
+    /// rows in order. Rendered rows can differ from the source (Markdown), so
+    /// a query the preview cannot show just leaves the view where it is.
+    fn find_scroll_preview(&mut self, occurrence: usize) {
+        let needle = match &self.find {
+            Some(f) if !f.query.is_empty() => f.query.to_lowercase(),
+            _ => return,
+        };
+        let mut want = occurrence;
+        let mut target = None;
+        for row in &self.preview_rows {
+            let text = row.text.to_lowercase();
+            let mut at = 0;
+            let mut hits = 0;
+            while let Some(i) = text[at..].find(&needle) {
+                hits += 1;
+                at += i + needle.len();
+            }
+            if hits == 0 {
+                continue;
+            }
+            if want < hits {
+                target = Some(row.top);
+                break;
+            }
+            want -= hits;
+        }
+        if let Some(top) = target {
+            let tab = &mut self.tabs[self.active];
+            tab.scroll.offset = (top - 32.0 * self.scale).max(0.0);
+            tab.scroll.scroll_by(0.0);
+        }
+    }
+
+    /// The find bar's rect right now (pure `find::bar_rect`), or a rect no
+    /// point can hit while the bar is closed.
+    fn find_bar_rect(&self) -> Rect {
+        match &self.find {
+            Some(f) => {
+                let status = f.status();
+                find::bar_rect(&self.fonts, self.viewport(), self.scale, &f.query, &status)
+            }
+            None => Rect::new(0.0, 0.0, 0.0, 0.0),
+        }
     }
 
     /// Click in a preview area: toggles and links. Returns true when the
@@ -1564,8 +1832,10 @@ impl App {
                 p
             }
         };
-        match std::fs::write(&path, self.buffer.text()) {
+        let text = self.buffer.text();
+        match std::fs::write(&path, &text) {
             Ok(()) => {
+                self.saved_text = text;
                 self.buffer.dirty = false;
                 self.status_extra.clear();
                 self.close_armed = false;
@@ -1585,6 +1855,7 @@ impl App {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 self.buffer = Buffer::from_text(&text);
+                self.saved_text = self.buffer.text();
                 self.editor.caret = self.buffer.clamp(self.editor.caret);
                 self.editor.anchor = None;
                 self.clear_preview_sel();
@@ -1637,19 +1908,23 @@ impl App {
         let vis_w = (viewport_w - rail).max(1.0);
         let line_h = self.editor.line_height(viewport_w, &ctx);
         let view_h = self.editor_area().h;
-        self.scroll.offset = self
+        // Keep the caret visible in editor space, then carry the shared
+        // ratio along: identity outside Split.
+        let want = self
             .editor
-            .ensure_visible(doc_y, line_h, view_h, self.scroll.offset);
-        self.scroll.scroll_by(0.0);
+            .ensure_visible(doc_y, line_h, view_h, self.editor_scroll());
+        let ed_max = self.editor_max();
+        self.set_scroll_ratio(if ed_max > 0.0 { want / ed_max } else { 0.0 });
         let margin = 32.0 * self.scale;
-        self.h_scroll = if doc_x < self.h_scroll + margin {
+        // Caret tracking is pointer-like: it sets the position outright,
+        // ending any wheel glide rather than fighting it.
+        self.set_h_scroll(if doc_x < self.h_scroll + margin {
             (doc_x - margin).max(0.0)
         } else if doc_x > self.h_scroll + vis_w - margin {
             doc_x - vis_w + margin
         } else {
             self.h_scroll
-        }
-        .clamp(0.0, self.h_max);
+        });
     }
 
     /// Paint selection + caret over an editor pane (document space -> pane).
@@ -1677,6 +1952,52 @@ impl App {
             &ctx,
             self.caret_visible(),
         );
+        // Find-bar matches tint the pane below the selection/caret: the
+        // current match is the editor selection, so it is skipped here.
+        if let Some(f) = &self.find {
+            let tint = Color::rgba(
+                self.theme.accent.r,
+                self.theme.accent.g,
+                self.theme.accent.b,
+                56,
+            );
+            let line_h = self.editor.line_height(area.w + self.h_scroll + rail, &ctx);
+            // The editor pane never wraps, so line i sits at pad + i*line_h:
+            // only the matches whose rows can be on screen pay for rects.
+            let first = ((scroll / line_h) as usize).saturating_sub(1);
+            let last = (((scroll + area.h) / line_h) as usize).saturating_add(1);
+            let mut painted = false;
+            for (i, &(from, to)) in f.matches.iter().enumerate() {
+                if from.line < first || from.line > last || i == f.current {
+                    continue;
+                }
+                for rect in layout::text::selection_rects(
+                    &self.buffer,
+                    from,
+                    to,
+                    area.w + self.h_scroll + rail,
+                    &ctx,
+                    false,
+                ) {
+                    if !painted {
+                        canvas.set_clip(Some(area));
+                        painted = true;
+                    }
+                    canvas.fill_rect(
+                        Rect::new(
+                            rect.x + area.x - self.h_scroll + rail,
+                            rect.y + area.y - scroll,
+                            rect.w,
+                            rect.h,
+                        ),
+                        tint,
+                    );
+                }
+            }
+            if painted {
+                canvas.set_clip(None);
+            }
+        }
         if ops.is_empty() {
             return;
         }
@@ -1790,49 +2111,53 @@ impl App {
         let view = self.viewport();
         match self.mode {
             Mode::Preview => {
+                let scroll = self.preview_scroll();
                 self.preview.paint(
                     canvas,
                     &self.fonts,
                     &self.theme,
                     view,
-                    PaneScroll::vertical(self.scroll.offset),
+                    PaneScroll::vertical(scroll),
                     self.metrics(),
                 );
-                self.paint_preview_selection(canvas, view, self.scroll.offset);
+                self.paint_preview_selection(canvas, view, scroll);
             }
             Mode::Edit => {
                 let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
+                let scroll = self.editor_scroll();
                 self.editor_pane.paint(
                     canvas,
                     &self.fonts,
                     &self.theme,
                     view,
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    PaneScroll::editor(scroll, self.h_scroll, self.h_max, rail),
                     self.metrics(),
                 );
-                self.paint_editor_overlay(canvas, view, self.scroll.offset);
+                self.paint_editor_overlay(canvas, view, scroll);
             }
             Mode::Split => {
                 let (left, right) = self.split_panes();
                 let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
+                let preview = self.preview_scroll();
+                let editor = self.editor_scroll();
                 self.preview.paint(
                     canvas,
                     &self.fonts,
                     &self.theme,
                     left,
-                    PaneScroll::vertical(self.scroll.offset),
+                    PaneScroll::vertical(preview),
                     self.metrics(),
                 );
-                self.paint_preview_selection(canvas, left, self.scroll.offset);
+                self.paint_preview_selection(canvas, left, preview);
                 self.editor_pane.paint(
                     canvas,
                     &self.fonts,
                     &self.theme,
                     right,
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    PaneScroll::editor(editor, self.h_scroll, self.h_max, rail),
                     self.metrics(),
                 );
-                self.paint_editor_overlay(canvas, right, self.scroll.offset);
+                self.paint_editor_overlay(canvas, right, editor);
                 // The seam between the panes.
                 canvas.fill_rect(self.split_divider(), self.theme.rule);
             }
@@ -1874,20 +2199,21 @@ impl App {
     }
 
     fn status_bar_text(&self) -> (String, String) {
+        // The tab already names the file, so the bar leaves it out: caret
+        // position (and selection) in Edit, otherwise nothing on the left.
         let left = if self.mode == Mode::Edit {
-            let name = self.title().replace(" — Readitor", "");
             let sel = if self.editor.selection().is_some() {
                 " [sel]"
             } else {
                 ""
             };
             format!(
-                "{name}  Ln {}, Col {}{sel}",
+                "Ln {}, Col {}{sel}",
                 self.editor.caret.line + 1,
                 char_col(&self.buffer, self.editor.caret),
             )
         } else {
-            self.title().replace(" — Readitor", "")
+            String::new()
         };
         let lines = self.buffer.line_count();
         let right = format!(
@@ -1972,14 +2298,14 @@ impl Handler for App {
                 host.request_redraw();
             }
             Event::Scroll { dx, dy } => {
-                self.pan_horizontal(dx);
+                self.pan_horizontal(dx, host);
                 self.scroll_input(-dy, host);
             }
             Event::Pan { dx, dy } => {
                 // Direct manipulation: follow the finger exactly, no glide —
                 // and drop any glide that was in flight (its remaining
                 // distance belongs to the wheel, not to the finger).
-                self.pan_horizontal(dx);
+                self.pan_horizontal_direct(dx);
                 self.scroll_direct(-dy, host);
             }
             Event::PanEnd { vx, vy } => self.coast(vx, vy, host),
@@ -2057,6 +2383,17 @@ impl Handler for App {
         if let Some(m) = &self.menu {
             m.paint(canvas, &self.fonts, &self.theme, self.scale);
         }
+        if let Some(f) = &self.find {
+            find::paint(
+                canvas,
+                &self.fonts,
+                &self.theme,
+                view,
+                self.scale,
+                f,
+                self.caret_visible(),
+            );
+        }
         if self.help_open {
             let _ = help::paint(
                 canvas,
@@ -2121,6 +2458,10 @@ impl Handler for App {
         if self.menu.is_some() || self.help_open || self.about_open {
             return CursorShape::Arrow;
         }
+        // The find bar is chrome, not text (the query has no click-to-place).
+        if self.find.is_some() && self.find_bar_rect().contains(Point { x, y }) {
+            return CursorShape::Arrow;
+        }
         if y < titlebar::HEIGHT * self.scale {
             let labels = self.tab_labels();
             let lay = titlebar::layout(&self.fonts, &labels, self.size.0 as f32, self.scale);
@@ -2144,7 +2485,7 @@ impl Handler for App {
             Mode::Preview => {
                 if self.preview.scrollbar_hit(
                     self.viewport(),
-                    PaneScroll::vertical(self.scroll.offset),
+                    PaneScroll::vertical(self.preview_scroll()),
                     self.metrics(),
                     p,
                 ) {
@@ -2155,7 +2496,7 @@ impl Handler for App {
                 let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
                 if self.editor_pane.scrollbar_hit(
                     self.viewport(),
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    PaneScroll::editor(self.editor_scroll(), self.h_scroll, self.h_max, rail),
                     self.metrics(),
                     p,
                 ) {
@@ -2167,12 +2508,12 @@ impl Handler for App {
                 let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
                 if self.preview.scrollbar_hit(
                     left,
-                    PaneScroll::vertical(self.scroll.offset),
+                    PaneScroll::vertical(self.preview_scroll()),
                     self.metrics(),
                     p,
                 ) || self.editor_pane.scrollbar_hit(
                     right,
-                    PaneScroll::editor(self.scroll.offset, self.h_scroll, self.h_max, rail),
+                    PaneScroll::editor(self.editor_scroll(), self.h_scroll, self.h_max, rail),
                     self.metrics(),
                     p,
                 ) {
@@ -2262,6 +2603,113 @@ mod tests {
         let msg = size_error(MAX_OPEN_BYTES + 1).expect("over the limit refuses");
         assert!(msg.contains("64 MB"), "names the limit: {msg}");
         assert!(msg.contains("larger than"), "says which way: {msg}");
+    }
+
+    /// `Event::KeyDown` for a plain (unmodified) key.
+    fn plain(key: Key) -> Event {
+        Event::KeyDown {
+            key,
+            mods: Modifiers::default(),
+        }
+    }
+
+    /// `Event::KeyDown` for a key with only Shift held.
+    fn shifted(key: Key) -> Event {
+        Event::KeyDown {
+            key,
+            mods: Modifiers {
+                ctrl: false,
+                alt: false,
+                shift: true,
+            },
+        }
+    }
+
+    #[test]
+    fn find_bar_opens_types_and_selects_the_first_match() {
+        let mut app = App::new(None).unwrap();
+        app.buffer = Buffer::from_text("one two\nthree one\none");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('f'), &mut host);
+        assert!(app.find.is_some(), "Ctrl+F opens the bar");
+        // Typing goes to the query, never the buffer.
+        app.on_event(Event::Text("one".into()), &mut host);
+        assert_eq!(app.buffer.text(), "one two\nthree one\none");
+        assert!(!app.buffer.dirty);
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.matches.len(), 3);
+        assert_eq!(f.status(), "1/3");
+        // The current match is the editor selection.
+        assert_eq!(app.editor.selection(), Some(f.matches[0]));
+        // Ctrl+F again keeps the query; Escape closes.
+        app.on_event(ctrl('f'), &mut host);
+        assert_eq!(app.find.as_ref().unwrap().query, "one");
+        app.on_event(plain(Key::Escape), &mut host);
+        assert!(app.find.is_none());
+    }
+
+    #[test]
+    fn find_bar_enter_and_f3_step_with_wrap() {
+        let mut app = App::new(None).unwrap();
+        app.buffer = Buffer::from_text("a a\nb\na");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('f'), &mut host);
+        app.on_event(Event::Text("a".into()), &mut host);
+        app.on_event(plain(Key::Enter), &mut host);
+        assert_eq!(app.find.as_ref().unwrap().status(), "2/3");
+        app.on_event(plain(Key::Enter), &mut host);
+        app.on_event(plain(Key::Enter), &mut host);
+        assert_eq!(app.find.as_ref().unwrap().status(), "1/3", "wraps forward");
+        app.on_event(shifted(Key::Enter), &mut host);
+        assert_eq!(app.find.as_ref().unwrap().status(), "3/3", "wraps backward");
+        app.on_event(plain(Key::F(3)), &mut host);
+        assert_eq!(app.find.as_ref().unwrap().status(), "1/3", "F3 steps too");
+    }
+
+    #[test]
+    fn find_bar_reports_zero_and_backspace_edits_the_query() {
+        let mut app = App::new(None).unwrap();
+        app.buffer = Buffer::from_text("one two");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('f'), &mut host);
+        app.on_event(Event::Text("onex".into()), &mut host);
+        assert_eq!(app.find.as_ref().unwrap().status(), "0 matches");
+        app.on_event(plain(Key::Backspace), &mut host);
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.query, "one");
+        assert_eq!(f.status(), "1/1");
+        assert_eq!(app.buffer.text(), "one two", "buffer untouched");
+    }
+
+    #[test]
+    fn find_bar_search_is_case_insensitive() {
+        let mut app = App::new(None).unwrap();
+        app.buffer = Buffer::from_text("Alpha ALPHA alPHA");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('f'), &mut host);
+        app.on_event(Event::Text("alpha".into()), &mut host);
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 3);
+    }
+
+    #[test]
+    fn find_bar_in_preview_counts_and_jumps_to_the_row() {
+        let text = format!("{}the needle\n", "filler row of text\n".repeat(80));
+        let mut app = open("readitor_test_findprev.txt", &text);
+        let _ = app.render_headless(400, 300, 1.0);
+        let mut host = NullHost::default();
+        app.on_event(ctrl('f'), &mut host);
+        app.on_event(Event::Text("needle".into()), &mut host);
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.matches.len(), 1);
+        assert_eq!(f.status(), "1/1");
+        assert!(
+            app.scroll.offset > 0.0,
+            "preview should scroll to the match row, offset {}",
+            app.scroll.offset
+        );
+        // Escape closes the bar there too.
+        app.on_event(plain(Key::Escape), &mut host);
+        assert!(app.find.is_none());
     }
 
     #[test]
@@ -2654,6 +3102,32 @@ mod tests {
         let _ = app.render_headless(800, 600, 1.0);
         let lay = titlebar::layout(&app.fonts, &app.tab_labels(), 800.0, app.scale);
         assert!(lay.saves[0].is_none());
+    }
+
+    #[test]
+    fn undo_back_to_saved_clears_the_save_button() {
+        // The report: type, see the save button pop up, undo it all — and
+        // the button stayed up. Dirty now means "differs from saved",
+        // recomputed on every edit, so it clears again.
+        let mut app = open("readitor_test_undoclean.txt", "hello");
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host); // Edit
+        assert!(!app.buffer.dirty, "a just-opened file is clean");
+        app.on_event(Event::Text("!".into()), &mut host);
+        assert!(app.buffer.dirty);
+        let _ = app.render_headless(800, 600, 1.0);
+        let lay = titlebar::layout(&app.fonts, &app.tab_labels(), 800.0, app.scale);
+        assert!(lay.saves[0].is_some(), "dirty tab shows a save button");
+        // Undo the keystroke: the content matches the file again.
+        app.on_event(ctrl('z'), &mut host);
+        assert_eq!(app.buffer.text(), "hello");
+        assert!(!app.buffer.dirty, "undo-to-saved must clear dirty");
+        let _ = app.render_headless(800, 600, 1.0);
+        let lay = titlebar::layout(&app.fonts, &app.tab_labels(), 800.0, app.scale);
+        assert!(lay.saves[0].is_none(), "the save button must go away");
+        // And re-editing raises it again.
+        app.on_event(Event::Text("?".into()), &mut host);
+        assert!(app.buffer.dirty);
     }
 
     #[test]
@@ -3523,6 +3997,123 @@ mod tests {
         );
     }
 
+    /// Long wrapping paragraphs: the preview runs much taller than the
+    /// source lines, which is the Split case the ratio lock exists for.
+    fn open_long_preview(name: &str) -> App {
+        let para = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do ";
+        let text = (0..40)
+            .map(|_| para.repeat(6).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut app = open(name, &format!("# Long\n\n{text}\n"));
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host);
+        app.on_event(ctrl('e'), &mut host); // Split
+        app
+    }
+
+    #[test]
+    fn split_scroll_shares_a_ratio_not_pixels() {
+        // The report: with a long preview the shared pixel offset sailed the
+        // short editor pane past its own end (phantom gutter rows, pinned
+        // thumb). Each pane now paints its own share of one ratio.
+        let mut app = open_long_preview("readitor_test_splitratio.md");
+        let _ = app.render_headless(1000, 700, 1.0);
+        assert!(
+            app.preview_max() > app.editor_max() * 1.5,
+            "setup needs a much longer preview: {} vs {}",
+            app.preview_max(),
+            app.editor_max()
+        );
+        // Bottom: the editor stops at its own end while the ratios agree.
+        app.scroll.offset = app.scroll.max();
+        assert!(
+            app.editor_scroll() <= app.editor_max() + 1.0,
+            "editor past its end: {} > {}",
+            app.editor_scroll(),
+            app.editor_max()
+        );
+        for (got, name) in [
+            (app.scroll_ratio(), "shared"),
+            (app.preview_scroll() / app.preview_max(), "preview"),
+            (app.editor_scroll() / app.editor_max(), "editor"),
+        ] {
+            assert!(
+                (got - 1.0).abs() < 0.01,
+                "{name} ratio should be 1 at the bottom: {got}"
+            );
+        }
+        // Middle: both panes sit halfway through their own content, so the
+        // preview covers more ground over the same thumb travel.
+        app.scroll.offset = app.scroll.max() / 2.0;
+        let preview_ratio = app.preview_scroll() / app.preview_max();
+        let editor_ratio = app.editor_scroll() / app.editor_max();
+        assert!((preview_ratio - 0.5).abs() < 0.02, "{preview_ratio}");
+        assert!((editor_ratio - 0.5).abs() < 0.02, "{editor_ratio}");
+        assert!(
+            app.preview_scroll() > app.editor_scroll() * 1.5,
+            "preview should move further per ratio point"
+        );
+        // Both thumbs ride at the same relative travel.
+        let pv = app.sb_geom(false, false).expect("preview bar");
+        let ed = app.sb_geom(true, false).expect("editor bar");
+        let rel = |g: &crate::ui::preview_view::SbGeom| (g.thumb.y - g.start) / g.travel.max(1.0);
+        assert!(
+            (rel(&pv) - rel(&ed)).abs() < 0.05,
+            "thumbs must stay locked: {} vs {}",
+            rel(&pv),
+            rel(&ed)
+        );
+    }
+
+    #[test]
+    fn split_thumb_drag_drives_both_panes_by_ratio() {
+        // Dragging either thumb sets the shared ratio, so the other pane
+        // follows: grab the short editor bar and pull it to the bottom.
+        let mut app = open_long_preview("readitor_test_splitdrag.md");
+        let mut host = NullHost::default();
+        let _ = app.render_headless(1000, 700, 1.0);
+        let g = app.sb_geom(true, false).expect("editor bar");
+        app.on_event(
+            Event::MouseDown {
+                x: g.thumb.x + 1.0,
+                y: g.thumb.y + 1.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.sb_drag.is_some(), "thumb press starts a drag");
+        app.on_event(
+            Event::MouseMove {
+                x: g.thumb.x + 1.0,
+                y: g.start + g.travel,
+            },
+            &mut host,
+        );
+        assert!(
+            app.scroll_ratio() > 0.95,
+            "dragging the editor thumb to its end must reach the document end: {}",
+            app.scroll_ratio()
+        );
+        // A 1 px grab offset keeps the last pixel of travel out of reach,
+        // so allow a relative epsilon instead of exactness.
+        assert!(
+            (app.preview_scroll() - app.preview_max()).abs() <= app.preview_max() * 0.01 + 1.0,
+            "preview follows to its own end: {} vs {}",
+            app.preview_scroll(),
+            app.preview_max()
+        );
+        app.on_event(
+            Event::MouseUp {
+                x: 0.0,
+                y: 0.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.sb_drag.is_none());
+    }
+
     /// Leftmost and rightmost edge (physical px) of the preview's text.
     fn preview_text_extent(app: &App) -> (f32, f32) {
         let ctx = app.ctx();
@@ -3670,7 +4261,8 @@ mod tests {
         // One row per line, no folding.
         assert_eq!(app.editor_pane.list.ops.len(), 1);
         assert!(app.h_max > 0.0, "long line must create scroll range");
-        // Horizontal wheel pans the editor pane.
+        // Horizontal wheel pans the editor pane with a glide, like vertical
+        // notches: nothing lands on the event's own frame.
         app.on_event(
             Event::Scroll {
                 dx: -120.0,
@@ -3678,7 +4270,17 @@ mod tests {
             },
             &mut host,
         );
-        assert!(app.h_scroll > 0.0);
+        assert_eq!(app.h_scroll, 0.0, "a notch must not land in one jump");
+        assert_eq!(app.h_target, 120.0);
+        assert!(app.scrolling, "a glide needs the frame clock");
+        for _ in 0..600 {
+            if !app.scrolling {
+                break;
+            }
+            app.on_event(Event::Frame, &mut host);
+        }
+        assert_eq!(app.h_scroll, 120.0);
+        assert!(!app.scrolling);
         // Clamped at the max.
         app.on_event(
             Event::Scroll {
@@ -3687,7 +4289,7 @@ mod tests {
             },
             &mut host,
         );
-        assert_eq!(app.h_scroll, app.h_max);
+        assert_eq!(app.h_target, app.h_max);
         app.on_event(
             Event::Scroll {
                 dx: 1_000_000.0,
@@ -3695,6 +4297,13 @@ mod tests {
             },
             &mut host,
         );
+        assert_eq!(app.h_target, 0.0);
+        for _ in 0..600 {
+            if !app.scrolling {
+                break;
+            }
+            app.on_event(Event::Frame, &mut host);
+        }
         assert_eq!(app.h_scroll, 0.0);
         // End key puts the caret past the pane edge; follow_caret pans to it.
         app.on_event(
@@ -3714,6 +4323,126 @@ mod tests {
             &mut host,
         );
         assert_eq!(app.h_scroll, 0.0);
+    }
+
+    /// Long-line setup with a real horizontal scroll range, in Edit mode.
+    fn open_wide(name: &str) -> (App, NullHost) {
+        let long = format!("{} end", "word ".repeat(200));
+        let mut app = open(name, &long);
+        let mut host = NullHost::default();
+        app.on_event(ctrl('e'), &mut host); // Edit
+        let _ = app.render_headless(600, 400, 1.0);
+        assert!(app.h_max > 100.0, "setup: need room to glide");
+        (app, host)
+    }
+
+    #[test]
+    fn horizontal_tilt_glides_over_frames_instead_of_jumping() {
+        // The report: the horizontal bar felt choppy next to the vertical
+        // one, because every tilt landed in one jump while vertical notches
+        // glide. Same easing, same clock discipline now.
+        let (mut app, mut host) = open_wide("readitor_test_hglide.txt");
+        app.on_event(Event::Scroll { dx: -90.0, dy: 0.0 }, &mut host);
+        assert_eq!(app.h_scroll, 0.0, "a tilt must not land in one jump");
+        assert_eq!(app.h_target, 90.0);
+        assert!(host.animating, "a glide needs the frame clock");
+        let mut seen = vec![app.h_scroll];
+        for _ in 0..600 {
+            if !app.scrolling {
+                break;
+            }
+            app.on_event(Event::Frame, &mut host);
+            seen.push(app.h_scroll);
+        }
+        assert!(
+            seen.len() > 5,
+            "a tilt should arrive over several frames, not {}: {seen:?}",
+            seen.len()
+        );
+        for w in seen.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "each frame moves a little, never back: {seen:?}"
+            );
+        }
+        assert_eq!(app.h_scroll, 90.0);
+        assert_eq!(app.h_target, 90.0);
+        assert!(!app.scrolling);
+        assert!(!host.animating);
+    }
+
+    #[test]
+    fn fine_horizontal_tilt_applies_directly() {
+        // Trackpad-grade deltas are already smooth: gliding them would only
+        // add latency, exactly like the vertical fine path.
+        let (mut app, mut host) = open_wide("readitor_test_hfine.txt");
+        app.on_event(Event::Scroll { dx: -3.0, dy: 0.0 }, &mut host);
+        assert_eq!(app.h_scroll, 3.0);
+        assert_eq!(app.h_target, 3.0);
+        assert!(!app.scrolling, "no glide stands behind a fine delta");
+    }
+
+    #[test]
+    fn touch_pan_stays_on_the_finger_and_ends_the_h_glide() {
+        // A finger landing mid-glide takes the view over horizontally too:
+        // the tilt's leftover travel is dropped, not resumed under the finger.
+        let (mut app, mut host) = open_wide("readitor_test_hpan.txt");
+        app.on_event(Event::Scroll { dx: -90.0, dy: 0.0 }, &mut host);
+        assert!(app.scrolling);
+        app.on_event(Event::Pan { dx: -17.0, dy: 0.0 }, &mut host);
+        assert_eq!(app.h_scroll, 17.0);
+        assert_eq!(app.h_target, 17.0, "the finger owns the view now");
+    }
+
+    #[test]
+    fn horizontal_thumb_drag_tracks_the_pointer_exactly() {
+        // Pointer-driven input never glides: the thumb is the pointer.
+        let (mut app, mut host) = open_wide("readitor_test_hdrag.txt");
+        let g = app.sb_geom(true, true).expect("horizontal bar");
+        app.on_event(
+            Event::MouseDown {
+                x: g.thumb.x + 1.0,
+                y: g.thumb.y + 1.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(app.sb_drag.is_some(), "thumb press starts a drag");
+        let px = g.start + g.travel / 2.0;
+        app.on_event(
+            Event::MouseMove {
+                x: px,
+                y: g.thumb.y + 1.0,
+            },
+            &mut host,
+        );
+        let want = g.offset_for(px - 1.0);
+        assert_eq!(app.h_scroll, want);
+        assert_eq!(app.h_target, want, "no glide behind a drag");
+    }
+
+    #[test]
+    fn h_glide_target_clamps_when_the_line_shrinks() {
+        // A relayout or frame that narrows the range must not leave the
+        // target unreachable past the end.
+        let (mut app, mut host) = open_wide("readitor_test_hclamp.txt");
+        app.h_scroll = app.h_max - 100.0;
+        app.h_target = app.h_max + 500.0;
+        app.scrolling = true;
+        app.on_event(Event::Frame, &mut host);
+        assert_eq!(
+            app.h_target, app.h_max,
+            "the frame clamps an unreachable target first"
+        );
+        for _ in 0..600 {
+            if !app.scrolling {
+                break;
+            }
+            app.on_event(Event::Frame, &mut host);
+        }
+        assert_eq!(app.h_scroll, app.h_max);
+        assert_eq!(app.h_target, app.h_max);
+        assert!(!app.scrolling);
     }
 
     #[test]
