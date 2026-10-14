@@ -77,8 +77,13 @@ extern "C" {
     fn objc_registerClassPair(cls: Id);
 }
 
-// CoreGraphics: the canvas blit and screen geometry.
-#[link(name = "CoreGraphics")]
+// CoreGraphics: the canvas blit and screen geometry. Framework `kind`, not a
+// bare `#[link(name = "...")]`: Apple stopped shipping /usr/lib stub libraries
+// for the frameworks, so a `-lCoreGraphics` argument no longer resolves and
+// linking dies with "library 'CoreGraphics' not found"; `-framework` (what
+// rustc emits for kind = "framework") resolves against the SDK's framework
+// stubs. Newer runners only fail on this one — link them all properly anyway.
+#[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> NSRect;
@@ -129,7 +134,7 @@ extern "C" {
 
 // AppKit/Foundation are reached only through `objc_msgSend`, but the
 // frameworks must be *loaded* for `objc_getClass` to find their classes.
-#[link(name = "AppKit")]
+#[link(name = "AppKit", kind = "framework")]
 extern "C" {}
 
 // ------------------------------------------------------- objc call helpers
