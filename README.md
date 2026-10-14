@@ -98,7 +98,7 @@ executable. `editor --version` prints what you have.
 | Find | `Ctrl+F` |
 | Theme | `Ctrl+T` or the status-bar toggle (persists) |
 | About / help | `F2` / `F1` |
-| Tabs | one per open file; a second launch of Editor hands its file to the window already open |
+| Tabs | one per open file; a second launch of Editor hands its file to the window already open (Windows today) |
 | Quit | `Ctrl+Q` or the window's × |
 
 Your session — theme, view mode, open tabs, window size and position — is
