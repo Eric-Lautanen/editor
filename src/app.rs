@@ -211,6 +211,9 @@ pub struct App {
     help_open: bool,
     /// F2 about box visible.
     about_open: bool,
+    /// Where the About box's update-toggle row is, refreshed by every paint
+    /// of the box (hit-tested in `on_mouse_down`).
+    about_toggle: Option<Rect>,
     /// Live Ctrl+F find bar, if open.
     find: Option<find::Find>,
     /// Live right-click context menu, if any.
@@ -248,6 +251,8 @@ pub struct App {
     /// remember it, so the next session opens the same way without losing the
     /// rect above.
     window_maximized: bool,
+    /// Auto-update checks on launch (About box toggle, persisted).
+    auto_update: bool,
     /// A glide is in flight, so the host is currently running its fast frame
     /// clock (and must be told when it can stop).
     scrolling: bool,
@@ -319,6 +324,7 @@ impl App {
             layout_dirty: true,
             help_open: false,
             about_open: false,
+            about_toggle: None,
             find: None,
             menu: None,
             close_armed: false,
@@ -334,6 +340,7 @@ impl App {
             blink: 0,
             window: None,
             window_maximized: false,
+            auto_update: true,
             scrolling: false,
             recent: Vec::new(),
             last_frame: Instant::now(),
@@ -357,6 +364,14 @@ impl App {
     pub fn set_dark_manual(&mut self, dark: bool) {
         self.theme_manual = true;
         self.set_dark(dark);
+    }
+
+    /// Toggle background update checks (About box row / cli startup). On by
+    /// default; turning it off only stops the *check* — `--update` keeps
+    /// working, and every install still goes through the consent + checksum
+    /// gates in `update.rs`.
+    pub fn set_auto_update(&mut self, on: bool) {
+        self.auto_update = on;
     }
 
     /// Restore a persisted session (cli startup): reopen the tabs that still
@@ -424,6 +439,7 @@ impl App {
             // as soon as it is un-maximized.
             window: self.window.map(|g| (g.x, g.y, g.width, g.height)),
             maximized: self.window_maximized,
+            auto_update: self.auto_update,
         }
     }
 
@@ -1230,10 +1246,23 @@ impl App {
             host.request_redraw();
             return;
         }
-        // Any click dismisses a full-window overlay.
-        if self.help_open || self.about_open {
-            self.help_open = false;
+        // The About box's update toggle is clickable: flip it and keep the
+        // box open. Anywhere else on the overlay dismisses it.
+        if self.about_open {
+            if let Some(r) = self.about_toggle.filter(|r| r.contains(Point { x, y })) {
+                self.set_auto_update(!self.auto_update);
+                self.persist();
+                let _ = r;
+                host.request_redraw();
+                return;
+            }
             self.about_open = false;
+            self.about_toggle = None;
+            host.request_redraw();
+            return;
+        }
+        if self.help_open {
+            self.help_open = false;
             host.request_redraw();
             return;
         }
@@ -2555,14 +2584,16 @@ impl Handler for App {
             );
         }
         if self.about_open {
-            let _ = about::paint(
+            let (_f, toggle) = about::paint(
                 canvas,
                 &self.fonts,
                 &self.theme,
                 canvas.width as f32,
                 canvas.height as f32,
                 self.scale,
+                self.auto_update,
             );
+            self.about_toggle = Some(toggle);
         }
     }
 

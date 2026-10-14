@@ -150,18 +150,18 @@ pub fn run(handler: impl Handler + 'static) -> Result<()> {
 /// the friendly thing rather than spawning a duplicate. `cli::run` calls
 /// this right before `platform::run`.
 pub fn forward_to_running(file: Option<&std::path::Path>) -> Result<bool> {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", editor_check_win))]
     {
         // SAFETY: the FFI here is the platform's own single-instance plumbing
         // (mutex + FindWindow + SendMessage), none of which touches Rust
-        // invariants; see `backend::handoff_to_running`.
+        // invariants; see `windows::handoff_to_running`.
         unsafe { backend::handoff_to_running(file) }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", editor_check_win)))]
     {
-        // Linux/macOS backends have no handoff yet (M8/M9 follow-up, same
-        // trick with D-Bus/NSConnection when those claim their GUIs); on
-        // them a second launch keeps the classic behavior.
+        // The linux/macos backends do the same trick (they open at their
+        // window-creation site — same as the win one) once their GUI (M8/M9)
+        // lands; until then a second launch keeps the classic behavior.
         let _ = file;
         Ok(false)
     }

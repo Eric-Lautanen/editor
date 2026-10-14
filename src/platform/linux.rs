@@ -603,6 +603,14 @@ pub fn exe_path() -> Option<std::path::PathBuf> {
     std::env::current_exe().ok()
 }
 
+/// Single-instance handoff, X11 side: not implemented yet (the GUI is M8).
+/// Reached only through `platform::forward_to_running`'s non-windows arm,
+/// which never calls it — kept here so the `backend` alias has the same
+/// function set on every backend module.
+pub(crate) unsafe fn handoff_to_running(_file: Option<&std::path::Path>) -> Result<bool> {
+    Ok(false)
+}
+
 // ---------------------------------------------------------------- host
 
 struct XHost {

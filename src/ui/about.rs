@@ -6,6 +6,7 @@ use crate::{
     gfx::{
         canvas::{Canvas, TextSpec},
         font::{FontStyle, FontSystem},
+        geom::Rect,
     },
     layout::theme::Theme,
 };
@@ -36,7 +37,14 @@ const FIELDS: &[(&str, &str)] = &[
 
 const HINT: &str = "F2 or Esc to close";
 
-/// Paint the box over the whole window, returning the panel it drew.
+/// The one setting the About box hosts: background update checks. Drawn as a
+/// checkbox row after the field table; the returned rect is what clicks
+/// hit-test against. Always-on gates live in `update.rs` regardless — this
+/// switch only decides whether the check happens at all.
+const UPDATE_TOGGLE: &str = "Check for updates automatically (twice a day)";
+
+/// Paint the box over the whole window, returning the panel it drew and the
+/// toggle row's clickable rect.
 pub fn paint(
     canvas: &mut Canvas,
     fonts: &FontSystem,
@@ -44,7 +52,8 @@ pub fn paint(
     width: f32,
     height: f32,
     scale: f32,
-) -> overlay::Frame {
+    auto_update: bool,
+) -> (overlay::Frame, crate::gfx::geom::Rect) {
     let (size, line_h) = overlay::metrics(scale);
     let pad = overlay::pad(scale);
     let col_gap = (size * 1.6).round();
@@ -77,8 +86,10 @@ pub fn paint(
         .max(fonts.measure(FontStyle::Regular, HINT, size));
     let panel_w = (content_w + 2.0 * pad).min(width - 40.0 * scale);
 
-    let content_h =
-        title_h + TAGLINE.len() as f32 * line_h + gap + FIELDS.len() as f32 * line_h + gap + line_h;
+    let content_h = title_h + TAGLINE.len() as f32 * line_h + gap + FIELDS.len() as f32 * line_h + gap
+            + line_h // the update toggle row
+            + gap
+            + line_h; // the hint
     let f = overlay::frame(
         canvas,
         fonts,
@@ -163,6 +174,67 @@ pub fn paint(
         y += line_h;
     }
 
+    // The update-check toggle: a real checkbox (square outline, check glyph
+    // when on — drawn with filled slabs, the canvas's only primitive), then
+    // the label. Clicking anywhere on the row flips it; the app persists it
+    // like any other setting.
+    y += gap;
+    let toggle_y = y;
+    let box_d = (line_h * 0.75).round();
+    let bx = x + (line_h * 0.15).round();
+    let by = toggle_y + (line_h - box_d) / 2.0;
+    let edge = 1.0_f32.max(scale); // ~1 px outline
+    let edge_color = if auto_update {
+        theme.accent
+    } else {
+        theme.muted
+    };
+    // Square outline: four thin slabs.
+    canvas.fill_rect(Rect::new(bx, by, box_d, edge), edge_color);
+    canvas.fill_rect(Rect::new(bx, by + box_d - edge, box_d, edge), edge_color);
+    canvas.fill_rect(Rect::new(bx, by, edge, box_d), edge_color);
+    canvas.fill_rect(Rect::new(bx + box_d - edge, by, edge, box_d), edge_color);
+    if auto_update {
+        let m = box_d * 0.24; // inset from the outline
+        let (c0x, c0y) = (bx + m, by + box_d * 0.55); // left arm's start
+        let (c1x, c1y) = (bx + box_d * 0.42, by + box_d - m); // the elbow
+        let (c2x, c2y) = (bx + box_d - m, by + m); // right arm's end
+        let t = (box_d * 0.14).max(edge);
+        // A diagonal slab: stamps small squares along the segment.
+        let mut slab = |a: (f32, f32), b: (f32, f32)| {
+            let steps = ((b.0 - a.0).abs().max((b.1 - a.1).abs()) / (t * 0.5))
+                .ceil()
+                .max(1.0) as i32;
+            for i in 0..=steps {
+                let u = i as f32 / steps as f32;
+                canvas.fill_rect(
+                    Rect::new(
+                        a.0 + (b.0 - a.0) * u - t / 2.0,
+                        a.1 + (b.1 - a.1) * u - t / 2.0,
+                        t,
+                        t,
+                    ),
+                    theme.accent,
+                );
+            }
+        };
+        slab((c0x, c0y), (c1x, c1y));
+        slab((c1x, c1y), (c2x, c2y));
+    }
+    canvas.draw_text(
+        fonts,
+        UPDATE_TOGGLE,
+        bx + box_d + (size * 0.4).round(),
+        f.baseline(toggle_y),
+        TextSpec {
+            size,
+            style: FontStyle::Regular,
+            color: if auto_update { theme.fg } else { theme.muted },
+        },
+    );
+    let toggle = Rect::new(f.panel.x + pad, toggle_y, f.panel.w - 2.0 * pad, line_h);
+
+    y += line_h;
     y += gap;
     canvas.draw_text(
         fonts,
@@ -175,7 +247,7 @@ pub fn paint(
             color: theme.muted,
         },
     );
-    f
+    (f, toggle)
 }
 
 #[cfg(test)]
@@ -213,11 +285,15 @@ mod tests {
         let bg = theme.bg.pack() & 0xFFFFFF;
         c.fill_rect(Rect::new(0.0, 0.0, w, h), theme.bg);
 
-        let f = paint(&mut c, &fonts, &theme, w, h, 1.0);
+        let (f, toggle) = paint(&mut c, &fonts, &theme, w, h, 1.0, true);
         assert!(
             (f.panel.x - (w - f.panel.w) / 2.0).abs() < 1.0,
             "not centred"
         );
+        // The toggle row is real estate inside the panel the click handler
+        // uses — non-degenerate and within the panel's horizontal padding.
+        assert!(toggle.w > 0.0 && toggle.h > 0.0, "toggle rect empty");
+        assert!(toggle.x >= f.panel.x + f.pad && toggle.y > f.panel.y);
         assert_ne!(c.pixels[10 * 900 + 2] & 0xFFFFFF, bg, "page not dimmed");
 
         let (x0, x1) = (
@@ -243,7 +319,7 @@ mod tests {
         let theme = Theme::light();
         let (w, h) = (1200.0, 700.0);
         let mut c = Canvas::new(1200, 700);
-        let f = paint(&mut c, &fonts, &theme, w, h, 1.0);
+        let (f, _) = paint(&mut c, &fonts, &theme, w, h, 1.0, false);
         let (size, _) = overlay::metrics(1.0);
         let widest = FIELDS
             .iter()

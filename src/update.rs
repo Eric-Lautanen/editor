@@ -20,6 +20,13 @@
 //! Intel, Linux on arm…) the check still works and says there is nothing to
 //! auto-install. Asset names are owned by `release.yml`; a drift between the
 //! two ends in a clear "download it manually" message, not a wrong download.
+//!
+//! Consent and integrity: the background check asks permission (native
+//! yes/no) BEFORE anything is downloaded; `--update` needs no ask because the
+//! user typed it. What always runs is the integrity gate: the release ships
+//! `SHA256SUMS` (see release.yml) and the downloaded installer's SHA-256 is
+//! checked against it before anything executes — a truncated or tampered
+//! download is refused, never run.
 use crate::error::{Error, Result};
 use crate::platform::print_line;
 
@@ -116,6 +123,8 @@ struct Release {
     tag: String,
     /// `browser_download_url` of this platform's install asset.
     asset_url: String,
+    /// `browser_download_url` of the same release's `SHA256SUMS`.
+    sums_url: String,
 }
 
 /// `None` when the newest release is not newer than this build.
@@ -142,7 +151,19 @@ fn newest_release() -> Result<Option<Release>> {
             "release {tag} exists but ships no {stage}; download one from github.com/{REPO}/releases/tag/{tag}"
         ))
     })?;
-    Ok(Some(Release { tag, asset_url }))
+    // The sums file is the integrity gate below; a release without one is a
+    // packaging drift, and the updater refuses to install rather than trust
+    // an unverified download.
+    let sums_url = find_named_asset(&json, "SHA256SUMS").ok_or_else(|| {
+        Error::Platform(format!(
+            "release {tag} ships no SHA256SUMS; refusing to install an unverified binary - download by hand from github.com/{REPO}/releases/tag/{tag}"
+        ))
+    })?;
+    Ok(Some(Release {
+        tag,
+        asset_url,
+        sums_url,
+    }))
 }
 
 /// The release asset for the running build per `release.yml`'s artifact
@@ -173,6 +194,23 @@ fn find_asset(json: &str, name_prefix: &str, stage: &str) -> Option<String> {
         let url = &rest[..end];
         let name = url.rsplit('/').next()?;
         if name.starts_with(name_prefix) && name.ends_with(stage) {
+            return Some(url.into());
+        }
+    }
+    None
+}
+
+/// Exact-filename sibling of `find_asset`, for the sums file (which does not
+/// carry the tag in its name).
+fn find_named_asset(json: &str, name: &str) -> Option<String> {
+    const KEY: &str = "\"browser_download_url\":\"";
+    let mut rest = json;
+    while let Some(i) = rest.find(KEY) {
+        rest = &rest[i + KEY.len()..];
+        let end = rest.find('"')?;
+        let url = &rest[..end];
+        let fname = url.rsplit('/').next()?;
+        if fname == name {
             return Some(url.into());
         }
     }
@@ -285,19 +323,239 @@ impl Release {
     }
 }
 
-// ---------------------------------------------------------------- installing
+// ---------------------------------------------------------------- integrity
 
 fn install(r: &Release) -> Result<()> {
+    let file = r.download()?;
+    verify(&file, r)?;
     match std::env::consts::OS {
-        "windows" => install_windows(&r.download()?, &r.tag),
-        "linux" => install_linux(&r.download()?, &r.tag),
-        "macos" => install_macos(&r.download()?, &r.tag),
+        "windows" => install_windows(&file, &r.tag),
+        "linux" => install_linux(&file, &r.tag),
+        "macos" => install_macos(&file, &r.tag),
         other => Err(Error::Platform(format!(
             "no automated update for {other}; download from github.com/{REPO}/releases/tag/{}",
             r.tag
         ))),
     }
 }
+
+/// Compares the downloaded asset's SHA-256 with the one the release's
+/// `SHA256SUMS` publishes for its exact filename. Mismatch, sums without our
+/// entry, or unfetchable sums: hard refusal — a truncated download trips this
+/// exactly like a substituted one, and there is no "install anyway". The
+/// error text points at the manual download either way; in the silent
+/// background path the thread just returns, leaving the running (trusted)
+/// install untouched.
+fn verify(file: &std::path::Path, r: &Release) -> Result<()> {
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::Platform("download path is not UTF-8".into()))?;
+    let sums = curl(&["-sS", "-m", "30", "-L", &r.sums_url])?;
+    let want = parse_sums(&sums)
+        .into_iter()
+        .find(|(_, f)| f == name)
+        .map(|(h, _)| h)
+        .ok_or_else(|| {
+            Error::Platform(format!(
+                "SHA256SUMS lists no entry for {name}; download by hand from github.com/{REPO}/releases/tag/{}",
+                r.tag
+            ))
+        })?;
+    let got = sha256_file(file)?;
+    if got != want {
+        return Err(Error::Platform(format!(
+            "checksum mismatch for {name}: the release published {want}, the download hashes to {got}. Refusing to run a file that is not the one published; if you trust the release, install it by hand from github.com/{REPO}/releases/tag/{}",
+            r.tag
+        )));
+    }
+    Ok(())
+}
+
+/// Parses `sha256sum`'s output format: `<64 hex>␣␣[*]<filename>` per line.
+/// Unknown lines (release notes, blanks) are skipped, so a hand-edited sums
+/// file cannot smuggle a parse error past the gate — its entries just have
+/// to match, or our asset will not be found.
+fn parse_sums(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.len() < 67 {
+                return None; // 64 hex + separator + at least a name
+            }
+            let (hex, rest) = line.split_at(64);
+            if !hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return None;
+            }
+            // `sha256sum` writes two spaces for text mode, one space plus `*`
+            // for binary (`*` is meaningless here — the digest is over bytes).
+            let name = rest.trim_start_matches([' ', '*']);
+            if name.is_empty() {
+                return None;
+            }
+            Some((hex.into(), name.into()))
+        })
+        .collect()
+}
+
+/// Hex digest of a file, chunked (installers are megabytes, never held whole).
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = sha256::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finish();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
+}
+
+/// Pure-std SHA-256 (FIPS 180-4). No crates (the Cargo.toml covenant), and
+/// shelling out to `certutil`/`shasum` would put the integrity check for a
+/// download at the mercy of the same environment an attacker could shadow —
+/// the algorithm is 60 lines, so it is inline.
+mod sha256 {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    pub struct Sha256 {
+        h: [u32; 8],
+        buf: [u8; 64],
+        used: usize,
+        /// Bytes fed so far (padding excluded) — set into the final block.
+        total: u64,
+    }
+
+    impl Sha256 {
+        pub fn new() -> Self {
+            Sha256 {
+                h: [
+                    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+                    0x1f83d9ab, 0x5be0cd19,
+                ],
+                buf: [0; 64],
+                used: 0,
+                total: 0,
+            }
+        }
+
+        pub fn update(&mut self, mut data: &[u8]) {
+            self.total = self.total.wrapping_add(data.len() as u64);
+            if self.used > 0 {
+                let take = (64 - self.used).min(data.len());
+                self.buf[self.used..self.used + take].copy_from_slice(&data[..take]);
+                self.used += take;
+                data = &data[take..];
+                if self.used == 64 {
+                    let block = self.buf;
+                    self.compress(&block);
+                    self.used = 0;
+                }
+            }
+            while data.len() >= 64 {
+                let mut block = [0u8; 64];
+                block.copy_from_slice(&data[..64]);
+                self.compress(&block);
+                data = &data[64..];
+            }
+            if !data.is_empty() {
+                self.buf[..data.len()].copy_from_slice(data);
+                self.used = data.len();
+            }
+        }
+
+        pub fn finish(mut self) -> [u8; 32] {
+            let bits = self.total.wrapping_mul(8); // before padding inflates total
+            self.update(&[0x80]);
+            // Cross the block boundary first (57..64 would leave no room for
+            // the length), then pad up to byte 56, then the 8 length bytes
+            // close that block — every case ends with exactly one compress
+            // for the final block, even when the message is exactly 56 bytes
+            // (padding lands alone in the next block there).
+            while self.used > 56 {
+                self.update(&[0]);
+            }
+            while self.used < 56 {
+                self.update(&[0]);
+            }
+            self.update(&bits.to_be_bytes());
+            let mut out = [0u8; 32];
+            for (i, w) in self.h.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            out
+        }
+
+        fn compress(&mut self, block: &[u8; 64]) {
+            let mut w = [0u32; 64];
+            for (i, wi) in w.iter_mut().take(16).enumerate() {
+                *wi = u32::from_be_bytes([
+                    block[i * 4],
+                    block[i * 4 + 1],
+                    block[i * 4 + 2],
+                    block[i * 4 + 3],
+                ]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = self.h;
+            for (i, wi) in w.iter().enumerate() {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ (!e & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(*wi);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            let add = [a, b, c, d, e, f, g, hh];
+            for (hi, xi) in self.h.iter_mut().zip(add) {
+                *hi = hi.wrapping_add(xi);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- installing
 
 /// Windows: run the per-user MSI. `/passive` shows a progress bar but asks
 /// no questions; Windows Installer's restart manager closes the running
@@ -432,7 +690,7 @@ fn relaunch(exe: &std::path::Path, tag: &str) {
 fn ask_install(tag: &str) -> bool {
     win_dialog(
         &format!(
-            "Editor {tag} is available. Install it now?\n\nEditor will close and restart with the new version."
+            "Editor {tag} is available. Download and install it now?\n\nEditor will close and restart with the new version."
         ),
         "Editor update",
     )
@@ -477,7 +735,7 @@ fn ask_install(tag: &str) -> bool {
     // nothing by itself; the answer decides. `--question` and friends run a
     // non-admin path every macOS has.
     let script = format!(
-        "display dialog \"Editor {tag} is available. Install it now?\" with title \"Editor update\" buttons {{\"Not now\",\"Install\"}} default button \"Install\""
+        "display dialog \"Editor {tag} is available. Download and install it now?\" with title \"Editor update\" buttons {{\"Not now\",\"Install\"}} default button \"Install\""
     );
     match std::process::Command::new("osascript")
         .args(["-e", &script])
@@ -495,7 +753,7 @@ fn ask_install(tag: &str) -> bool {
     // `platform::linux`), so on a kit where the user picked dialogs with,
     // update consent appears with the same look. The first present wins:
     // if zenity answered at all, do not re-ask with kdialog.
-    let text = format!("Editor {tag} is available. Install it now?");
+    let text = format!("Editor {tag} is available. Download and install it now?");
     let question = format!("--text={text}");
     if let Some(yes) = ask_with("zenity", &["--question", &question]) {
         return yes;
@@ -518,6 +776,99 @@ fn ask_with(helper: &str, args: &[&str]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_matches_the_published_test_vectors() {
+        // FIPS 180-4 vectors, via temp files so the real file path is what is
+        // hashed.
+        let cases: &[(&str, &str)] = &[
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ];
+        for (i, (input, want)) in cases.iter().enumerate() {
+            let p = std::env::temp_dir().join(format!("editor-sha-test-{i}"));
+            std::fs::write(&p, input).unwrap();
+            assert_eq!(sha256_file(&p).unwrap(), *want, "input {i}");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    fn sha256_streams_across_chunk_boundaries() {
+        // A buffer larger than one block, built byte by byte, must hash the
+        // same as fed all at once (this is where a broken `update` shows).
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let p = std::env::temp_dir().join("editor-sha-test-chunk");
+        std::fs::write(&p, &data).unwrap();
+        let streamed = sha256_file(&p).unwrap();
+
+        let mut one = sha256::Sha256::new();
+        one.update(&data);
+        let once = one.finish();
+        let mut hex = String::with_capacity(64);
+        for b in once {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        assert_eq!(streamed, hex);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sums_parsing_tolerates_the_shasum_dialect_and_skips_junk() {
+        let sums = join_lines(&[
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  editor-v0.2.0-windows-x86_64.msi",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *editor-v0.2.0-macos.zip",
+            "# a comment line from release notes",
+            "",
+            "short line",
+            "NOTHEXNOTHEXNOTHEXNOTHEXNOTHEXNOTHEXNOTHEXNOTHEXNOTHEXNOT  some-file",
+        ]);
+        let parsed = parse_sums(&sums);
+        assert_eq!(parsed.len(), 2, "junk lines must be skipped");
+        assert_eq!(
+            parsed[0],
+            (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                "editor-v0.2.0-windows-x86_64.msi".to_string()
+            )
+        );
+        assert_eq!(
+            parsed[1].1, "editor-v0.2.0-macos.zip",
+            "binary-marker star must be stripped"
+        );
+    }
+
+    fn join_lines(lines: &[&str]) -> String {
+        let mut out = String::new();
+        for l in lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn named_asset_finds_the_sums_file() {
+        let json = r#"{"assets":[
+            {"name":"SHA256SUMS","browser_download_url":"https://gh/dl/v0.2.0/SHA256SUMS"},
+            {"name":"editor-v0.2.0-macos.zip","browser_download_url":"https://gh/dl/v0.2.0/editor-v0.2.0-macos.zip"}
+        ]}"#;
+        assert_eq!(
+            find_named_asset(json, "SHA256SUMS").unwrap(),
+            "https://gh/dl/v0.2.0/SHA256SUMS"
+        );
+        assert_eq!(find_named_asset(json, "editor-v0.2.0-linux.tar.gz"), None);
+    }
 
     #[test]
     fn version_comparison_numerics_and_short_tags() {

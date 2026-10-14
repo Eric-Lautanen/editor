@@ -26,6 +26,11 @@ pub struct Settings {
     /// The window was maximized when the session ended, so the next one opens
     /// the same way (at `window`, then maximized).
     pub maximized: bool,
+    /// Background update checks on launch (About box toggle). On by default;
+    /// off means `--update` is still there but nothing pings GitHub silently.
+    /// The consent + checksum gates around *installing* are separate from and
+    /// stricter than this switch: it only controls whether the check runs.
+    pub auto_update: bool,
     /// Recently opened files, most recent first, capped at [`RECENT_MAX`].
     /// Independent of `files` (the tabs this session reopens): a file can be
     /// recent long after it stopped being open.
@@ -97,12 +102,13 @@ fn temp_in(dir: &Path) -> PathBuf {
 /// Render the settings as the tiny text file format.
 fn render(s: &Settings) -> String {
     let mut out = format!(
-        "theme {}\nmanual {}\nmode {}\nactive {}\nmaximized {}\n",
+        "theme {}\nmanual {}\nmode {}\nactive {}\nmaximized {}\nauto_update {}\n",
         if s.dark { "dark" } else { "light" },
         u8::from(s.manual),
         s.mode,
         s.active,
-        u8::from(s.maximized)
+        u8::from(s.maximized),
+        u8::from(s.auto_update)
     );
     if let Some((x, y, w, h)) = s.window {
         out.push_str(&format!("window {x} {y} {w} {h}\n"));
@@ -130,6 +136,7 @@ fn parse(text: &str) -> Settings {
             "mode" => s.mode = val.parse().unwrap_or(0),
             "active" => s.active = val.parse().unwrap_or(0),
             "maximized" => s.maximized = val == "1",
+            "auto_update" => s.auto_update = val == "1",
             "window" => s.window = parse_window(val),
             "open" => s.files.push(PathBuf::from(val)),
             "recent" => s.recent.push(PathBuf::from(val)),
@@ -233,6 +240,7 @@ mod tests {
             active: 1,
             window: Some((-1920, 40, 1100, 800)),
             maximized: true,
+            auto_update: false,
             recent: vec![PathBuf::from("/home/u/notes.txt")],
         };
         let text = render(&s);
@@ -332,6 +340,7 @@ mod tests {
             window: Some((120, 80, 1100, 800)),
             maximized: false,
             recent: Vec::new(),
+            auto_update: true,
         };
         save_in(&dir, &s);
         // What a crash between the write and the rename leaves: a temp file with
@@ -371,6 +380,7 @@ mod tests {
             window: Some((10, 20, 900, 700)),
             maximized: false,
             recent: Vec::new(),
+            auto_update: true,
         };
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(file_in(&dir), render(&s)).unwrap();

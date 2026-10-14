@@ -1260,6 +1260,13 @@ pub fn edge_grip() -> f32 {
     RESIZE_BAND
 }
 
+/// Single-instance handoff, AppKit side: not implemented yet (the GUI is M9).
+/// Kept so the `backend` alias has the same function set on every backend
+/// module (see `platform::forward_to_running`'s comment).
+pub(crate) unsafe fn handoff_to_running(_file: Option<&std::path::Path>) -> Result<bool> {
+    Ok(false)
+}
+
 /// The dark-mode preference: `AppleInterfaceStyle` reads "Dark" exactly when
 /// the user picked the dark appearance (the key is absent in light mode).
 pub fn system_prefers_dark() -> bool {

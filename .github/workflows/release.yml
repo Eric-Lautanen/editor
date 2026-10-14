@@ -123,6 +123,15 @@ jobs:
         with:
           merge-multiple: true
           path: dist
+      # The integrity contract in src/update.rs: every install (manual or
+      # auto-updater) verifies its download's SHA-256 against this file
+      # before running it. A release without SHA256SUMS is one the updater
+      # refuses to install.
+      - name: publish SHA256SUMS
+        run: |
+          cd dist
+          sha256sum editor-v* | sed 's/  / /' > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

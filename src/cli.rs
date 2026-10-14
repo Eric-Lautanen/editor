@@ -182,9 +182,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
     // Silent update check, detached: the check lives its own life (its
     // thread may end in an installer spawn + process exit) while the window
-    // opens immediately. Dev loops turn it off with --no-update or
-    // EDITOR_NO_UPDATE_CHECK; see src/update.rs for the whole story.
-    if !o.no_update && update::due_for_check() {
+    // opens immediately. Off by the About box toggle (persisted), by
+    // --no-update, or EDITOR_NO_UPDATE_CHECK; see src/update.rs for the
+    // whole story (consent dialog + SHA-256 gate sit inside it).
+    if !o.no_update && session.auto_update && update::due_for_check() {
         update::background_check();
     }
     platform::run(app)
