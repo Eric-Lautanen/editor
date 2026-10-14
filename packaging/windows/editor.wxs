@@ -34,7 +34,15 @@
       UpgradeStrategy="majorUpgrade"
       Scope="perUser"
       Language="1033"
-      Codepage="65001">
+      Codepage="65001"
+      Compressed="yes">
+
+    <!-- Embed the payload cabinet INTO the msi: without `EmbedCab` WiX
+         writes a sibling cab1.cab and the installer dies with "Source file
+         not found" when run from anywhere but the build directory
+         (observed: Downloads). `Package@Compressed=.names` is default-on and
+         NOT enough; the MediaTemplate switch is what embeds. -->
+    <MediaTemplate EmbedCab="yes" />
 
     <!-- `UpgradeCode` is the stable upgrade identity: never regenerate it (a
          new GUID here would make MSI installs sit next to the old one
