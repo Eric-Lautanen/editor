@@ -3,3 +3,4 @@
 /.workbuddy-ai
 tools/recovery_manifest.json
 test_out.txt
+*.msi

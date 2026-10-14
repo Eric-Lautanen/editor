@@ -37,11 +37,41 @@ jobs:
       - run: cargo build --release
 
       # ---- package per OS -------------------------------------------------
+      # WiX: pinned dotnet-tool (the runner image carries only legacy WiX
+      # v3, which the v4+ schema in packaging/windows/editor.wxs predates).
+      - name: install WiX (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          # WiX v7 EULA (the OSMF one; free below the \
+          # $10k-revenue threshold) plus the UI extension for the
+          # feature-tree dialog in editor.wxs.
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" eula accept wix7
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext
+
       - name: package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           Compress-Archive -Path target/release/editor.exe -DestinationPath ${{ matrix.artifact }}
+          # Per-user MSI (Scope=perUser, no UAC): Add/Remove-Programs entry,
+          # Start Menu shortcut, HKCU file associations, and major-upgrade
+          # replacement of any previously installed MSI — the last one is
+          # what makes `editor --update` a one-click story (it downloads this
+          # artifact for the tag and runs msiexec). The msi's names here AND
+          # in src/update.rs's asset scan must stay in sync with this stamp
+          # of `editor-<tag>-windows-x86_64.msi`.
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" build `
+            -acceptEula wix7 `
+            -ext WixToolset.UI.wixext `
+            -arch x64 `
+            -d Version=$version `
+            -d PublishDir=target/release `
+            -d Icon=assets/icon.ico `
+            -o ${{ matrix.artifact }}.msi `
+            packaging/windows/editor.wxs
 
       - name: package (linux)
         if: matrix.os == 'ubuntu-latest'
@@ -65,10 +95,16 @@ jobs:
           # resource forks/extended attributes.
           ditto -c -k --sequesterRsrc --keepParent target/Editor.app ${{ matrix.artifact }}
 
+      # Artifact name keeps the zip for history/cohabit reason; the publish
+      # job merges all three OSes' artifacts into the release assets. Each
+      # glob picks up that OS's file(s) (windows has two: zip + msi).
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            editor-v*.zip
+            editor-v*.tar.gz
+            editor-v*.msi
           if-no-files-found: error
 
   publish:
@@ -91,14 +127,18 @@ jobs:
 
             | File | OS | Install |
             |---|---|---|
-            | `*-windows-x86_64.zip` | Windows 10/11 | Unzip anywhere, run `editor.exe --install` once to claim file associations (HKCU, no admin). |
+            | `*-windows-x86_64.msi` | Windows 10/11 | **Run it — that's the install.** Per-user, no admin: Add/Remove Programs entry, Start Menu shortcut, file associations, and a newer MSI replaces it automatically. |
+            | `*-windows-x86_64.zip` | Windows 10/11 | Portable alternative: unzip anywhere, run `editor.exe --install` once to claim file associations (HKCU, no admin). |
             | `*-linux-x86_64.tar.gz` | Linux (X11/XWayland) | Unpack, run `packaging/linux/install.sh` (~/.local install + MIME defaults). |
             | `*-macos.zip` | macOS | Unzip, drag `Editor.app` to /Applications. |
 
-            **Updating**: replace the binary (or the whole `.app` / zip
-            contents) — associations keep pointing at the same path, so no
-            re-registration is needed unless you move the executable. Run
-            `editor --version` to check what you have.
+            **Updating**: on Windows the app checks GitHub in the background
+            and asks to install the new build for you (`editor --update` as a
+            manual shortcut; `--no-update` opts a launch out). On Linux and
+            macOS the same `--update` exists. Omit the MSI story: every new
+            release still ships portable/overwrite-friendly binaries, and
+            associations keep working across upgrades unless you move the
+            executable. Run `editor --version` to check what you have.
 
             Note: the Linux and macOS GUI backends (M8/M9) are in progress;
             those builds currently compile and pass the full headless test

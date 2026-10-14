@@ -21,6 +21,9 @@ mod platform;
 mod scratch_test;
 mod settings;
 mod ui;
+mod update;
+// update sits with the other top-level app concerns (settings, cli); see
+// src/update.rs for the whole self-update story.
 
 fn main() {
     let code = match cli::run(std::env::args().skip(1).collect()) {

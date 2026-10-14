@@ -22,9 +22,9 @@ open tabs, window size/place/maximized), `--install` file associations.
 
 | OS | How |
 |---|---|
-| Windows | Unzip `editor.exe` anywhere and run `editor.exe --install` once — registers `Editor.Document` for `.md .markdown .json .jsonl .ndjson .txt .log .csv .tsv .yaml .yml .toml .ini .cfg .conf` and code extensions under `HKCU` (no admin). Editor then shows up in "Open with" and can be set as the default. `--uninstall` removes it. |
-| Linux | `packaging/linux/install.sh` — installs to `~/.local/bin`, a `.desktop` entry, a MIME package for `.jsonl`/`.ndjson`, and sets `xdg-mime` defaults for markdown/JSON/NDJSON/plain text/CSV/YAML/TOML. |
-| macOS | `Editor.app` (built by `packaging/macos/bundle.sh`) declares `CFBundleDocumentTypes` for the same extensions, so it appears in "Open With". |
+| Windows | **Run the release `.msi`** — no admin, no command line: per-user install, Start Menu shortcut, Add/Remove Programs entry, and a wizard (Customize page) where you choose which file types to associate (documents/configs vs code; uncheck either). A newer MSI replaces the installed one automatically, and the app checks GitHub for updates in the background — `editor --update` does the same from a terminal, `--no-update` opts a launch out. The zip stays for portable use: unzip anywhere, run `editor.exe --install` once for all supported extensions under `HKCU` (no admin), `--uninstall` removes them. |
+| Linux | `packaging/linux/install.sh` — installs to `~/.local/bin`, a `.desktop` entry, a MIME package for `.jsonl`/`.ndjson`, and sets `xdg-mime` defaults for markdown/JSON/NDJSON/plain text/CSV/YAML/TOML. `editor --update` can also fetch and self-replace a newer release. |
+| macOS | `Editor.app` (built by `packaging/macos/bundle.sh`) declares `CFBundleDocumentTypes` for the same extensions, so it appears in "Open With". `editor --update` swaps the bundle for a newer release. |
 
 ## Updating
 

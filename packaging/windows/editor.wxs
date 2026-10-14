@@ -1,0 +1,318 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Windows installer for Editor, built by `.github/workflows/release.yml` with
+  `wix build ... -d Version=$(version) packaging/windows/editor.wxs`.
+
+  Design points:
+
+  * `Scope="perUser"`: the whole install lands under the user's profile
+    (`ProgramFiles64Folder` resolves to `%LOCALAPPDATA%\Programs` in per-user
+    context, see Microsoft's Single Package Authoring) — no UAC prompt, no
+    admin, the same promise the portable install flag makes. (XML comments
+    cannot contain double hyphens, so CLI flags are written as e.g. the
+    “update flag”.)
+  * `Package`/`UpgradeStrategy="majorUpgrade"` with a fixed `Id`: every build
+    of this wxs shares one identity, so running a newer MSI upgrades in place
+    (Windows Installer removes the old build inside the same transaction,
+    which is how the update command can just hand the user an MSI).
+  * The file associations mirror `platform/install.rs`'s portable install
+    flag: the same `Editor.Document` ProgID and per-extension
+    `OpenWithProgids` values under HKCU. Running the MSI after a portable
+    install (or vice versa) writes identical data, so there is no clash to
+    fail on.
+  * The extension list below must track `core::file_kind::EXTENSIONS`; the
+    repo test that pins one against drift lives nowhere, so check both when
+    editing either (search for `EXTENSIONS`).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+      Name="Editor"
+      Manufacturer="Eric-Lautanen"
+      Version="$(var.Version)"
+      UpgradeCode="7C61E9D4-33C2-4FA9-9BA4-0D6A57457F09"
+      UpgradeStrategy="majorUpgrade"
+      Scope="perUser"
+      Language="1033"
+      Codepage="65001">
+
+    <!-- `UpgradeCode` is the stable upgrade identity: never regenerate it (a
+         new GUID here would make MSI installs sit next to the old one
+         instead of replacing it). ProductCode differs per build by WiX
+         default, which is exactly what major upgrades want. -->
+    <MajorUpgrade
+        AllowDowngrades="no"
+        DowngradeErrorMessage="A newer version of Editor is already installed."
+        Schedule="afterInstallInitialize" />
+
+    <Icon Id="editor.ico" SourceFile="$(var.Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="editor.ico" />
+    <!-- Sensible defaults for ARP metadata. -->
+    <Property Id="ARPNOMODIFY" Value="1" /> <!-- replace-don't-tweak: updates come as new MSIs -->
+
+    <Feature Id="Main" Title="Editor core" Description="The editor itself, Start Menu shortcut, and the Editor.Document handler." Level="1">
+      <ComponentRef Id="AppExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="ProgIdRegistry" />
+    </Feature>
+    <Feature Id="DocumentTypes" Title="Associate document and config files" Description="Add Editor to the Open-with menu for md, markdown, json, jsonl, ndjson, txt, log, csv, tsv, yaml, yml, toml, ini, cfg, conf." Level="1">
+      <ComponentRef Id="ExtMd" />
+      <ComponentRef Id="ExtMarkdown" />
+      <ComponentRef Id="ExtJson" />
+      <ComponentRef Id="ExtJsonl" />
+      <ComponentRef Id="ExtNdjson" />
+      <ComponentRef Id="ExtTxt" />
+      <ComponentRef Id="ExtLog" />
+      <ComponentRef Id="ExtCsv" />
+      <ComponentRef Id="ExtTsv" />
+      <ComponentRef Id="ExtYaml" />
+      <ComponentRef Id="ExtYml" />
+      <ComponentRef Id="ExtToml" />
+      <ComponentRef Id="ExtIni" />
+      <ComponentRef Id="ExtCfg" />
+      <ComponentRef Id="ExtConf" />
+    </Feature>
+    <Feature Id="CodeTypes" Title="Associate code files" Description="Add Editor to the Open-with menu for rs, py, js, ts, c, h, cpp, hpp, cs, java, go, rb, php, css, html, xml, sh." Level="1">
+      <ComponentRef Id="ExtRs" />
+      <ComponentRef Id="ExtPy" />
+      <ComponentRef Id="ExtJs" />
+      <ComponentRef Id="ExtTs" />
+      <ComponentRef Id="ExtC" />
+      <ComponentRef Id="ExtH" />
+      <ComponentRef Id="ExtCpp" />
+      <ComponentRef Id="ExtHpp" />
+      <ComponentRef Id="ExtCs" />
+      <ComponentRef Id="ExtJava" />
+      <ComponentRef Id="ExtGo" />
+      <ComponentRef Id="ExtRb" />
+      <ComponentRef Id="ExtPhp" />
+      <ComponentRef Id="ExtCss" />
+      <ComponentRef Id="ExtHtml" />
+      <ComponentRef Id="ExtXml" />
+      <ComponentRef Id="ExtSh" />
+    </Feature>
+    <!-- The standard feature-tree dialog (WixToolset.UI.wixext): on a
+         double-click install the user walks a wizard whose Customize page
+         lets them uncheck either association group; a silent install
+         (msiexec /passive, as the updater runs) installs both at their
+         default level. -->
+    <ui:WixUI Id="WixUI_FeatureTree" />
+
+    <!-- `PerUserProgramFilesFolder` (WiX v6+): resolves to
+         %LOCALAPPDATA%\Programs in per-user scope. Plain
+         `ProgramFiles64Folder` does NOT redirect and dies with error 1303
+         against the real Program Files — verified the hard way. -->
+    <StandardDirectory Id="PerUserProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="Editor">
+        <Component Id="AppExe" Guid="*">
+          <File Id="EditorExe" Source="$(var.PublishDir)\editor.exe" KeyPath="yes" />
+        </Component>
+
+        <!-- Editor.Document: name, icon, and the open command the shell runs
+             when the user picks Editor as the default for a type. -->
+        <Component Id="ProgIdRegistry" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\Editor.Document">
+            <RegistryValue Type="string" Value="Editor Document" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Editor.Document\DefaultIcon">
+            <RegistryValue Type="string" Value="[INSTALLFOLDER]editor.exe,0" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Editor.Document\shell\open\command">
+            <!-- The quoting is load-bearing: the exe path may contain spaces
+                 (`%LOCALAPPDATA%\Programs` can appear verbatim) and so may
+                 the opened file's path. -->
+            <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]editor.exe&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+
+        <!-- One component per extension, because an MSI component may
+             carry exactly one KeyPath and each HKCU key wants to be its
+             own. Mirrors `platform/install.rs` /
+             `core::file_kind::EXTENSIONS`; update both when the list moves.
+             Installation is "offer, don't take": placement only adds Editor
+             to the Explorer "Open with" menu, never clobbers the user's
+             existing default. -->
+
+        <Component Id="ExtMd" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.md\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtMarkdown" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.markdown\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtJson" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.json\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtJsonl" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.jsonl\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtNdjson" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.ndjson\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtTxt" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtLog" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.log\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtCsv" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.csv\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtTsv" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.tsv\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtYaml" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.yaml\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtYml" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.yml\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtToml" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.toml\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtIni" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.ini\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtCfg" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.cfg\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtConf" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.conf\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtRs" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.rs\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtPy" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.py\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtJs" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.js\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtTs" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.ts\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtC" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.c\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtH" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.h\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtCpp" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.cpp\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtHpp" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.hpp\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtCs" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.cs\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtJava" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.java\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtGo" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.go\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtRb" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.rb\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtPhp" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.php\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtCss" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.css\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtHtml" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.html\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtXml" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.xml\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtSh" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.sh\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="Editor">
+        <!-- Shortcuts need a KeyPath of their own; an HKCU registry value is
+             the per-user MSI-correct one (a shortcut file would need machine
+             context). Removing the value plus the folder makes uninstall
+             leave nothing behind. -->
+        <Component Id="StartMenuShortcut" Guid="*">
+          <Shortcut
+              Id="EditorShortcut"
+              Name="Editor"
+              Description="Editor — native viewer for Markdown, JSON, CSV and code"
+              Target="[INSTALLFOLDER]editor.exe"
+              WorkingDirectory="INSTALLFOLDER"
+              Icon="editor.ico" />
+          <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\Eric-Lautanen\Editor" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Package>
+</Wix>

@@ -3,13 +3,15 @@ use crate::{
     core::file_kind::FileKind,
     error::{Error, Result},
     parse::{json, jsonl},
-    platform, settings,
+    platform, settings, update,
 };
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: editor [FILE]\n\
   --version | -V       print version\n\
-  --install | --uninstall   register/remove file associations\n\
+  --install | --uninstall   register/remove file associations (portable use)\n\
+  --update             check GitHub and install the newest release\n\
+  --no-update          skip the automatic update check for this launch\n\
   --pretty             print FILE (.json/.jsonl) canonicalized to stdout\n\
   dev: --render OUT.ppm [--size WxH] [--scale S] [--dark] [--scroll PX]   headless snapshot of FILE
   dev: --mem-report FILE                                                allocation census after load+layout (mem-census builds)";
@@ -24,6 +26,9 @@ struct Opts {
     scroll: f32,
     /// Print the allocation census after the file is loaded/laid out.
     mem_report: bool,
+    /// Skip the background update check this launch (dev loop; the env
+    /// equivalent, `EDITOR_NO_UPDATE_CHECK`, covers whole sessions).
+    no_update: bool,
 }
 
 fn usage(msg: impl Into<String>) -> Error {
@@ -40,6 +45,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         dark: false,
         scroll: 0.0,
         mem_report: false,
+        no_update: false,
     };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -58,6 +64,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
             }
             "--install" => return platform::install::install(),
             "--uninstall" => return platform::install::uninstall(),
+            "--update" => return update::run(),
+            "--no-update" => o.no_update = true,
             "--render" => o.render = Some(PathBuf::from(val("--render")?)),
             "--pretty" => o.pretty = true,
             "--size" => {
@@ -164,6 +172,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
             o.size.1
         ));
         return Ok(());
+    }
+    // Silent update check, detached: the check lives its own life (its
+    // thread may end in an installer spawn + process exit) while the window
+    // opens immediately. Dev loops turn it off with --no-update or
+    // EDITOR_NO_UPDATE_CHECK; see src/update.rs for the whole story.
+    if !o.no_update {
+        update::background_check();
     }
     platform::run(app)
 }
