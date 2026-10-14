@@ -676,7 +676,7 @@ unsafe fn wm_state(x: &X, action: i32) {
     ev.window = x.win;
     ev.message_type = x.atoms.net_wm_state;
     ev.format = 32;
-    ev.data[0] = action;
+    ev.data[0] = action as c_long;
     ev.data[1] = x.atoms.net_wm_state_maximized_vert as c_long;
     ev.data[2] = x.atoms.net_wm_state_maximized_horz as c_long;
     let raw = &ev as *const XClientMessageEvent as *const XEvent;

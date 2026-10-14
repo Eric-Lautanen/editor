@@ -26,7 +26,7 @@ use crate::{
     },
 };
 use std::{
-    ffi::{c_char, c_int, c_void, CStr, CString},
+    ffi::{c_char, c_int, c_void, CStr},
     ptr::{null, null_mut},
 };
 
@@ -109,10 +109,14 @@ extern "C" {
 
 // libSystem, for the font mapping only (`font::fallback` maps system fonts
 // rather than reading them, see `platform::map_file`). No libc crate: one
-// link attribute and the two calls needed.
+// link attribute and one call needed. The file itself is opened through
+// std (`File::open`), not a binding: declaring `open` here — even with the
+// exact runtime signature in mind — collides with the variadic `open` that
+// the standard library itself declares for its own I/O, and the
+// `invalid_runtime_symbol_definitions` lint (deny by default) rejects any
+// conflicting redefinition.
 #[link(name = "System")]
 extern "C" {
-    fn open(path: *const c_char, flags: c_int) -> c_int;
     fn mmap(
         addr: *mut c_void,
         len: usize,
@@ -1260,8 +1264,6 @@ pub fn system_prefers_dark() -> bool {
     out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("Dark"))
 }
 
-/// `O_RDONLY`; the value is Darwin's, which is what this backend targets.
-const O_RDONLY: c_int = 0;
 const PROT_READ: c_int = 1;
 const MAP_PRIVATE: c_int = 2;
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
@@ -1279,16 +1281,20 @@ pub fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
     if len == 0 || len > usize::MAX as u64 {
         return None;
     }
-    let c = CString::new(path.to_string_lossy().as_bytes()).ok()?;
     unsafe {
-        let fd = open(c.as_ptr(), O_RDONLY);
-        if fd < 0 {
-            return None;
-        }
+        // `mmap` with a file descriptor doesn't need a path, so the file is
+        // opened through std (`File::open`) rather than a bound `open` — see
+        // the note on the `System` extern block above.
+        let file = std::fs::File::open(path).ok()?;
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         let p = mmap(null_mut(), len as usize, PROT_READ, MAP_PRIVATE, fd, 0);
         if p == MAP_FAILED || p.is_null() {
             return None;
         }
+        // Leak the file: the descriptor must stay open for the life of the
+        // process, and the mapping is only ever freed with us.
+        std::mem::forget(file);
+        // SAFETY: `p` is a live read-only mapping of `len` bytes.
         Some(std::slice::from_raw_parts(p as *const u8, len as usize))
     }
 }
