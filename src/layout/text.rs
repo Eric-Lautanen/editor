@@ -211,6 +211,29 @@ fn advance_of(ctx: &Ctx, ch: char, size: f32) -> f32 {
 /// Map a document-space point to the nearest buffer position.
 pub fn hit_test(buf: &Buffer, x: f32, y: f32, viewport_w: f32, ctx: &Ctx, wrap: bool) -> Pos {
     let p = plain_params(viewport_w, ctx, wrap);
+    // The editor pane never wraps: one row per line, so the row index *is*
+    // the line index — no walking the document to find the row.
+    if !wrap {
+        if y >= p.pad + buf.line_count() as f32 * p.line_h {
+            return buf.end();
+        }
+        let li = (((y - p.pad) / p.line_h).floor().max(0.0) as usize)
+            .min(buf.line_count().saturating_sub(1));
+        let exp = expand_line(buf.line(li));
+        let mut w = 0.0;
+        let mut col = 0usize;
+        for k in 0..exp.chars.len() {
+            let cw = advance_of(ctx, exp.chars[k], p.size);
+            if x < p.x0 + w + cw / 2.0 {
+                break;
+            }
+            w += cw;
+            col = k + 1;
+        }
+        let eb = exp.byte_at[col.min(exp.chars.len())];
+        let ob = exp.exp_to_orig[eb.min(exp.exp_to_orig.len() - 1)];
+        return buf.clamp(Pos { line: li, col: ob });
+    }
     let mut row_top = p.pad;
     for li in 0..buf.line_count() {
         let exp = expand_line(buf.line(li));
@@ -246,6 +269,21 @@ pub fn hit_test(buf: &Buffer, x: f32, y: f32, viewport_w: f32, ctx: &Ctx, wrap: 
 pub fn caret_point(buf: &Buffer, caret: Pos, viewport_w: f32, ctx: &Ctx, wrap: bool) -> (f32, f32) {
     let p = plain_params(viewport_w, ctx, wrap);
     let caret = buf.clamp(caret);
+    // The editor pane never wraps: the caret's row is its line, at
+    // pad + line*line_h — no walking the document to find it.
+    if !wrap {
+        let line = buf.line(caret.line);
+        let exp = expand_line(line);
+        let eb = orig_to_exp(line, caret.col);
+        let mut w = 0.0;
+        for k in 0..exp.chars.len() {
+            if exp.byte_at[k] >= eb {
+                break;
+            }
+            w += advance_of(ctx, exp.chars[k], p.size);
+        }
+        return (p.x0 + w, p.pad + caret.line as f32 * p.line_h);
+    }
     let mut row_top = p.pad;
     for li in 0..buf.line_count() {
         let exp = expand_line(buf.line(li));
@@ -287,8 +325,17 @@ pub fn selection_rects(
     }
     let p = plain_params(viewport_w, ctx, wrap);
     let mut rects = Vec::new();
-    let mut row_top = p.pad;
-    for li in 0..buf.line_count() {
+    // The editor pane never wraps: one row per line at pad + line*line_h, so
+    // only the selected lines are worth visiting. Wrapped panes must walk
+    // every line to keep the row_top cursor honest.
+    let (lo, hi, row0) = if wrap {
+        (0, buf.line_count(), p.pad)
+    } else {
+        let hi = (to.line + 1).min(buf.line_count());
+        (from.line.min(hi), hi, p.pad + from.line as f32 * p.line_h)
+    };
+    let mut row_top = row0;
+    for li in lo..hi {
         let line = buf.line(li);
         let exp = expand_line(line);
         let text: String = exp.chars.iter().collect();
@@ -512,5 +559,46 @@ mod tests {
             true,
         );
         assert_eq!(rev.len(), multi.len());
+    }
+
+    #[test]
+    fn no_wrap_geometry_jumps_straight_to_the_line() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let ctx = Ctx {
+            fonts: &f,
+            theme: &t,
+            scale: 1.0,
+            zoom: 1.0,
+        };
+        let buf = Buffer::from_text("aaa\nbbb\nccc");
+        let p = plain_params(800.0, &ctx, false);
+        // One row per line at pad + line*line_h: a multi-line selection's
+        // rects sit on exactly those rows.
+        let rects = selection_rects(
+            &buf,
+            Pos { line: 0, col: 1 },
+            Pos { line: 2, col: 2 },
+            800.0,
+            &ctx,
+            false,
+        );
+        assert_eq!(rects.len(), 3);
+        for (i, r) in rects.iter().enumerate() {
+            assert!(
+                (r.y - (p.pad + i as f32 * p.line_h)).abs() < 0.5,
+                "row {i} drawn at {}",
+                r.y
+            );
+        }
+        // A click far below the text is the buffer end, not a phantom row.
+        assert_eq!(
+            hit_test(&buf, 10.0, p.pad + 99.0 * p.line_h, 800.0, &ctx, false),
+            buf.end()
+        );
+        // The caret of a late line is found without walking the early ones.
+        let (x, y) = caret_point(&buf, Pos { line: 2, col: 2 }, 800.0, &ctx, false);
+        assert!((y - (p.pad + 2.0 * p.line_h)).abs() < 0.5);
+        assert!(x > p.x0, "caret x is inside the pane");
     }
 }

@@ -849,6 +849,12 @@ survived restarts (theme, mode, tabs); the window did not.
   the × and Find button toggle the bar, double-tap-drag extends without scrolling or
   coasting, the Copy button appears with a selection and copies. 329 tests,
   `clippy --all-targets` and `rustfmt --check` clean.
+- **Editor geometry is O(line), not O(buffer)** (`layout/text.rs`): the editor pane never
+  wraps, so `hit_test` jumps straight to the clicked line, `caret_point` to the caret's
+  line, and `selection_rects` visits only the selected lines — a keystroke, arrow, or
+  click on a huge file no longer walks the whole document with a per-line allocation.
+  The preview's find jump reuses one lowercase scratch buffer across rows for the same
+  reason. 330 tests, `clippy --all-targets` and `rustfmt --check` clean.
 
 ## Review notes (Oct 2026 hygiene + gap pass)
 - `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the

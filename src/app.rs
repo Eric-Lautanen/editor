@@ -1797,11 +1797,16 @@ impl App {
         };
         let mut want = occurrence;
         let mut target = None;
+        // One scratch buffer for every row: the jump runs per keystroke, so
+        // per-row lowercase allocation is the difference between churning
+        // the heap for every row of a big preview and not.
+        let mut lower = String::new();
         for row in &self.preview_rows {
-            let text = row.text.to_lowercase();
+            lower.clear();
+            lower.extend(row.text.chars().flat_map(char::to_lowercase));
             let mut at = 0;
             let mut hits = 0;
-            while let Some(i) = text[at..].find(&needle) {
+            while let Some(i) = lower[at..].find(&needle) {
                 hits += 1;
                 at += i + needle.len();
             }
