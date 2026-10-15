@@ -61,18 +61,19 @@ pub enum CursorShape {
 
 /// Platform-neutral events delivered by `platform::run`.
 /// Grows per milestone: macOS open-file arrives with M9.
+///
+// Continuous manipulation and theme keys reach the app through whichever
+// backend the executable was built for — Win32 constructs `Pan`/
+// `PanEnd`/`ThemeChanged` from its pointer and `WM_SETTINGCHANGE` paths,
+// X11 constructs `Frame` from its poll loop, AppKit constructs `FileOpen`
+// from Finder — so when the enum is type-checked against one backend the
+// others' variants go unconstructed dead-code. (The cross-build cfgs use
+// the same enum, hence an enum-level allow rather than per-variant: the
+// set differs by target.) It covers construction only; the app's matching
+// arms are exhaustive and lint-free everywhere.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum Event {
-    // Continuous manipulation and theme keys reach the app through whichever
-    // backend the executable was built for — Win32 constructs `Pan`/
-    // `PanEnd`/`ThemeChanged` from its pointer and `WM_SETTINGCHANGE` paths,
-    // X11 constructs `Frame` from its poll loop, AppKit constructs `FileOpen`
-    // from Finder — so when the enum is type-checked against one backend the
-    // others' variants go unconstructed dead-code. (The cross-build cfgs use
-    // the same enum, hence this being an enum-level allow rather than per-
-    // variant: the set differs by target.) It covers construction only; the
-    // app's matching arms are exhaustive and lint-free everywhere.
-    #[allow(dead_code)]
     Resized {
         width: usize,
         height: usize,
