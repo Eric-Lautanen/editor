@@ -349,8 +349,10 @@ working set**, and one emoji pulled in `seguiemj.ttf` (12.9 MB) on top.
   resize** (6px bands, min 200×100), full event translation — keys with
   Ctrl/Shift/Alt chords + `XLookupString` text, mouse, wheel/tilt (buttons
   4–7 → `Event::Scroll`), `ConfigureNotify` → `Resized`, `WM_DELETE_WINDOW`
-  → `CloseRequested` — canvas blit via a hand-built `XImage` header
-  (ZPixmap, depth 24, 4 bytes/px — no `XCreateImage`/`XDestroyImage` needed),
+  → `CloseRequested` — canvas blit through an Xlib-made `XImage`
+  (ZPixmap, depth 24, 4 bytes/px: `XCreateImage` once, `sync_image` restating
+  the buffer pointer and row stride before each blit, and never
+  `XDestroyImage`d because the pixels belong to the canvas),
   **clipboard** through the CLIPBOARD/PRIMARY selections (we own the
   selection; `SelectionRequest` answered with UTF8_STRING/STRING/TARGETS,
   reads spin the queue with a deferred-event replay), **file dialogs** via
@@ -368,7 +370,14 @@ working set**, and one emoji pulled in `seguiemj.ttf` (12.9 MB) on top.
   covers Latin-1 today), DPI scale is fixed at 1.0.
 - Runtime verification needs a real X server (X11/XWayland) — CI
   (`ci.yml`) compiles + runs the headless suite on ubuntu-latest from the
-  first push; the window itself needs a human or Xvfb pass.
+  first push, and the `smoke (linux window)` job starts the release binary
+  under Xvfb and asks that server for a mapped window named `Editor`
+  (`tools/linux-window-smoke.sh`, which `release.yml` runs on the binary it is
+  about to publish too). That probe is not ceremony: the first time this
+  backend was ever started it died at the first blit with a bare SIGSEGV,
+  because the hand-built `XImage` header above left `f.put_image` null and
+  `XPutImage` calls through it. A human pass is still what the checklists
+  above mean by "eyeballed".
 
 ### Cross-OS verification round (Oct 2026) — the macOS CI job would have failed on push
 
