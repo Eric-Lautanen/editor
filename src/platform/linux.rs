@@ -86,6 +86,19 @@ extern "C" {
     fn XPending(d: *mut Display) -> i32;
     fn XFlush(d: *mut Display) -> i32;
     fn XCreateGC(d: *mut Display, drawable: Xid, mask: c_ulong, values: *const c_void) -> Gc;
+    fn XDefaultVisual(d: *mut Display, screen: i32) -> *mut c_void;
+    fn XCreateImage(
+        d: *mut Display,
+        visual: *mut c_void,
+        depth: c_uint,
+        format: c_int,
+        offset: c_int,
+        data: *mut c_char,
+        width: c_uint,
+        height: c_uint,
+        bitmap_pad: c_int,
+        bytes_per_line: c_int,
+    ) -> *mut XImage;
     fn XPutImage(
         d: *mut Display,
         drawable: Xid,
@@ -314,6 +327,11 @@ struct XSelectionRequestEvent {
     time: Time,
 }
 
+/// `XImage`, in libX11's field order. Nothing here is ever filled in from
+/// Rust: the image comes from `XCreateImage` and only the four fields
+/// [`sync_image`] restates are written. The tail still has to be declared at
+/// its true offsets — `XPutImage` calls through `f.put_image`, so an image
+/// assembled by hand (with the tail left zero) segfaults on the first blit.
 #[repr(C)]
 struct XImage {
     width: c_int,
@@ -327,13 +345,14 @@ struct XImage {
     bitmap_pad: c_int,
     depth: c_int,
     bytes_per_line: c_int,
-    visual: *mut c_void,
+    bits_per_pixel: c_int,
     red_mask: c_ulong,
     green_mask: c_ulong,
     blue_mask: c_ulong,
     obdata: Xid,
-    // fns omitted: XPutImage only reads the header fields above.
-    pad: [u8; 128],
+    /// `struct funcs`: create_image, destroy_image, get_pixel, put_pixel,
+    /// sub_image, add_pixel.
+    funcs: [*mut c_void; 6],
 }
 
 // ---------------------------------------------------------------- consts
@@ -441,6 +460,9 @@ struct X {
     atoms: Atoms,
     handler: Box<dyn Handler>,
     canvas: Canvas,
+    /// The canvas's standing `XImage`, made by `XCreateImage` in `run` and
+    /// re-pointed at the canvas by `sync_image` before each blit.
+    image: *mut XImage,
     last_title: String,
     /// Set by `request_redraw`; the poll loop paints when it sees it.
     dirty: bool,
@@ -465,8 +487,6 @@ struct X {
     /// Left button held with the app told about it. The app's drags end only on
     /// `MouseUp`, so this is what `FOCUS_OUT` consults.
     left_down: bool,
-    /// Root depth of the window (for the XImage header).
-    depth: i32,
     /// Events swallowed while waiting for a SelectionNotify, replayed later.
     deferred: Vec<XEvent>,
     /// Current cursor index (0 arrow, 1 ibeam, 2 hand) to avoid re-defining.
@@ -569,25 +589,38 @@ pub fn edge_grip() -> f32 {
 /// and file-backed. The descriptor is deliberately left open (the view is
 /// borrowed for `'static`); the path is used only to open it.
 pub fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
-    let len = std::fs::metadata(path).ok()?.len();
-    if len == 0 || len > usize::MAX as u64 {
-        return None;
+    // `editor_check_linux` compiles this module on a host that has no
+    // `std::os::unix` and so no descriptor to map; that seam checks the code
+    // without running it, and nothing here is mapped in that configuration.
+    // Exactly one of these blocks is the function's tail (see
+    // `platform::forward_to_running` for the same shape).
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
-    unsafe {
-        // `mmap` with a file descriptor doesn't need a path, so the file is
-        // opened through std (`File::open`) rather than a bound `open` — see
-        // the note on the libc extern block above.
-        let file = std::fs::File::open(path).ok()?;
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
-        let p = mmap(null_mut(), len as usize, PROT_READ, MAP_PRIVATE, fd, 0);
-        if p == MAP_FAILED || p.is_null() {
+    #[cfg(unix)]
+    {
+        let len = std::fs::metadata(path).ok()?.len();
+        if len == 0 || len > usize::MAX as u64 {
             return None;
         }
-        // Leak the file: the descriptor must stay open for the life of the
-        // process, and the mapping is only ever freed with us.
-        std::mem::forget(file);
-        // SAFETY: `p` is a live read-only mapping of `len` bytes.
-        Some(std::slice::from_raw_parts(p as *const u8, len as usize))
+        unsafe {
+            // `mmap` with a file descriptor doesn't need a path, so the file is
+            // opened through std (`File::open`) rather than a bound `open` — see
+            // the note on the libc extern block above.
+            let file = std::fs::File::open(path).ok()?;
+            let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+            let p = mmap(null_mut(), len as usize, PROT_READ, MAP_PRIVATE, fd, 0);
+            if p == MAP_FAILED || p.is_null() {
+                return None;
+            }
+            // Leak the file: the descriptor must stay open for the life of the
+            // process, and the mapping is only ever freed with us.
+            std::mem::forget(file);
+            // SAFETY: `p` is a live read-only mapping of `len` bytes.
+            Some(std::slice::from_raw_parts(p as *const u8, len as usize))
+        }
     }
 }
 
@@ -889,30 +922,25 @@ unsafe fn on_selection_request(x: &mut X, req: &XSelectionRequestEvent) {
     );
 }
 
-/// Hand-built `XImage` header wrapping the canvas buffer (ZPixmap, depth 24,
-/// 4 bytes/px, host byte order). `XPutImage` only reads these fields; the
-/// function-pointer tail is never called because we never use XGetPixel.
-unsafe fn make_image(depth: i32, w: i32, h: i32, data: *mut c_char) -> XImage {
-    XImage {
-        width: w,
-        height: h,
-        xoffset: 0,
-        format: ZPOINTER,
-        data,
-        // 0 = LSBFirst: every supported target is little-endian.
-        byte_order: 0,
-        bitmap_unit: 32,
-        bitmap_bit_order: 0,
-        bitmap_pad: 32,
-        depth,
-        bytes_per_line: w * 4,
-        visual: null_mut(),
-        red_mask: 0,
-        green_mask: 0,
-        blue_mask: 0,
-        obdata: 0,
-        pad: [0; 128],
-    }
+/// Point the blit's image at the buffer it should read. The window can be
+/// resized at any time and `Canvas::resize` reallocates the pixels, so the
+/// pointer and the row stride are restated before every blit instead of being
+/// captured once. Everything else in the header (byte order, `bits_per_pixel`,
+/// the channel masks) is Xlib's own, set by `XCreateImage` when it built the
+/// image for this window's depth and visual.
+unsafe fn sync_image(x: &mut X) {
+    let (w, h, pixels) = (
+        x.canvas.width as c_int,
+        x.canvas.height as c_int,
+        x.canvas.pixels.as_mut_ptr() as *mut c_char,
+    );
+    let img = &mut *x.image;
+    img.width = w;
+    img.height = h;
+    // 4 bytes/px: the canvas is `u32` per pixel, the same assumption every
+    // backend makes about it.
+    img.bytes_per_line = w * 4;
+    img.data = pixels;
 }
 
 /// KeySym -> app key. Printable keys go through `XLookupString` instead.
@@ -1006,12 +1034,12 @@ unsafe fn paint(x: *mut X) {
         return;
     }
     x.handler.paint(&mut x.canvas);
-    let mut img = make_image(x.depth, w, h, x.canvas.pixels.as_ptr() as *mut c_char);
+    sync_image(x);
     XPutImage(
         x.d,
         x.win,
         x.gc,
-        &mut img,
+        x.image,
         0,
         0,
         0,
@@ -1365,6 +1393,29 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             XCreateFontCursor(d, XC_HAND2),
         ];
         let title = handler.title();
+        let mut canvas = Canvas::new(win_w.max(1) as usize, win_h.max(1) as usize);
+        // The blit goes through `XPutImage`, which calls the image's own
+        // `f.put_image` — so the image must come from Xlib. It is created once
+        // and never given to `XDestroyImage`: the pixels belong to the canvas
+        // (Xlib only stores the pointer when `data` is non-null), and
+        // destroying the image would free Rust's buffer out from under it.
+        // `sync_image` restates the pointer before every blit.
+        let image = XCreateImage(
+            d,
+            XDefaultVisual(d, screen),
+            depth as c_uint,
+            ZPOINTER,
+            0,
+            canvas.pixels.as_mut_ptr() as *mut c_char,
+            win_w.max(1) as c_uint,
+            win_h.max(1) as c_uint,
+            32,
+            0,
+        );
+        if image.is_null() {
+            XCloseDisplay(d);
+            return Err(Error::Platform("XCreateImage failed".into()));
+        }
         let mut x = Box::new(X {
             d,
             screen,
@@ -1374,7 +1425,8 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             cursors,
             atoms,
             handler,
-            canvas: Canvas::new(win_w.max(1) as usize, win_h.max(1) as usize),
+            canvas,
+            image,
             last_title: title,
             dirty: true,
             animating: false,
@@ -1385,7 +1437,6 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             geom: (x0, y0, win_w, win_h),
             mouse: (0.0, 0.0),
             left_down: false,
-            depth,
             deferred: Vec::new(),
             cursor_idx: 0,
             maximized: false,
