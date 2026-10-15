@@ -792,7 +792,7 @@ impl<'a> Colr<'a> {
         // rather than mis-index.
         layer.clamp(w, h);
         let has_fg = layer.fg.iter().any(|&v| v != 0);
-        let coverage: Vec<u8> = layer.px.chunks_exact(4).map(|p| p[3]).collect();
+        let coverage: Vec<u8> = layer.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
         Some(Glyph {
             width: w,
             height: h,
@@ -961,7 +961,7 @@ impl Layer {
 
     /// Source-over of a whole layer.
     fn over(&mut self, src: &Layer) {
-        for (i, p) in src.px.chunks_exact(4).enumerate() {
+        for (i, p) in src.px.as_chunks::<4>().0.iter().enumerate() {
             let x = (i % self.w) as i32;
             let y = (i / self.w) as i32;
             if p[3] != 0 {
@@ -999,7 +999,7 @@ impl Layer {
                 _ => (1.0, 1.0 - sa),       // SRC_OVER
             }
         };
-        for (i, s) in src.px.chunks_exact(4).enumerate() {
+        for (i, s) in src.px.as_chunks::<4>().0.iter().enumerate() {
             let o = i * 4;
             let sa = s[3] as f32 / 255.0;
             let da = self.px[o + 3] as f32 / 255.0;

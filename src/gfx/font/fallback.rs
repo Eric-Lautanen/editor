@@ -622,7 +622,9 @@ mod tests {
         // A grinning face is not greyscale: some pixel must differ across
         // channels, or we rasterized a monochrome outline by mistake.
         let chromatic = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| p[3] > 0 && (p[0].abs_diff(p[1]) > 24 || p[1].abs_diff(p[2]) > 24));
         assert!(chromatic, "the emoji came back monochrome");
     }

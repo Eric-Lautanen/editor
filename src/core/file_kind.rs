@@ -52,6 +52,17 @@ impl FileKind {
 /// source for open-dialog filters on all three backends (`;` on Windows,
 /// spaces for zenity), so the dialogs never drift from what the app opens
 /// and the installer registers.
+///
+/// Present only where a dialog consumes it (the macOS panel enumerates
+/// [`EXTENSIONS`] directly) plus test builds, so the shared-API dead-code
+/// lint stays quiet on every native target.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "windows",
+    editor_check_linux,
+    editor_check_win,
+    test
+))]
 pub fn globs(sep: &str) -> String {
     EXTENSIONS
         .iter()
@@ -62,6 +73,9 @@ pub fn globs(sep: &str) -> String {
 
 /// Save-dialog groups: `(label, extensions)`, mirroring [`FileKind`].
 /// Every [`EXTENSIONS`] entry appears in exactly one group (pinned by test).
+/// Windows-only by the same rule as [`globs`]: the save dialog that reads it
+/// is Windows code.
+#[cfg(any(target_os = "windows", editor_check_win, test))]
 pub const SAVE_GROUPS: &[(&str, &[&str])] = &[
     ("Markdown", &["md", "markdown"]),
     ("JSON", &["json"]),

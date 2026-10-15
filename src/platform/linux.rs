@@ -8,7 +8,8 @@
 //! dialogs by shelling out to `zenity`/`kdialog`, `xdg-open` for links,
 //! `_NET_WM_ICON` from the portable icon renderer, `_MOTIF_WM_HINTS` to drop
 //! server decorations, `_NET_WM_STATE` for maximize, dark preference via
-//! `gsettings`. Not yet: XDND drag-and-drop (tracked in docs/PLAN.md, M8 follow-up).
+//! `gsettings`. Single-instance handoff and IME/XIM are tracked in
+//! docs/PLAN.md (M8 follow-up); drag-and-drop likewise.
 use super::Handler;
 use crate::{
     error::{Error, Result},
@@ -630,18 +631,6 @@ pub fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
 /// instead of the ~120 the eye can use.
 fn frame_due(animating: bool, since_last: std::time::Duration) -> bool {
     animating && since_last >= std::time::Duration::from_millis(FRAME_MS)
-}
-
-pub fn exe_path() -> Option<std::path::PathBuf> {
-    std::env::current_exe().ok()
-}
-
-/// Single-instance handoff, X11 side: not implemented yet (the GUI is M8).
-/// Reached only through `platform::forward_to_running`'s non-windows arm,
-/// which never calls it — kept here so the `backend` alias has the same
-/// function set on every backend module.
-pub(crate) unsafe fn handoff_to_running(_file: Option<&std::path::Path>) -> Result<bool> {
-    Ok(false)
 }
 
 // ---------------------------------------------------------------- host

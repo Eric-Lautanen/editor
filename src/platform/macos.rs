@@ -8,10 +8,10 @@
 //! an `NSView` subclass for drawing and events (`drawRect:`, `keyDown:`,
 //! mouse, `scrollWheel:`, Finder drag-drop), canvas blit via `CGImageCreate`
 //! + `CGContextDrawImage` (the view is flipped so the image lands upright),
-//! `NSPasteboard` clipboard, `NSOpenPanel`/`NSSavePanel` dialogs, `NSTimer`
-//! (40 ms) for `Event::Tick`, `NSCursor` arrow/IBeam/hand, dock icon from
-//! the portable icon renderer, dark preference via `defaults read -g
-//! AppleInterfaceStyle`, `open` for links, `mmap(MAP_PRIVATE)` font mapping.
+//!   `NSPasteboard` clipboard, `NSOpenPanel`/`NSSavePanel` dialogs, `NSTimer`
+//!   (40 ms) for `Event::Tick`, `NSCursor` arrow/IBeam/hand, dock icon from
+//!   the portable icon renderer, dark preference via `defaults read -g
+//!   AppleInterfaceStyle`, `open` for links, `mmap(MAP_PRIVATE)` font mapping.
 //! Not yet: IME/`NSTextInputClient` (`characters` covers Latin-1 and
 //! composed keys), live theme-change notification (no KVO on the
 //! appearance), and the scroll direction/multipliers want a real-wheel pass.
@@ -588,8 +588,6 @@ unsafe fn report_geometry() {
 }
 
 /// Wrap the canvas buffer in a `CGImage` and draw it over the whole view.
-
-/// Wrap the canvas buffer in a `CGImage` and draw it over the whole view.
 /// The view is flipped, so the image lands upright, row 0 at the top.
 unsafe fn blit(m: &Mac, w_pt: f64, h_pt: f64) {
     let (w, h) = (m.canvas.width, m.canvas.height);
@@ -900,12 +898,14 @@ struct MethodDef {
 }
 
 /// Erase a callback's signature to the `IMP` type `class_addMethod` takes
-/// (a macro, so the transmute sees the concrete fn-pointer type at each
-/// call site rather than an unsized generic; callers are in `run`'s unsafe
-/// block).
+/// (a macro so every call site states its concrete `unsafe extern "C" fn`
+/// type twice — as the cast and as the transmute source — which is what
+/// keeps `missing_transmute_annotations` satisfied without an allow):
+/// `tr!(view_key_down, unsafe extern "C" fn(Id, Sel, Id))`. Callers are in
+/// `run`'s unsafe block.
 macro_rules! tr {
-    ($f:expr) => {
-        std::mem::transmute::<_, unsafe extern "C" fn()>($f)
+    ($f:expr, $t:ty) => {
+        std::mem::transmute::<$t, unsafe extern "C" fn()>($f as $t)
     };
 }
 
@@ -990,77 +990,83 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             &[
                 MethodDef {
                     name: "isFlipped",
-                    imp: tr!(view_is_flipped as unsafe extern "C" fn(Id, Sel) -> i8),
+                    imp: tr!(view_is_flipped, unsafe extern "C" fn(Id, Sel) -> i8),
                     types: "B@:",
                 },
                 MethodDef {
                     name: "acceptsFirstResponder",
-                    imp: tr!(view_accepts_first_responder as unsafe extern "C" fn(Id, Sel) -> i8),
+                    imp: tr!(
+                        view_accepts_first_responder,
+                        unsafe extern "C" fn(Id, Sel) -> i8
+                    ),
                     types: "B@:",
                 },
                 MethodDef {
                     name: "drawRect:",
-                    imp: tr!(view_draw_rect as unsafe extern "C" fn(Id, Sel, NSRect)),
+                    imp: tr!(view_draw_rect, unsafe extern "C" fn(Id, Sel, NSRect)),
                     types: "v@:{_NSRect={_NSPoint=dd}{_NSSize=dd}}",
                 },
                 MethodDef {
                     name: "keyDown:",
-                    imp: tr!(view_key_down as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_key_down, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "mouseDown:",
-                    imp: tr!(view_mouse_down as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_mouse_down, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "mouseUp:",
-                    imp: tr!(view_mouse_up as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_mouse_up, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "mouseDragged:",
-                    imp: tr!(view_mouse_dragged as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_mouse_dragged, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "mouseMoved:",
-                    imp: tr!(view_mouse_moved as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_mouse_moved, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "rightMouseDown:",
-                    imp: tr!(view_right_mouse_down as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_right_mouse_down, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "rightMouseUp:",
-                    imp: tr!(view_right_mouse_up as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_right_mouse_up, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "otherMouseDown:",
-                    imp: tr!(view_other_mouse_down as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_other_mouse_down, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "otherMouseUp:",
-                    imp: tr!(view_other_mouse_up as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_other_mouse_up, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "scrollWheel:",
-                    imp: tr!(view_scroll_wheel as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(view_scroll_wheel, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "draggingEntered:",
-                    imp: tr!(view_dragging_entered as unsafe extern "C" fn(Id, Sel, Id) -> u64),
+                    imp: tr!(
+                        view_dragging_entered,
+                        unsafe extern "C" fn(Id, Sel, Id) -> u64
+                    ),
                     types: "Q@:@",
                 },
                 MethodDef {
                     name: "performDragOperation:",
-                    imp: tr!(view_perform_drag as unsafe extern "C" fn(Id, Sel, Id) -> i8),
+                    imp: tr!(view_perform_drag, unsafe extern "C" fn(Id, Sel, Id) -> i8),
                     types: "B@:@",
                 },
             ],
@@ -1070,7 +1076,7 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             "EditorWindow",
             &[MethodDef {
                 name: "canBecomeKeyWindow",
-                imp: tr!(win_can_become_key as unsafe extern "C" fn(Id, Sel) -> i8),
+                imp: tr!(win_can_become_key, unsafe extern "C" fn(Id, Sel) -> i8),
                 types: "B@:",
             }],
         )?;
@@ -1080,32 +1086,38 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
             &[
                 MethodDef {
                     name: "applicationDidFinishLaunching:",
-                    imp: tr!(app_did_finish_launching as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(app_did_finish_launching, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
                 MethodDef {
                     name: "applicationShouldTerminate:",
-                    imp: tr!(app_should_terminate as unsafe extern "C" fn(Id, Sel, Id) -> i8),
+                    imp: tr!(
+                        app_should_terminate,
+                        unsafe extern "C" fn(Id, Sel, Id) -> i8
+                    ),
                     types: "B@:@",
                 },
                 MethodDef {
                     name: "applicationShouldTerminateAfterLastWindowClosed:",
-                    imp: tr!(app_after_last_window as unsafe extern "C" fn(Id, Sel, Id) -> i8),
+                    imp: tr!(
+                        app_after_last_window,
+                        unsafe extern "C" fn(Id, Sel, Id) -> i8
+                    ),
                     types: "B@:@",
                 },
                 MethodDef {
                     name: "application:openFile:",
-                    imp: tr!(app_open_file as unsafe extern "C" fn(Id, Sel, Id, Id) -> i8),
+                    imp: tr!(app_open_file, unsafe extern "C" fn(Id, Sel, Id, Id) -> i8),
                     types: "B@:@@",
                 },
                 MethodDef {
                     name: "windowShouldClose:",
-                    imp: tr!(win_should_close as unsafe extern "C" fn(Id, Sel, Id) -> i8),
+                    imp: tr!(win_should_close, unsafe extern "C" fn(Id, Sel, Id) -> i8),
                     types: "B@:@",
                 },
                 MethodDef {
                     name: "tick:",
-                    imp: tr!(timer_tick as unsafe extern "C" fn(Id, Sel, Id)),
+                    imp: tr!(timer_tick, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
                 },
             ],
@@ -1258,13 +1270,6 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
 /// so `App` keeps its overlay scrollbars clear of it.
 pub fn edge_grip() -> f32 {
     RESIZE_BAND
-}
-
-/// Single-instance handoff, AppKit side: not implemented yet (the GUI is M9).
-/// Kept so the `backend` alias has the same function set on every backend
-/// module (see `platform::forward_to_running`'s comment).
-pub(crate) unsafe fn handoff_to_running(_file: Option<&std::path::Path>) -> Result<bool> {
-    Ok(false)
 }
 
 /// The dark-mode preference: `AppleInterfaceStyle` reads "Dark" exactly when
