@@ -10,8 +10,8 @@
 //! + `CGContextDrawImage` (the view is flipped so the image lands upright),
 //!   `NSPasteboard` clipboard, `NSOpenPanel`/`NSSavePanel` dialogs, `NSTimer`
 //!   (40 ms) for `Event::Tick`, `NSCursor` arrow/IBeam/hand, dock icon from
-//!   the portable icon renderer, dark preference via `defaults read -g
-//!   AppleInterfaceStyle`, `open` for links, `mmap(MAP_PRIVATE)` font mapping.
+//!   the portable icon renderer, dark preference via `defaults read -g//! AppleInterfaceStyle`, `open` for links, `mmap(MAP_PRIVATE)` font mapping.
+//!
 //! Not yet: IME/`NSTextInputClient` (`characters` covers Latin-1 and
 //! composed keys), live theme-change notification (no KVO on the
 //! appearance), and the scroll direction/multipliers want a real-wheel pass.
