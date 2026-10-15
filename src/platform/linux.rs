@@ -8,7 +8,7 @@
 //! dialogs by shelling out to `zenity`/`kdialog`, `xdg-open` for links,
 //! `_NET_WM_ICON` from the portable icon renderer, `_MOTIF_WM_HINTS` to drop
 //! server decorations, `_NET_WM_STATE` for maximize, dark preference via
-//! `gsettings`. Not yet: XDND drag-and-drop (tracked in PLAN.md M8 follow-up).
+//! `gsettings`. Not yet: XDND drag-and-drop (tracked in docs/PLAN.md, M8 follow-up).
 use super::Handler;
 use crate::{
     error::{Error, Result},
