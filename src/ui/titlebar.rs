@@ -138,7 +138,9 @@ pub fn paint(
         theme.rule,
     );
     let m = fonts.metrics(FontStyle::Regular, size);
-    let baseline = |top: f32| (top + (m.height() - m.height()) / 2.0 + m.ascent).round();
+    // The old text-drawn × kept this for glyph baselines; the rect-drawn
+    // buttons no longer need it, and neither do the tab labels (they use
+    // bar_baseline).
     let bar_baseline = |r: Rect| (r.y + (r.h - m.height()) / 2.0 + m.ascent).round();
 
     for (i, (name, dirty)) in names.iter().enumerate() {
@@ -225,22 +227,36 @@ pub fn paint(
     canvas.fill_rect(Rect::new(mx, my + s - t, s, t), theme.fg);
     canvas.fill_rect(Rect::new(mx, my, t, s), theme.fg);
     canvas.fill_rect(Rect::new(mx + s - t, my, t, s), theme.fg);
-    // close: × glyph
-    canvas.draw_text(
-        fonts,
-        "×",
-        lay.close.x + lay.close.w / 2.0 - 5.0 * scale,
-        baseline(0.0) + (lay.bar.h - m.height()) / 2.0,
-        TextSpec {
-            size: 15.0 * scale,
-            style: FontStyle::Regular,
-            color: if hover == Some(TitleHit::Close) {
-                Color::hex(0xFFFFFF)
-            } else {
-                theme.fg
-            },
-        },
+    // close: × drawn from bars, like the dash and square above — the text
+    // pipeline's "×" glyph is stroked thinner and sits off-centre (Liberation
+    // puts it high and slightly right), so the three buttons did not read as
+    // one row of chrome. Two crossed diagonal bars, each as long as the
+    // maximize square (10px) and stroked at the same weight `t`, drawn as
+    // corner-to-corner runs of unit steps; the round()s make it crisp the
+    // same way fill_rect does.
+    let cs = 10.0 * scale;
+    let (cx, cyc) = (
+        lay.close.x + lay.close.w / 2.0,
+        lay.close.y + lay.close.h / 2.0,
     );
+    let (hx, hy) = (cx - cs / 2.0, cyc - cs / 2.0);
+    let close_color = if hover == Some(TitleHit::Close) {
+        Color::hex(0xFFFFFF)
+    } else {
+        theme.fg
+    };
+    for (dx0, dy0, dx1, dy1) in [
+        (hx, hy, hx + cs, hy + cs), // \ diagonal
+        (hx, hy + cs, hx + cs, hy), // / diagonal
+    ] {
+        let steps = (cs / t).ceil().max(1.0) as i32;
+        for k in 0..=steps {
+            let f = k as f32 / steps as f32;
+            let px = (dx0 + (dx1 - dx0) * f).round();
+            let py = (dy0 + (dy1 - dy0) * f).round();
+            canvas.fill_rect(Rect::new(px, py, t, t), close_color);
+        }
+    }
     canvas.set_clip(None);
 }
 

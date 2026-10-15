@@ -33,6 +33,7 @@ const FIELDS: &[(&str, &str)] = &[
         "Built with",
         "Rust — standard library only, no dependencies",
     ),
+    ("GitHub", "https://github.com/Eric-Lautanen/editor"),
 ];
 
 const HINT: &str = "F2 or Esc to close";
