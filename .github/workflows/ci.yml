@@ -123,17 +123,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libx11-dev xvfb xdotool
       - run: cargo build --release
+      # The failure report matters as much as the assertion: this is the only
+      # place a Linux window is ever created, so when the app dies the step has
+      # to say *how* — its exit status (139 is a segfault, 134 an abort) and
+      # whatever it managed to write.
       - name: the window really opens
         run: |
-          xvfb-run -a -s "-screen 0 1280x800x24" sh -eu -c '
+          xvfb-run -a -s "-screen 0 1280x800x24" sh -u -c '
+            set -u
+            echo "binary: $(./target/release/editor --version)"
+            echo "DISPLAY=${DISPLAY:-unset}"
             ./target/release/editor --no-update samples/sample.md > /tmp/editor.log 2>&1 &
             pid=$!
             ids=""
+            gone=""
             i=0
             while [ $i -lt 60 ]; do
               ids=$(xdotool search --name "Editor" 2>/dev/null || true)
               if [ -n "$ids" ]; then break; fi
-              if ! kill -0 "$pid" 2>/dev/null; then break; fi
+              if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid" 2>/dev/null || gone=$?
+                break
+              fi
               i=$((i + 1))
               sleep 0.25
             done
@@ -141,12 +152,17 @@ jobs:
               first=$(printf "%s\n" "$ids" | head -1)
               echo "mapped window: $(xdotool getwindowname "$first")"
               xdotool getwindowgeometry "$first"
-            fi
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            if [ -z "$ids" ]; then
-              echo "FAIL: no X window named *Editor* appeared within 15s"
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            else
+              echo "the app is gone before any window: status ${gone:-?} (139 segv, 134 abort)"
+              echo "its output was $(wc -c < /tmp/editor.log) bytes:"
               cat /tmp/editor.log
+              echo "windows xdotool can see at all:"
+              xdotool search --onlyvisible --name "" 2>&1 | head -10
+            fi
+            if [ -z "$ids" ]; then
+              echo "FAIL: no X window named *Editor* appeared"
               exit 1
             fi
             if grep -q "panicked at" /tmp/editor.log; then
