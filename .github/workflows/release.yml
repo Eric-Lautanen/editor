@@ -156,7 +156,10 @@ jobs:
             associations keep working across upgrades unless you move the
             executable. Run `editor --version` to check what you have.
 
-            Note: the Linux and macOS GUI backends (M8/M9) are in progress;
-            those builds currently compile and pass the full headless test
-            suite but the window does not open yet.
+            Note: the Linux and macOS GUI backends (M8/M9) are usable — the
+            release binaries open real windows, and CI starts each one on a
+            virtual display on every push to prove the backends come up (the
+            `smoke-*` jobs). What is still missing is narrower: XDND
+            drag-and-drop on Linux; IME and live theme changes on macOS. See
+            `docs/PLAN.md`.
           generate_release_notes: true

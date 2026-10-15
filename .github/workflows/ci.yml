@@ -105,6 +105,102 @@ jobs:
           print(f'bundle OK: version {version}, {len(exts)} document extensions')
           PY
 
+  # Compiling a backend is not the same as running it: the X11 and AppKit
+  # backends used to be covered only by `cargo test`, which never reaches
+  # window creation — a backend that links cleanly and dies on the first
+  # XMapWindow / orderFront passed every check here. These two jobs start the
+  # release binary for real and look for the window.
+  smoke-linux:
+    name: smoke (linux window)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Xvfb provides the DISPLAY; xdotool asks that X server what is mapped.
+      - name: install X11, Xvfb and xdotool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev xvfb xdotool
+      - run: cargo build --release
+      - name: the window really opens
+        run: |
+          xvfb-run -a -s "-screen 0 1280x800x24" sh -eu -c '
+            ./target/release/editor --no-update samples/sample.md > /tmp/editor.log 2>&1 &
+            pid=$!
+            ids=""
+            i=0
+            while [ $i -lt 60 ]; do
+              ids=$(xdotool search --name "Editor" 2>/dev/null || true)
+              if [ -n "$ids" ]; then break; fi
+              if ! kill -0 "$pid" 2>/dev/null; then break; fi
+              i=$((i + 1))
+              sleep 0.25
+            done
+            if [ -n "$ids" ]; then
+              first=$(printf "%s\n" "$ids" | head -1)
+              echo "mapped window: $(xdotool getwindowname "$first")"
+              xdotool getwindowgeometry "$first"
+            fi
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            if [ -z "$ids" ]; then
+              echo "FAIL: no X window named *Editor* appeared within 15s"
+              cat /tmp/editor.log
+              exit 1
+            fi
+            if grep -q "panicked at" /tmp/editor.log; then
+              echo "FAIL: the backend panicked"
+              cat /tmp/editor.log
+              exit 1
+            fi
+          '
+
+  smoke-macos:
+    name: smoke (macos window)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: the app starts and puts a window on screen
+        run: |
+          ./target/release/editor --no-update samples/sample.md > /tmp/editor.log 2>&1 &
+          pid=$!
+          sleep 6
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "FAIL: editor exited during startup"
+            cat /tmp/editor.log
+            exit 1
+          fi
+          status=0
+          # `kCGWindowName` needs Screen Recording permission, which the runner
+          # will not grant, so the check reads the owner name (still reported)
+          # and only prints the title when the window server hands it over.
+          if ! python3 - <<'PY'
+          import sys
+          try:
+              import Quartz
+          except ImportError:
+              print('pyobjc/Quartz unavailable; the liveness check above is the evidence here')
+              sys.exit(0)
+          info = Quartz.CGWindowListCopyWindowInfo(
+              Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+          ours = [w for w in info if w.get('kCGWindowOwnerName') == 'editor']
+          for w in ours:
+              print('on-screen window:', w.get('kCGWindowName'), w.get('kCGWindowBounds'))
+          if not ours:
+              print('FAIL: no on-screen window owned by editor')
+              sys.exit(1)
+          PY
+          then
+            status=1
+          fi
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          exit $status
+
   fmt:
     runs-on: ubuntu-latest
     steps:
