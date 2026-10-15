@@ -87,6 +87,8 @@ jobs:
           # would flatten the script to `packaging/install.sh`, giving the
           # tarball a path that matches neither the README nor a checkout.
           cp -r packaging/linux dist/packaging/linux
+          # The hicolor launcher icons install.sh installs travel beside it.
+          cp -r assets/linux dist/packaging/linux/icons
           tar -czf ${{ matrix.artifact }} -C dist .
 
       - name: package (macos)

@@ -40,6 +40,58 @@ jobs:
       # deferred warning cleanup lands (ttf.rs dead code, mark_dirty).
       - run: cargo clippy --all-targets
 
+  # The release packagers copy files by name; a rename that misses one of
+  # them (a stale `readitor-mime.xml` next to an installer asking for
+  # `editor-mime.xml`) breaks every user's install and nothing else notices.
+  # Lay the tarball out the way release.yml does, install it into a throwaway
+  # HOME, and check what actually landed. `bundle.sh` is plain sh, so its
+  # layout is checkable here too - only the Mach-O inside needs a mac runner.
+  packaging:
+    name: packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: linux tarball installs what the installer says it does
+        run: |
+          rm -rf dist /tmp/unpack /tmp/fakehome
+          mkdir -p dist/packaging /tmp/unpack /tmp/fakehome
+          cp target/release/editor dist/
+          cp -r packaging/linux dist/packaging/linux
+          cp -r assets/linux dist/packaging/linux/icons
+          tar -czf /tmp/editor.tar.gz -C dist .
+          tar -xzf /tmp/editor.tar.gz -C /tmp/unpack
+          cd /tmp/unpack
+          HOME=/tmp/fakehome sh packaging/linux/install.sh
+          test -x /tmp/fakehome/.local/bin/editor
+          test -f /tmp/fakehome/.local/share/applications/editor.desktop
+          test -f /tmp/fakehome/.local/share/mime/packages/editor-mime.xml
+          for size in 16 32 48 64 128 256 512; do
+            test -f "/tmp/fakehome/.local/share/icons/hicolor/${size}x${size}/apps/editor.png"
+          done
+          grep -q "^Exec=/tmp/fakehome/.local/bin/editor "             /tmp/fakehome/.local/share/applications/editor.desktop
+      - name: macos bundle layout and version
+        run: |
+          sh packaging/macos/bundle.sh
+          test -f target/Editor.app/Contents/MacOS/editor
+          test -f target/Editor.app/Contents/Resources/Editor.icns
+          python3 - <<'PY'
+          import plistlib
+          path = 'target/Editor.app/Contents/Info.plist'
+          with open(path, encoding='utf-8') as f:
+              raw = f.read()
+          assert '__VERSION__' not in raw, 'bundle.sh left a placeholder behind'
+          plist = plistlib.loads(raw.encode())
+          assert plist['CFBundleExecutable'] == 'editor', plist['CFBundleExecutable']
+          assert plist['CFBundleIconFile'] == 'Editor', plist['CFBundleIconFile']
+          version = plist['CFBundleVersion']
+          assert version == plist['CFBundleShortVersionString'], version
+          exts = plist['CFBundleDocumentTypes'][0]['CFBundleTypeExtensions']
+          assert exts, 'no document types in the bundle'
+          print(f'bundle OK: version {version}, {len(exts)} document extensions')
+          PY
+
   fmt:
     runs-on: ubuntu-latest
     steps:

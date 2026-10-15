@@ -51,13 +51,20 @@ associations. `editor --uninstall` removes them.
 ### Linux
 
 Unpack the tarball and run `packaging/linux/install.sh`. It installs the
-binary to `~/.local/bin`, creates a desktop entry, and sets the default
-application for Markdown, JSON, NDJSON, plain text, CSV, YAML and TOML.
+binary to `~/.local/bin`, creates a desktop entry that points at that binary
+by absolute path (so it starts even when `~/.local/bin` is not on `PATH`),
+installs the launcher icons into the user's `hicolor` theme, and sets the
+default application for Markdown, JSON, NDJSON, plain text, CSV, YAML and
+TOML.
 
 ### macOS
 
 Unzip, then drag `Editor.app` into `/Applications`. The bundle declares the
 same document types, so Finder's "Open With" offers it.
+
+The bundle is not signed or notarized yet, so Gatekeeper refuses the first
+launch of a downloaded copy: right-click the app and choose **Open** once
+(or run `xattr -d com.apple.quarantine /Applications/Editor.app`).
 
 ### From source
 

@@ -1,11 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template, not a finished Info.plist: packaging/macos/bundle.sh substitutes
+     __VERSION__ from Cargo.toml (CFBundleVersion and CFBundleShortVersionString)
+     when it builds the bundle. Do not hand-copy this file into an app. -->
 <plist version="1.0"><dict>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Editor</string>
+  <key>CFBundleDisplayName</key><string>Editor</string>
   <key>CFBundleIdentifier</key><string>dev.editor.app</string>
   <key>CFBundleExecutable</key><string>editor</string>
-  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>CFBundleIconFile</key><string>Editor</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>__VERSION__</string>
+  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleDocumentTypes</key>
   <array>
