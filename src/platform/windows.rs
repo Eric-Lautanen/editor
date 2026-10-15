@@ -1830,12 +1830,18 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             if lp != 0 {
                 let cds = &*(lp as *const CopyDataStruct);
                 if cds.dw_data == HANDOFF_TAG as usize && cds.size.is_multiple_of(2) {
-                    let bytes = std::slice::from_raw_parts(
+                    let units = std::slice::from_raw_parts(
                         cds.data as *const u16,
-                        cds.size as usize / 2, // byte count → UTF-16 units; NUL written
+                        cds.size as usize / 2, // byte count → UTF-16 units
                     );
-                    let path = String::from_utf16_lossy(bytes);
-                    if !path.is_empty() {
+                    // The sender's `wide()` writes a NUL terminator, and it is
+                    // part of `size`. Everything past the first NUL is padding,
+                    // and a path carrying one would fail at the Win32 boundary
+                    // with "strings passed to WinAPI cannot contain NULs" —
+                    // which is exactly what happened before this truncation.
+                    let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+                    if len > 0 {
+                        let path = String::from_utf16_lossy(&units[..len]);
                         dispatch(st, hwnd, Event::FileOpen(std::path::PathBuf::from(path)));
                     }
                 }
@@ -2086,6 +2092,9 @@ pub(crate) unsafe fn handoff_to_running(file: Option<&std::path::Path>) -> Resul
         // exit the instant send_message_w returns — which the second process
         // does immediately after. `dwData` tags the payload so junk messages
         // (or another app's WM_COPYDATA to a shared window) are rejected.
+        //
+        // The payload is `wide`'s UTF-16 buffer *including* its NUL terminator,
+        // and `size` counts those bytes; the receiver truncates at the NUL.
         let class = wide("EditorWindow");
         let target = find_window_w(class.as_ptr(), null());
         if !target.is_null() {

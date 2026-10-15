@@ -74,6 +74,7 @@ jobs:
             -d Version=$version `
             -d PublishDir=target/release `
             -d Icon=assets/icon.ico `
+            -d DialogIcon=assets/icon-setup.ico `
             -o $msi `
             packaging/windows/editor.wxs
 

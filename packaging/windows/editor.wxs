@@ -5,16 +5,22 @@
 
   Design points:
 
-  * `Scope="perUser"`: the whole install lands under the user's profile
-    (`ProgramFiles64Folder` resolves to `%LOCALAPPDATA%\Programs` in per-user
-    context, see Microsoft's Single Package Authoring) — no UAC prompt, no
-    admin, the same promise the portable install flag makes. (XML comments
-    cannot contain double hyphens, so CLI flags are written as e.g. the
-    “update flag”.)
-  * `Package`/`UpgradeStrategy="majorUpgrade"` with a fixed `Id`: every build
-    of this wxs shares one identity, so running a newer MSI upgrades in place
-    (Windows Installer removes the old build inside the same transaction,
-    which is how the update command can just hand the user an MSI).
+  * `Scope="perUser"` together with `ALLUSERS=2` and `MSIINSTALLPERUSER=1`:
+    a standard user installs the whole product under their own profile
+    (`PerUserProgramFilesFolder` resolves to `%LOCALAPPDATA%\Programs` in
+    per-user context, see Microsoft's Single Package Authoring) with no UAC
+    prompt, the same promise the portable install flag makes. Windows
+    Installer falls back to the machine-wide registration when an
+    administrator runs it from an already-elevated session; the payload path
+    is unaffected. (XML comments cannot contain double hyphens, so CLI flags
+    are written as e.g. the “update flag”.)
+  * One fixed `UpgradeCode` is the upgrade identity and the `Upgrade` rows are
+    written by hand below, with an INCLUSIVE upper bound: reinstalling the same
+    version replaces the previous install (Windows Installer removes it inside
+    the same transaction, which is how the update command can just hand the
+    user an MSI). WiX's `<MajorUpgrade>` element cannot express that - its
+    VersionMax is exclusive - which is what put three "Editor 0.1.0" entries in
+    one machine's Add/Remove Programs.
   * The file associations mirror `platform/install.rs`'s portable install
     flag: the same `Editor.Document` ProgID and per-extension
     `OpenWithProgids` values under HKCU. Running the MSI after a portable
@@ -48,14 +54,56 @@
          new GUID here would make MSI installs sit next to the old one
          instead of replacing it). ProductCode differs per build by WiX
          default, which is exactly what major upgrades want. -->
-    <MajorUpgrade
-        AllowDowngrades="no"
-        DowngradeErrorMessage="A newer version of Editor is already installed."
-        Schedule="afterInstallInitialize" />
+    <!-- The upgrade detection is spelled out instead of using `<MajorUpgrade>`:
+         that element's VersionMax is EXCLUSIVE, so reinstalling the same
+         version (a republished build, a plain re-run) matched nothing and every
+         install added another Add/Remove Programs entry beside the old one
+         instead of replacing it. The range below is inclusive at the top, so
+         any build at or below this one is removed first; a genuinely newer
+         install is only detected, and the launch condition says so rather than
+         silently downgrading. -->
+    <Upgrade Id="7C61E9D4-33C2-4FA9-9BA4-0D6A57457F09">
+      <UpgradeVersion
+          Minimum="0.0.0"
+          IncludeMinimum="yes"
+          Maximum="$(var.Version)"
+          IncludeMaximum="yes"
+          OnlyDetect="no"
+          Property="WIX_UPGRADE_DETECTED" />
+      <UpgradeVersion
+          Minimum="$(var.Version)"
+          IncludeMinimum="no"
+          OnlyDetect="yes"
+          Property="WIX_NEWER_VERSION_DETECTED" />
+    </Upgrade>
+    <Property Id="WIX_UPGRADE_DETECTED" Secure="yes" />
+    <Property Id="WIX_NEWER_VERSION_DETECTED" Secure="yes" />
+    <Launch
+        Condition="NOT WIX_NEWER_VERSION_DETECTED"
+        Message="A newer version of Editor is already installed." />
+    <InstallExecuteSequence>
+      <RemoveExistingProducts After="InstallInitialize" />
+    </InstallExecuteSequence>
+
+    <!-- Per-user preferred, stated rather than implied: ALLUSERS=2 with
+         MSIINSTALLPERUSER=1 means a standard user installs the whole product
+         (files, Start-menu entry, associations, Add/Remove Programs row) inside
+         their own profile with no UAC prompt. Windows Installer falls back to
+         the machine-wide registration when an administrator runs it from an
+         already-elevated session, which is its documented rule for this
+         combination; the payload still lands under the per-user
+         ProgramFilesFolder because that is what directs the files. -->
+    <Property Id="ALLUSERS" Value="2" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" />
 
     <Icon Id="editor.ico" SourceFile="$(var.Icon)" />
-    <!-- The welcome page's icon control reads from the Binary table. -->
-    <Binary Id="editor.ico" SourceFile="$(var.Icon)" />
+    <!-- The header icon the dialogs draw. MSI's Icon control renders the icon's
+         FIRST frame stretched to the control's pixel size, so this asset leads
+         with the 48px frame - exactly the size a 32x32-dialog-unit control is
+         at 100% scaling. Feeding it assets/icon.ico (whose first frame is
+         16px) is what made the old icon a blurry block. -->
+    <Icon Id="editor_setup.ico" SourceFile="$(var.DialogIcon)" />
+    <Binary Id="editor_setup.ico" SourceFile="$(var.DialogIcon)" />
     <Property Id="ARPPRODUCTICON" Value="editor.ico" />
     <!-- Sensible defaults for ARP metadata. -->
     <Property Id="ARPNOMODIFY" Value="1" /> <!-- replace-don't-tweak: updates come as new MSIs -->
@@ -105,56 +153,101 @@
         <ComponentRef Id="ExtSh" />
       </Feature>
     </Feature>
-    <!-- The setup UI: one welcome page with two checkboxes, then the stock
-         WiX progress/exit dialogs. Checked by default (the properties are
-         preset to 1), so Install takes everything with zero clicks beyond
-         the button; unchecking either box simply refuses that group of
-         associations. -->
+    <!-- The setup UI. Two pages of our own, then the UI extension's stock
+         ProgressDlg/CancelDlg/ErrorDlg/UserExit.
+
+         Why not the extension's ExitDialog: in WiX 7 its dialog ships with no
+         ControlEvent rows at all (verified by querying the built MSI), so its
+         Finish button does nothing and the wizard can never be closed - it had
+         to be killed from Task Manager. The completion page below is ours so
+         the Finish button's EndDialog is guaranteed to exist.
+
+         Why every control names a TextStyle: an unset TextStyle falls back to
+         Windows Installer's legacy 8pt raster face, which is what made the old
+         pages look blocky on a modern display.
+
+         Why the text is ASCII: dialog strings are rendered in the package's
+         language codepage, which rewrites anything else (an em dash came out
+         as "I", smart quotes as "IOpen withl"). -->
+    <!-- WiX v4+ has no per-control TextStyle attribute, so the face comes from
+         DefaultUIFont: Windows Installer applies the named style to every
+         control whose TextStyle is empty - all of ours, and the imported
+         dialogs' too. Without it the legacy raster face comes back, which is
+         what made the old pages look blocky. -->
+    <Property Id="DefaultUIFont" Value="EditorBody" />
+
+    <!-- Add/Remove Programs metadata: what the Windows "Installed apps" page
+         shows next to the name. -->
+    <Property Id="ARPCOMMENTS" Value="Viewer and editor for Markdown, JSON, CSV, logs and code." />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Eric-Lautanen/editor" />
+
+    <!-- Association choices. Both default to 1, so Install takes everything
+         with no clicks beyond the button; a silent install runs no UI and
+         lands on the feature defaults (both groups), which is what the
+         auto-updater must produce. -->
     <Property Id="DOCUMENT_TYPES" Value="1" />
     <Property Id="CODE_TYPES" Value="1" />
     <UI Id="EditorOnePageUi">
-      <Dialog Id="EditorWelcomeDlg" Width="404" Height="238" Title="Install Editor">
-        <!-- App icon + heading. -->
-        <Control Id="AppIcon" Type="Icon" X="20" Y="22" Width="48" Height="48" Text="editor.ico" />
-        <Control Id="Title" Type="Text" X="80" Y="24" Width="300" Height="24" Transparent="yes" NoPrefix="yes" Text="Install Editor" />
-        <Control Id="Subtitle" Type="Text" X="80" Y="50" Width="300" Height="34" Transparent="yes" NoPrefix="yes" Text="A fast viewer for Markdown, JSON, CSV, logs and code. Per-user install — no admin rights needed." />
-        <!-- The only two questions: both default to checked. Height 30 so
-             the wrapping second line shows instead of clipping mid-word. -->
-        <Control Id="DocumentsCheck" Type="CheckBox" X="25" Y="104" Width="354" Height="30" Property="DOCUMENT_TYPES" CheckBoxValue="1" Text="Associate document and config files\n(md, json, csv, log, yaml, toml, ...)" />
-        <Control Id="CodeCheck" Type="CheckBox" X="25" Y="140" Width="354" Height="30" Property="CODE_TYPES" CheckBoxValue="1" Text="Associate code files (rs, py, js, ts, c, cpp, ...)" />
-        <Control Id="Hint" Type="Text" X="25" Y="178" Width="354" Height="14" Transparent="yes" NoPrefix="yes" Text=" associations are offered in Explorer’s “Open with” menu. You can change these any time." />
-        <Control Id="Install" Type="PushButton" X="254" Y="200" Width="70" Height="22" Default="yes" Text="Install">
-          <!-- The checkbox pattern: the check state lands in the property
-               (CheckBoxValue), and these events turn it into feature state.
-               Unchecked -> Remove (absent); checked -> AddLocal (installed).
-               A silent install runs no UI, so both groups land at their
-               default level - full associations - which is what the updater
-               must produce. -->
+      <TextStyle Id="EditorBody" FaceName="Segoe UI" Size="9" />
+      <Dialog Id="EditorWelcomeDlg" Width="370" Height="270" Title="Install Editor">
+        <Control Id="AppIcon" Type="Icon" X="18" Y="10" Width="32" Height="32" Text="editor_setup.ico" />
+        <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Install Editor" />
+        <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Native viewer and editor for Markdown, JSON, CSV, logs and code." />
+        <Control Id="HeaderLine" Type="Line" X="0" Y="54" Width="370" Height="0" />
+        <Control Id="Section" Type="Text" X="18" Y="66" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="File associations" />
+        <!-- Each checkbox is one line with the extension list under it: one
+             long wrapped line would clip (it did - the old page cut the list
+             off mid-word). Height 10 is a single 9pt line. -->
+        <Control Id="DocumentsCheck" Type="CheckBox" X="18" Y="84" Width="336" Height="10" Property="DOCUMENT_TYPES" CheckBoxValue="1" Text="Offer Editor in the Open with menu for documents and config files" />
+        <Control Id="DocumentsList" Type="Text" X="36" Y="96" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="md  markdown  json  jsonl  txt  log  csv  tsv  yaml  toml  ini  conf" />
+        <Control Id="CodeCheck" Type="CheckBox" X="18" Y="114" Width="336" Height="10" Property="CODE_TYPES" CheckBoxValue="1" Text="Offer Editor in the Open with menu for code files" />
+        <Control Id="CodeList" Type="Text" X="36" Y="126" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="rs  py  js  ts  c  h  cpp  cs  java  go  rb  php  css  html  xml  sh" />
+        <Control Id="Note" Type="Text" X="18" Y="150" Width="334" Height="36" Transparent="yes" NoPrefix="yes" Text="Editor is only added as an option in the Explorer Open with menu. Your current default apps are never taken over, and you can change these choices at any time." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <!-- The checkbox pattern: the check state lands in the property
+             (CheckBoxValue) and these events turn it into feature state.
+             Unchecked -> Remove (absent); checked -> AddLocal (installed). -->
+        <Control Id="Install" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Install">
           <Publish Event="AddLocal" Value="DocumentTypes" Condition="DOCUMENT_TYPES" Order="1" />
           <Publish Event="Remove" Value="DocumentTypes" Condition="NOT DOCUMENT_TYPES" Order="2" />
           <Publish Event="AddLocal" Value="CodeTypes" Condition="CODE_TYPES" Order="3" />
           <Publish Event="Remove" Value="CodeTypes" Condition="NOT CODE_TYPES" Order="4" />
           <Publish Event="EndDialog" Value="Return" Order="5" />
         </Control>
-        <Control Id="Cancel" Type="PushButton" X="330" Y="200" Width="60" Height="22" Cancel="yes" Text="Cancel">
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
           <Publish Event="EndDialog" Value="Exit" />
         </Control>
-        <Control Id="BottomLine" Type="Line" X="0" Y="196" Width="404" Height="0" />
+      </Dialog>
+      <Dialog Id="EditorDoneDlg" Width="370" Height="270" Title="Editor Setup Complete">
+        <Control Id="AppIcon" Type="Icon" X="18" Y="10" Width="32" Height="32" Text="editor_setup.ico" />
+        <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Setup complete" />
+        <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Editor [ProductVersion] is installed for your account." />
+        <Control Id="HeaderLine" Type="Line" X="0" Y="54" Width="370" Height="0" />
+        <Control Id="Body" Type="Text" X="18" Y="68" Width="334" Height="40" Transparent="yes" NoPrefix="yes" Text="Open any supported file from the Explorer Open with menu, or drag it onto the Editor window. Editor also appears in the Start menu." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="Back" />
+        <!-- The one event that matters: this is what the extension's page was
+             missing, so Finish now closes the wizard. -->
+        <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Finish">
+          <Publish Event="EndDialog" Value="Return" Order="1" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="Cancel" />
       </Dialog>
       <InstallUISequence>
         <Show Dialog="EditorWelcomeDlg" Before="ExecuteAction" />
+        <!-- OnExit="success" is the MSI exit-page slot (the -1 row); only a
+             fresh install gets a completion page, since `Installed` is already
+             set during a repair or an uninstall and "Setup complete" would be
+             a lie there. -->
+        <Show Dialog="EditorDoneDlg" OnExit="success" Condition="NOT Installed" />
       </InstallUISequence>
-      <!-- The stock WiX progress + completion dialogs: after Install the
-           installer shows a real progress bar, then an "Installation
-           complete / Finish" page. Cancelling surfaces UserExit; failures
-           ErrorDlg. Referencing each dialog links its stock scheduling —
-           no <Show> entries here (they would conflict). -->
+      <!-- The stock progress page (its Cancel event is intact, and the UI
+           sequence drives its controls), plus the cancel/error/abort pages. -->
       <DialogRef Id="ProgressDlg" />
-      <DialogRef Id="ExitDialog" />
       <DialogRef Id="UserExit" />
       <DialogRef Id="ErrorDlg" />
       <!-- Maintenance mode (repair/change/uninstall over an existing install)
-           needs no page; Windows Installer own dialogs handle it. -->
+           needs no page; Windows Installer's own dialogs handle it. -->
     </UI>
 
     <!-- `PerUserProgramFilesFolder` (WiX v6+): resolves to

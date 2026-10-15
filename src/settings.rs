@@ -138,8 +138,11 @@ fn parse(text: &str) -> Settings {
             "maximized" => s.maximized = val == "1",
             "auto_update" => s.auto_update = val == "1",
             "window" => s.window = parse_window(val),
-            "open" => s.files.push(PathBuf::from(val)),
-            "recent" => s.recent.push(PathBuf::from(val)),
+            // A path with an embedded NUL can never open (Win32 rejects it),
+            // so such a line is dropped rather than carried forever. Builds
+            // before the handoff fix wrote exactly that into the recent list.
+            "open" if !val.contains('\0') => s.files.push(PathBuf::from(val)),
+            "recent" if !val.contains('\0') => s.recent.push(PathBuf::from(val)),
             _ => {}
         }
     }
@@ -245,6 +248,16 @@ mod tests {
         };
         let text = render(&s);
         assert_eq!(parse(&text), s);
+    }
+
+    #[test]
+    fn nul_tainted_paths_are_dropped_on_load() {
+        // The single-instance handoff once delivered its path with the UTF-16
+        // NUL terminator still attached, so those lines landed in the recent
+        // list. They can never open; loading must discard them.
+        let s = parse("open C:\\ok\\a.md\nopen C:\\bad\\b.md\0\nrecent C:\\bad\\b.md\0\nrecent C:\\ok\\c.md\n");
+        assert_eq!(s.files, vec![PathBuf::from("C:\\ok\\a.md")]);
+        assert_eq!(s.recent, vec![PathBuf::from("C:\\ok\\c.md")]);
     }
 
     #[test]
