@@ -1,5 +1,5 @@
 {
-  "name": "readitor",
+  "name": "editor",
   "version": 1,
   "description": "A small native viewer/editor for Markdown, JSON and JSONL.",
   "tags": ["md", "json", "jsonl", "txt"],

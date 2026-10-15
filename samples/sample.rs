@@ -1,4 +1,4 @@
-// Readitor sample code: exercises the lightweight tint.
+// Editor sample code: exercises the lightweight tint.
 use std::collections::HashMap;
 
 const MAX_ROWS: usize = 2000;

@@ -366,6 +366,14 @@ impl App {
         self.set_dark(dark);
     }
 
+    /// Pick the view mode directly (Ctrl+E cycles into it, `--mode` names it).
+    /// Any preview selection belongs to the pane that just went away.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.clear_preview_sel();
+        self.layout_dirty = true;
+    }
+
     /// Toggle background update checks (About box row / cli startup). On by
     /// default; turning it off only stops the *check* — `--update` keeps
     /// working, and every install still goes through the consent + checksum
@@ -1108,13 +1116,12 @@ impl App {
             Key::Char('s') if mods.ctrl => self.save(host),
             Key::Char('r') if mods.ctrl => self.reload_file(host),
             Key::Char('e') if mods.ctrl => {
-                self.mode = match self.mode {
+                let next = match self.mode {
                     Mode::Preview => Mode::Edit,
                     Mode::Edit => Mode::Split,
                     Mode::Split => Mode::Preview,
                 };
-                self.clear_preview_sel();
-                self.layout_dirty = true;
+                self.set_mode(next);
                 self.persist();
             }
             Key::Char('f') if mods.ctrl => {

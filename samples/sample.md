@@ -1,4 +1,4 @@
-# Readitor sample
+# Editor sample
 
 A tour of everything the renderer understands. The point of this file is that
 it is *long*: open it and scroll — the overlay scrollbar on the right is the

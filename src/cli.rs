@@ -13,7 +13,8 @@ const USAGE: &str = "usage: editor [FILE]\n\
   --update             check GitHub and install the newest release\n\
   --no-update          skip the automatic update check for this launch\n\
   --pretty             print FILE (.json/.jsonl) canonicalized to stdout\n\
-  dev: --render OUT.ppm [--size WxH] [--scale S] [--dark] [--scroll PX]   headless snapshot of FILE
+  dev: --render OUT.ppm [--size WxH] [--scale S] [--dark|--light] [--scroll PX]\n\
+                       [--mode preview|edit|split]   headless snapshot of FILE
   dev: --mem-report FILE                                                allocation census after load+layout (mem-census builds)";
 
 struct Opts {
@@ -23,7 +24,13 @@ struct Opts {
     size: (usize, usize),
     scale: f32,
     dark: bool,
+    /// `--light`: pin the light theme for this launch. `--dark` wins if both
+    /// are given; with neither, the saved session and the OS decide.
+    light: bool,
     scroll: f32,
+    /// View mode for a headless snapshot (screenshots); unset keeps whatever
+    /// the session restored.
+    mode: Option<Mode>,
     /// Print the allocation census after the file is loaded/laid out.
     mem_report: bool,
     /// Skip the background update check this launch (dev loop; the env
@@ -43,7 +50,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
         size: platform::DEFAULT_SIZE,
         scale: 1.0,
         dark: false,
+        light: false,
         scroll: 0.0,
+        mode: None,
         mem_report: false,
         no_update: false,
     };
@@ -85,6 +94,15 @@ pub fn run(args: Vec<String>) -> Result<()> {
                     .map_err(|_| usage("bad --scroll"))?
             }
             "--dark" => o.dark = true,
+            "--light" => o.light = true,
+            "--mode" => {
+                o.mode = Some(match val("--mode")?.as_str() {
+                    "preview" => Mode::Preview,
+                    "edit" => Mode::Edit,
+                    "split" => Mode::Split,
+                    other => return Err(usage(format!("bad --mode {other}"))),
+                })
+            }
             "--mem-report" => o.mem_report = true,
             other if !other.starts_with('-') => o.file = Some(PathBuf::from(other)),
             other => return Err(usage(format!("unknown flag {other}\n{USAGE}"))),
@@ -98,9 +116,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
         app.note_recent(f);
     }
     let session = settings::load();
-    // --dark wins, then the user's saved manual pick, then the OS theme.
+    // --dark / --light win, then the user's saved manual pick, then the OS
+    // theme.
     if o.dark {
         app.set_dark_manual(true);
+    } else if o.light {
+        app.set_dark_manual(false);
     } else if session.manual {
         app.set_dark_manual(session.dark);
     } else {
@@ -124,6 +145,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let mut host = crate::platform::NullHost::default();
             app.open_path(path.clone(), &mut host);
         }
+    }
+    // --mode names the view instead of cycling to it with Ctrl+E. Applied
+    // here, after the session merge, so it wins over the restored mode —
+    // and before the snapshot path below, which never sees a keystroke.
+    if let Some(mode) = o.mode {
+        app.set_mode(mode);
     }
     // Reopen where the window was left — with or without a file argument, and
     // maximized if that is how it was closed. The platform reads this back

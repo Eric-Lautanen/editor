@@ -1,4 +1,4 @@
-Readitor plain text sample
+Editor plain text sample
 ==========================
 
 This is a long paragraph to exercise word wrapping: the quick brown fox jumps over the lazy dog, then keeps running through the fields until the line is wider than the column, at which point it must wrap cleanly without cutting words in half. It keeps going for a while, because a text file that fits on one screen never shows you the scrollbar.
