@@ -32,7 +32,10 @@ if [ -z "${DISPLAY:-}" ]; then
         echo "FAIL: no DISPLAY and no xvfb-run to provide one"
         exit 1
     fi
-    exec xvfb-run -a -s "-screen 0 1280x800x24" "$0" "$@"
+    # `sh "$0"` rather than `"$0"`: xvfb-run executes what it is given, so
+    # going through the shell a second time keeps the script working however
+    # it was checked out (the mode is lost by more than one tool).
+    exec xvfb-run -a -s "-screen 0 1280x800x24" sh "$0" "$@"
 fi
 
 echo "binary: $("$bin" --version)"
