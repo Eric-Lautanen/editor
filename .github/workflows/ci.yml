@@ -40,24 +40,24 @@ jobs:
       # deferred warning cleanup lands (ttf.rs dead code, mark_dirty).
       - run: cargo clippy --all-targets
 
-  # The release packagers copy files by name; a rename that misses one of
-  # them (a stale `readitor-mime.xml` next to an installer asking for
+  # The release packagers copy files by name; a rename that misses one of them
+  # (a stale `readitor-mime.xml` next to an installer asking for
   # `editor-mime.xml`) breaks every user's install and nothing else notices.
-  # Lay the tarball out the way release.yml does, install it into a throwaway
-  # HOME, and check what actually landed. `bundle.sh` is plain sh, so its
-  # layout is checkable here too - only the Mach-O inside needs a mac runner.
-  packaging:
-    name: packaging
+  # This job owns install.sh's file handling, so it compiles nothing: a
+  # stand-in executable is enough to prove what lands where, and it keeps the
+  # job clear of the X11 link dependency the test job carries.
+  packaging-linux:
+    name: packaging (linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - name: linux tarball installs what the installer says it does
+      - name: install into a throwaway HOME and check what landed
         run: |
           rm -rf dist /tmp/unpack /tmp/fakehome
           mkdir -p dist/packaging /tmp/unpack /tmp/fakehome
-          cp target/release/editor dist/
+          # Stand-in for the release binary; install.sh only copies it.
+          : > dist/editor
+          chmod +x dist/editor
           cp -r packaging/linux dist/packaging/linux
           cp -r assets/linux dist/packaging/linux/icons
           tar -czf /tmp/editor.tar.gz -C dist .
@@ -70,10 +70,21 @@ jobs:
           for size in 16 32 48 64 128 256 512; do
             test -f "/tmp/fakehome/.local/share/icons/hicolor/${size}x${size}/apps/editor.png"
           done
-          grep -q "^Exec=/tmp/fakehome/.local/bin/editor "             /tmp/fakehome/.local/share/applications/editor.desktop
-      - name: macos bundle layout and version
+          grep -q '^Exec=/tmp/fakehome/.local/bin/editor '             /tmp/fakehome/.local/share/applications/editor.desktop
+
+  # The bundle is built for real here (macOS links its frameworks natively, so
+  # nothing extra to install), then checked: the icon and the version-filled
+  # plist are what the Finder and the About box read.
+  packaging-macos:
+    name: packaging (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sh packaging/macos/bundle.sh
+      - name: check the bundle
         run: |
-          sh packaging/macos/bundle.sh
           test -f target/Editor.app/Contents/MacOS/editor
           test -f target/Editor.app/Contents/Resources/Editor.icns
           python3 - <<'PY'
@@ -83,8 +94,10 @@ jobs:
               raw = f.read()
           assert '__VERSION__' not in raw, 'bundle.sh left a placeholder behind'
           plist = plistlib.loads(raw.encode())
-          assert plist['CFBundleExecutable'] == 'editor', plist['CFBundleExecutable']
-          assert plist['CFBundleIconFile'] == 'Editor', plist['CFBundleIconFile']
+          for key, want in (('CFBundleExecutable', 'editor'),
+                            ('CFBundleIconFile', 'Editor'),
+                            ('CFBundlePackageType', 'APPL')):
+              assert plist[key] == want, f'{key} is {plist[key]!r}'
           version = plist['CFBundleVersion']
           assert version == plist['CFBundleShortVersionString'], version
           exts = plist['CFBundleDocumentTypes'][0]['CFBundleTypeExtensions']
