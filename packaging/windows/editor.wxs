@@ -26,9 +26,10 @@
     `OpenWithProgids` values under HKCU. Running the MSI after a portable
     install (or vice versa) writes identical data, so there is no clash to
     fail on.
-  * The extension list below must track `core::file_kind::EXTENSIONS`; the
-    repo test that pins one against drift lives nowhere, so check both when
-    editing either (search for `EXTENSIONS`).
+  * The extension list below must track `core::file_kind::EXTENSIONS`: the
+    `packaging_manifests_claim_exactly_the_supported_extensions` test in
+    `src/core/file_kind.rs` reads this file and fails if the two drift apart,
+    so edit either one and let the test tell you which side is short.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">

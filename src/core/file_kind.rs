@@ -148,6 +148,79 @@ mod tests {
         assert_eq!(FileKind::from_path(Path::new("x.rs")), FileKind::Code);
     }
 
+    /// The packaging manifests carry hand-written copies of [`EXTENSIONS`],
+    /// so an extension added here quietly stops being associated until
+    /// someone remembers all three files. Read them at compile time and fail
+    /// here instead — this is the test `packaging/windows/editor.wxs` used to
+    /// point at as missing.
+    #[test]
+    fn packaging_manifests_claim_exactly_the_supported_extensions() {
+        const WXS: &str = include_str!("../../packaging/windows/editor.wxs");
+        const PLIST: &str = include_str!("../../packaging/macos/Info.plist");
+
+        let mut want: Vec<&str> = EXTENSIONS.to_vec();
+        want.sort_unstable();
+        want.dedup();
+
+        // Windows: one `Software\Classes\.<ext>\OpenWithProgids` key per
+        // extension, shared by the MSI and the portable `--install` path.
+        let mut win: Vec<&str> = WXS
+            .match_indices("Software\\Classes\\.")
+            .filter_map(|(i, key)| WXS[i + key.len()..].split('\\').next())
+            .collect();
+        win.sort_unstable();
+        win.dedup();
+        assert_eq!(win, want, "editor.wxs and EXTENSIONS disagree");
+
+        // macOS: the bundle's document types, which is what Finder offers.
+        let array = PLIST
+            .split("<key>CFBundleTypeExtensions</key>")
+            .nth(1)
+            .expect("no CFBundleTypeExtensions in Info.plist")
+            .split("</array>")
+            .next()
+            .unwrap();
+        let mut mac: Vec<&str> = array
+            .split("<string>")
+            .skip(1)
+            .filter_map(|s| s.split("</string>").next())
+            .collect();
+        mac.sort_unstable();
+        mac.dedup();
+        assert_eq!(mac, want, "Info.plist and EXTENSIONS disagree");
+    }
+
+    /// The desktop entry declares the MIME types the app handles; install.sh
+    /// loops over the list it makes default. Two copies of one list: a
+    /// mismatch leaves a type declared but undefaulted, or a default for a
+    /// type the entry does not even claim.
+    #[test]
+    fn linux_desktop_entry_and_installer_agree_on_mime_types() {
+        const DESKTOP: &str = include_str!("../../packaging/linux/editor.desktop");
+        const INSTALL: &str = include_str!("../../packaging/linux/install.sh");
+
+        let declared: Vec<&str> = DESKTOP
+            .lines()
+            .find_map(|l| l.strip_prefix("MimeType="))
+            .expect("no MimeType line in editor.desktop")
+            .split(';')
+            .filter(|t| !t.is_empty())
+            .collect();
+        let installed: Vec<&str> = INSTALL
+            .split("for t in ")
+            .nth(1)
+            .expect("no `for t in` loop in install.sh")
+            .split("; do")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            declared, installed,
+            "editor.desktop and install.sh disagree on the MIME types"
+        );
+    }
+
     #[test]
     fn dialog_filters_cover_every_claimed_extension() {
         // Open filter: one glob per claimed extension.
