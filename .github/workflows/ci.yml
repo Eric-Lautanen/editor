@@ -36,9 +36,11 @@ jobs:
       # that platform's backend; the other two are covered by the
       # `editor_check_*` cfgs (see `platform/mod.rs`).
       - run: cargo test
-      # TODO: flip to `cargo clippy --all-targets -- -D warnings` once the
-      # deferred warning cleanup lands (ttf.rs dead code, mark_dirty).
-      - run: cargo clippy --all-targets
+      # Warnings fail the build. The old deferral ("wait for the ttf.rs dead
+      # code and mark_dirty cleanup") is done history: the tree is clippy-
+      # clean under -D warnings, and a maintenance-stage app shouldn't let a
+      # new warning land unchallenged.
+      - run: cargo clippy --all-targets -- -D warnings
 
   # The release packagers copy files by name; a rename that misses one of them
   # (a stale `readitor-mime.xml` next to an installer asking for

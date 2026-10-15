@@ -969,7 +969,14 @@ impl<'a> Face<'a> {
                     .filter(|e| y >= e.y0 && y <= e.y1)
                     .map(|e| (e.x0 + e.slope * (y - e.y0), e.dir))
                     .collect();
-                xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                // A total ordering: malformed outlines can carry NaN
+                // coordinates, and `partial_cmp().unwrap()` would panic on
+                // them mid-rasterize. `total_cmp` orders NaN somewhere
+                // deterministic instead; garbage spans are degenerate and
+                // contribute nothing usable, which is exactly the
+                // degrade-don't-crash behaviour the rest of the parser
+                // gives bad input.
+                xs.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let mut wind = 0i32;
                 let mut span_start = 0.0f32;
                 for (x, dir) in xs {

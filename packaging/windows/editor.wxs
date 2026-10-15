@@ -279,6 +279,11 @@
       <Directory Id="INSTALLFOLDER" Name="Editor">
         <Component Id="AppExe" Guid="*">
           <File Id="EditorExe" Source="$(var.PublishDir)\editor.exe" KeyPath="yes" />
+          <!-- Uninstall must leave nothing behind, including this folder:
+               without RemoveFolder the directory survives its contents (the
+               exe and the Start-menu dir go, the empty Programs\Editor shell
+               stayed, confirmed by a real uninstall cycle). -->
+          <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
         </Component>
 
         <!-- Editor.Document: name, icon, and the open command the shell runs
