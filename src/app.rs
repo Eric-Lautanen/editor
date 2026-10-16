@@ -4,7 +4,12 @@ use crate::{
         file_kind::FileKind,
     },
     error::Result,
-    gfx::{canvas::Canvas, color::Color, font::FontSystem, geom::Point, geom::Rect},
+    gfx::{
+        canvas::Canvas,
+        color::Color,
+        font::{FontStyle, FontSystem},
+        geom::{Point, Rect},
+    },
     layout::{
         self,
         display_list::{DisplayList, DrawOp},
@@ -938,6 +943,48 @@ impl App {
         } else {
             0.0
         };
+        // Everything on screen persists; a big document's own scale (this
+        // runs on every resize, zoom and pane switch, so whole-document work
+        // at 1M+ rows is what turns those into freezes).
+
+        if self.mode == Mode::Edit {
+            // One pass over the buffer's lines and the scroll range is the
+            // whole job. status_extra is untouched here: absent a reader
+            // pane there is no suffix to rewrite.
+            tab.status_extra.clear();
+            tab.editor_pane.list = layout::text::layout_plain(&tab.buffer, edit_w, &ctx, false);
+            let rail = gutter::rail_w(&self.fonts, &ctx, tab.buffer.line_count());
+            // h_max needs the widest display row. The old loop measured
+            // every laid-out op — for a million-line pane that is a second
+            // full walk *and* a full glyph-measure per line (13 s on the
+            // 34 MB log), all to answer "how wide is the longest line".
+            // In Edit the pane is one row per line, so it is the widest
+            // expanded buffer line: tracking it during one line walk and
+            // measuring only that line gives the identical max.
+            let p = layout::text::plain_params(edit_w, &ctx, false);
+            let mut longest: String = String::new();
+            let mut longest_w: usize = 0;
+            for i in 0..tab.buffer.line_count() {
+                let line = tab.buffer.line(i).replace('\t', "    ");
+                let w = line.len();
+                if w > longest_w {
+                    longest_w = w;
+                    longest = line;
+                }
+            }
+            let extent = ctx.fonts.measure(FontStyle::Mono, &longest, p.size);
+            // Content is painted inset by the rail, so it scrolls that much
+            // farther before hitting the right edge.
+            tab.h_max = (extent + rail + 32.0 * self.scale - edit_w).max(0.0);
+            tab.h_scroll = tab.h_scroll.min(tab.h_max);
+            tab.h_target = tab.h_target.min(tab.h_max);
+            let content = tab.editor_pane.list.height;
+            tab.scroll.content_height = content;
+            tab.scroll.viewport_height = view_h;
+            tab.scroll.offset = ratio * content;
+            tab.scroll.scroll_by(0.0);
+            return;
+        }
         let list = match tab.kind {
             FileKind::Json => {
                 Self::layout_json(&tab.buffer, &tab.collapsed, &mut tab.status_extra, w, &ctx)
@@ -1055,8 +1102,13 @@ impl App {
     /// (typing, delete, paste, cut, undo, redo) funnels through
     /// `after_edit`, so undoing back to the saved content clears the tab's
     /// save button again instead of leaving it stuck on.
+    ///
+    /// The compare is byte-identical equality, so the O(n²) `text()` join a
+    /// direct `!=` (or `PartialEq`) compare of whole documents would run —
+    /// per-mutation, per keystroke — is skipped in favor of a same-shaped
+    /// line walk, keeping huge buffers responsive while editing.
     fn sync_dirty(&mut self) {
-        let dirty = self.buffer.text() != self.saved_text;
+        let dirty = !same_lines(&self.buffer, &self.saved_text);
         self.buffer.dirty = dirty;
     }
 
@@ -2407,6 +2459,33 @@ fn char_col(buf: &Buffer, p: Pos) -> usize {
     buf.line(p.line)[..p.col].chars().count() + 1
 }
 
+/// Whole-document byte equality shaped like a line walk instead of a join.
+/// [`Buffer::text`] assembles a second full copy of the document; against a
+/// huge buffer that is O(n) bytes *and* an O(n) String allocation per
+/// keystroke, and the incremental shading that pushes caller care about
+/// compares whole documents against the saved snapshot. Comparing line by
+/// line, with the lengths checked up front, allocates nothing and short-
+/// circuits on the first mismatched line.
+fn same_lines(buf: &Buffer, saved: &str) -> bool {
+    // Line counts must agree: a saved snapshot of "a\nb" is 2 lines and a saved
+    // "a\n" is 2 lines too (the trailing newline is one empty last line), and
+    // both saved-\r\n shapes normalize to the same \n-joined shape at load.
+    let expected = saved.split('\n').count();
+    if buf.line_count() != expected {
+        return false;
+    }
+    let mut it = saved.split('\n').enumerate();
+    for i in 0..buf.line_count() {
+        let Some((_, text)) = it.next() else {
+            return false;
+        };
+        if buf.line(i) != text.trim_end_matches('\r') {
+            return false;
+        }
+    }
+    true
+}
+
 /// Log status counts over at most the first 20k lines: a full 64 MB scan on
 /// every relayout would jank the window for no reader benefit. Empty when
 /// nothing matched, so ordinary logs keep a clean bar.
@@ -3086,6 +3165,10 @@ mod tests {
         let h1 = app.preview.list.height;
         let mut host = NullHost::default();
         app.on_event(ctrl('+'), &mut host);
+        // Zooming in Edit mode defers the wrapped list (it is not painted
+        // there); the pane-switch button relayouts before the pane shows it.
+        app.mode = Mode::Preview;
+        app.layout_dirty = true;
         let mut c = Canvas::new(800, 600);
         app.paint(&mut c);
         assert!(app.preview.list.height > h1);

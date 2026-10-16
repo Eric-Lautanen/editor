@@ -112,6 +112,38 @@ pub fn wrap_line(
 /// Plain text / logs / anything without a richer renderer yet: monospace,
 /// wrapped into a centered column (preview) or one row per line (editor).
 pub fn layout_plain(buf: &Buffer, viewport_w: f32, ctx: &Ctx, wrap: bool) -> DisplayList {
+    // The editor pane (wrap=false) never folds a line into rows, and its
+    // per-line output is exactly `buf.line(i)` tab-expanded into one Text op.
+    // Running that through the ordinary wrap path walked every line's chars
+    // with `advance_at` to produce the same single row — most of a huge
+    // no-wrap pane's layout cost for no difference on screen. wrap=true (the
+    // wrapped preview pane) keeps the full path below.
+    if !wrap {
+        let p = plain_params(viewport_w, ctx, false);
+        let m = ctx.fonts.metrics(FontStyle::Mono, p.size);
+        let mut ops = Vec::new();
+        let mut y = p.pad;
+        for i in 0..buf.line_count() {
+            let line = buf.line(i).replace('\t', "    ");
+            if !line.is_empty() {
+                let baseline = (y + (p.line_h - m.height()) / 2.0 + m.ascent).round();
+                ops.push(DrawOp::Text {
+                    x: p.x0,
+                    y: baseline,
+                    text: line,
+                    size: p.size,
+                    style: FontStyle::Mono,
+                    color: ctx.theme.fg,
+                });
+            }
+            y += p.line_h;
+        }
+        return DisplayList {
+            ops,
+            height: y + p.pad,
+            hits: Vec::new(),
+        };
+    }
     #[cfg(any(test, feature = "mem-census"))]
     crate::mem::begin(crate::mem::Component::DisplayList);
     let t = ctx.theme;
