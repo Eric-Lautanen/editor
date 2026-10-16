@@ -109,10 +109,18 @@
     <!-- Sensible defaults for ARP metadata. -->
     <Property Id="ARPNOMODIFY" Value="1" /> <!-- replace-don't-tweak: updates come as new MSIs -->
 
-    <Feature Id="Main" Title="Editor" Description="The editor, Start Menu shortcut, and this installer's choices." Level="1">
+    <Feature Id="Main" Title="Editor" Description="The editor and this installer's choices." Level="1">
       <ComponentRef Id="AppExe" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="ProgIdRegistry" />
+      <!-- The Desktop shortcut is its own feature so the checkbox can turn
+           it off; its Level is 1, so a silent install (the auto-updater's
+           `msiexec /passive`) gets it too. The Start menu entry is not
+           optional - it is how an app is expected to be reachable after
+           installing. -->
+      <Feature Id="DesktopShortcutFeature" Title="Desktop shortcut" Description="A shortcut to Editor on the Desktop." Level="1" AllowAdvertise="no">
+        <ComponentRef Id="DesktopShortcut" />
+      </Feature>
       <!-- The association comps nest under two checkbox-driven subfeatures;
            their state is set by the one-page dialog below: unchecking a
            checkbox removes that whole group (its components stay installed
@@ -182,12 +190,13 @@
     <Property Id="ARPCOMMENTS" Value="Viewer and editor for Markdown, JSON, CSV, logs and code." />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Eric-Lautanen/editor" />
 
-    <!-- Association choices. Both default to 1, so Install takes everything
-         with no clicks beyond the button; a silent install runs no UI and
-         lands on the feature defaults (both groups), which is what the
-         auto-updater must produce. -->
+    <!-- The installer's choices. All three default to 1, so Install takes
+         everything with no clicks beyond the button; a silent install runs no
+         UI and lands on the feature defaults, which is what the auto-updater
+         must produce. -->
     <Property Id="DOCUMENT_TYPES" Value="1" />
     <Property Id="CODE_TYPES" Value="1" />
+    <Property Id="DESKTOP_SHORTCUT" Value="1" />
     <UI Id="EditorOnePageUi">
       <TextStyle Id="EditorBody" FaceName="Segoe UI" Size="9" />
       <Dialog Id="EditorWelcomeDlg" Width="370" Height="270" Title="Install Editor">
@@ -195,15 +204,24 @@
         <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Install Editor" />
         <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Native viewer and editor for Markdown, JSON, CSV, logs and code." />
         <Control Id="HeaderLine" Type="Line" X="0" Y="54" Width="370" Height="0" />
-        <Control Id="Section" Type="Text" X="18" Y="66" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="File associations" />
-        <!-- Each checkbox is one line with the extension list under it: one
-             long wrapped line would clip (it did - the old page cut the list
-             off mid-word). Height 10 is a single 9pt line. -->
-        <Control Id="DocumentsCheck" Type="CheckBox" X="18" Y="84" Width="336" Height="10" Property="DOCUMENT_TYPES" CheckBoxValue="1" Text="Offer Editor in the Open with menu for documents and config files" />
-        <Control Id="DocumentsList" Type="Text" X="36" Y="96" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="md  markdown  json  jsonl  txt  log  csv  tsv  yaml  toml  ini  conf" />
-        <Control Id="CodeCheck" Type="CheckBox" X="18" Y="114" Width="336" Height="10" Property="CODE_TYPES" CheckBoxValue="1" Text="Offer Editor in the Open with menu for code files" />
-        <Control Id="CodeList" Type="Text" X="36" Y="126" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="rs  py  js  ts  c  h  cpp  cs  java  go  rb  php  css  html  xml  sh" />
-        <Control Id="Note" Type="Text" X="18" Y="150" Width="334" Height="36" Transparent="yes" NoPrefix="yes" Text="Editor is only added as an option in the Explorer Open with menu. Your current default apps are never taken over, and you can change these choices at any time." />
+        <!-- The section heading states the action once, so each checkbox only
+             has to name its group. Each is one line with its extension list
+             under it: one long wrapped line would clip (it did - the old page
+             cut the list off mid-word). Height 10 is a single 9pt line. -->
+        <Control Id="AssocSection" Type="Text" X="18" Y="66" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="Add Editor to the Open with menu for" />
+        <Control Id="DocumentsCheck" Type="CheckBox" X="18" Y="84" Width="336" Height="10" Property="DOCUMENT_TYPES" CheckBoxValue="1" Text="Documents and config files" />
+        <!-- Single-space separators, not the double spaces these lists used to
+             carry: fifteen names double-spaced ran to within 5px of this
+             control's right edge at 100% scaling, measured from a capture of
+             the built MSI's own dialog, which is one font metric away from the
+             mid-word clip this page has already been through once. -->
+        <Control Id="DocumentsList" Type="Text" X="36" Y="96" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="md markdown json jsonl ndjson txt log csv tsv yaml yml toml ini cfg conf" />
+        <Control Id="CodeCheck" Type="CheckBox" X="18" Y="114" Width="336" Height="10" Property="CODE_TYPES" CheckBoxValue="1" Text="Code and markup files" />
+        <Control Id="CodeList" Type="Text" X="36" Y="126" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="rs py js ts c h cpp hpp cs java go rb php css html xml sh" />
+        <Control Id="ShortcutSection" Type="Text" X="18" Y="146" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="Shortcuts" />
+        <Control Id="DesktopCheck" Type="CheckBox" X="18" Y="164" Width="336" Height="10" Property="DESKTOP_SHORTCUT" CheckBoxValue="1" Text="Create a shortcut on the Desktop" />
+        <Control Id="StartMenuNote" Type="Text" X="36" Y="175" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="A Start menu entry is always added." />
+        <Control Id="Note" Type="Text" X="18" Y="194" Width="334" Height="34" Transparent="yes" NoPrefix="yes" Text="Editor only joins the Open with menu - your current default apps are not changed. Run the installer again to change these choices." />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <!-- The checkbox pattern: the check state lands in the property
              (CheckBoxValue) and these events turn it into feature state.
@@ -213,7 +231,9 @@
           <Publish Event="Remove" Value="DocumentTypes" Condition="NOT DOCUMENT_TYPES" Order="2" />
           <Publish Event="AddLocal" Value="CodeTypes" Condition="CODE_TYPES" Order="3" />
           <Publish Event="Remove" Value="CodeTypes" Condition="NOT CODE_TYPES" Order="4" />
-          <Publish Event="EndDialog" Value="Return" Order="5" />
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="DESKTOP_SHORTCUT" Order="5" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT DESKTOP_SHORTCUT" Order="6" />
+          <Publish Event="EndDialog" Value="Return" Order="7" />
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
           <Publish Event="EndDialog" Value="Exit" />
@@ -224,7 +244,7 @@
         <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Setup complete" />
         <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Editor [ProductVersion] is installed for your account." />
         <Control Id="HeaderLine" Type="Line" X="0" Y="54" Width="370" Height="0" />
-        <Control Id="Body" Type="Text" X="18" Y="68" Width="334" Height="40" Transparent="yes" NoPrefix="yes" Text="Open any supported file from the Explorer Open with menu, or drag it onto the Editor window. Editor also appears in the Start menu." />
+        <Control Id="Body" Type="Text" X="18" Y="68" Width="334" Height="40" Transparent="yes" NoPrefix="yes" Text="Open a file from the Open with menu, or drag it onto the Editor window. Editor is in the Start menu too." />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="Back" />
         <!-- The one event that matters: this is what the extension's page was
@@ -448,6 +468,24 @@
         </Component>      </Directory>
     </StandardDirectory>
 
+    <!-- The Desktop shortcut. Same per-user KeyPath trick as the Start menu
+         component below (an HKCU value, since a per-user component's key path
+         cannot be a machine-context shortcut), and the .lnk itself is removed
+         with the component on uninstall. The Desktop *folder* is not ours, so
+         there is deliberately no RemoveFolder here. -->
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut
+            Id="EditorDesktopShortcut"
+            Name="Editor"
+            Description="Editor - native viewer for Markdown, JSON, CSV and code"
+            Target="[INSTALLFOLDER]editor.exe"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="editor.ico" />
+        <RegistryValue Root="HKCU" Key="Software\Eric-Lautanen\Editor" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="AppMenuFolder" Name="Editor">
         <!-- Shortcuts need a KeyPath of their own; an HKCU registry value is
@@ -455,10 +493,14 @@
              context). Removing the value plus the folder makes uninstall
              leave nothing behind. -->
         <Component Id="StartMenuShortcut" Guid="*">
+          <!-- ASCII, like the dialog text: Windows Installer writes a shortcut
+               description through the shell, which turned the em dash this
+               once carried into a plain hyphen anyway (checked by reading both
+               .lnk files after a real install). -->
           <Shortcut
               Id="EditorShortcut"
               Name="Editor"
-              Description="Editor — native viewer for Markdown, JSON, CSV and code"
+              Description="Editor - native viewer for Markdown, JSON, CSV and code"
               Target="[INSTALLFOLDER]editor.exe"
               WorkingDirectory="INSTALLFOLDER"
               Icon="editor.ico" />

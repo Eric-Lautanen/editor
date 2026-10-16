@@ -117,37 +117,43 @@ asset; verify the file you download against it if you want to check it yourself.
 
 ### Windows
 
-**Run the `.msi`** — that's the whole install. Per-user (no admin, no UAC
-prompt): it adds a Start Menu shortcut, an Add/Remove Programs entry, and
-registers Editor in Explorer's "Open with" menu for the file types it
-supports. The setup is one page with two checkboxes — the file-type groups to
-associate, both checked by default:
+**Run the `.msi`** — that is the whole install. It is per-user, so there is no
+admin prompt, and the wizard is one page with three checkboxes, all ticked:
 
-- *Associate document and config files* — md, markdown, json, jsonl, ndjson,
-  txt, log, csv, tsv, yaml, yml, toml, ini, cfg, conf
-- *Associate code files* — rs, py, js, ts, c, h, cpp, hpp, cs, java, go, rb,
-  php, css, html, xml, sh
+| | |
+|---|---|
+| Documents and config files | md, markdown, json, jsonl, ndjson, txt, log, csv, tsv, yaml, yml, toml, ini, cfg, conf |
+| Code and markup files | rs, py, js, ts, c, h, cpp, hpp, cs, java, go, rb, php, css, html, xml, sh |
+| Create a shortcut on the Desktop | a Start menu entry is always added |
 
-Adding a type only *offers* Editor in the "Open with" menu; it never takes
-over a file type you've already assigned to another program.
+These only *offer* Editor in the Explorer "Open with" menu — a file type you
+have already assigned to another program keeps that program. The install also
+adds an entry to Installed apps, and running the installer again with
+different boxes ticked changes your choices.
 
-The portable zip is the alternative: unzip it anywhere and run
-`editor --install` (still per-user, still no admin) to register the same
-associations. `editor --uninstall` removes them.
+The portable zip is the alternative: unzip it wherever you like and run
+`editor --install` to register the same "Open with" entries (still per-user,
+still no admin, and no shortcuts — the zip stays where you put it).
+`editor --uninstall` removes them.
 
 ### Linux
 
 Unpack the tarball and run `packaging/linux/install.sh`. It installs the
-binary to `~/.local/bin`, creates a desktop entry that points at that binary
-by absolute path (so it starts even when `~/.local/bin` is not on `PATH`),
-installs the launcher icons into the user's `hicolor` theme, and sets the
-default application for Markdown, JSON, NDJSON, plain text, CSV, YAML and
-TOML.
+binary to `~/.local/bin`, adds a launcher to your applications menu **and a
+shortcut on your Desktop**, installs the launcher icons, and makes Editor the
+default app for Markdown, JSON, NDJSON, plain text, CSV, YAML and TOML (Linux
+has no "Open with" list to be offered in, so there it does take the defaults).
+Set `EDITOR_NO_DESKTOP_SHORTCUT=1` to leave the Desktop alone.
+
+To undo all of it, delete `~/.local/bin/editor`,
+`~/.local/share/applications/editor.desktop`, `~/Desktop/editor.desktop` and
+`~/.local/share/icons/hicolor/*/apps/editor.png`.
 
 ### macOS
 
 Unzip, then drag `Editor.app` into `/Applications`. The bundle declares the
-same document types, so Finder's "Open With" offers it.
+same document types, so Finder's "Open With" offers it. There is no Desktop
+shortcut to add here — the Dock and Spotlight are how an app is launched.
 
 The bundle is not signed or notarized yet, so Gatekeeper refuses the first
 launch of a downloaded copy: right-click the app and choose **Open** once

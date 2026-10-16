@@ -906,8 +906,9 @@ survived restarts (theme, mode, tabs); the window did not.
   the new `editor_check_*` names.
 
 ## Review notes (Oct 2026 hygiene + gap pass)
-- `PLAN.md` (root) and `docs/PLAN.md` are byte-identical; root is the working copy, `docs/` the
-  published copy — keep them in sync until one is declared canonical (suggest: root wins, M10).
+- `PLAN.md` (root) and `docs/PLAN.md` used to be byte-identical, kept in step by hand; the
+  heuristic used only the names. The rule now: `docs/PLAN.md` is canonical, the packaging README
+  and release workflow point at it, and a duplicate root copy should not come back.
 - OS theme-following is still manual (`Ctrl T`); automatic detection belongs to M6 Windows polish.
 - Restored-by-milestone ledger (all live as of M4): `FontStyle::{Bold, Italic, BoldItalic}`,
   `Theme::quote_bar`, `HitAction::Link`. Still parked: `Host` regrows clipboard (M5) and dialogs
@@ -923,3 +924,29 @@ survived restarts (theme, mode, tabs); the window did not.
 - [ ] Status bar shows file name, kind, line count, zoom %
 
 Time: 2026-10-12 13:42:24 UTC
+### Installer round (Oct 2026) — a Desktop shortcut, on by default
+- **Windows**: the one-page wizard grew a third checkbox under a `Shortcuts`
+  heading. `DesktopShortcutFeature` (Level 1, so a silent `msiexec /passive`
+  install from the updater gets it too) owns a `DesktopFolder` component whose
+  KeyPath is an HKCU value — the same per-user trick the Start menu entry uses,
+  since a per-user component's key path cannot be a machine-context shortcut.
+  Verified by hand on the built MSI: a default silent install puts `Editor.lnk`
+  on the Desktop, removing just that feature deletes the shortcut and nothing
+  else (Start menu entry, exe and associations stay), and an uninstall takes
+  both shortcuts, the install folder and the ARP row with it.
+- **Linux**: `install.sh` writes the same `.desktop` to the Desktop as well as
+  the applications menu, honouring `XDG_DESKTOP_DIR` (whose value is usually a
+  literal `$HOME`, which sed cannot expand), marking it executable and — where
+  `gio` exists — trusted, because GNOME will not launch an untrusted one.
+  `EDITOR_NO_DESKTOP_SHORTCUT=1` skips it and nothing else; the CI packaging job
+  now asserts the default, the XDG directory and the opt-out.
+- Wording: each checkbox now only names a group ("Documents and config files")
+  under a heading that states the action once, the extension lists name every
+  claimed type, and the shortcut descriptions are ASCII — Windows Installer
+  writes those through the shell, where the em dash they carried came out as a
+  hyphen anyway (read back from both `.lnk` files after a real install).
+- **Measured, not eyeballed** (this page has clipped a list before): the built
+  MSI's dialog was captured by its own window rect and the ink bands compared
+  with the control boxes. Fifteen names double-spaced cleared the documents
+  list's right edge by 5px, so the lists now use single spaces — the same line
+  clears it by 37px, and no two text rows overlap.

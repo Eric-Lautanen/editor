@@ -63,6 +63,10 @@ jobs:
           tar -czf /tmp/editor.tar.gz -C dist .
           tar -xzf /tmp/editor.tar.gz -C /tmp/unpack
           cd /tmp/unpack
+          # A Desktop directory has to exist for the shortcut to be made; the
+          # XDG user dirs point elsewhere when they say so, which is what the
+          # second HOME below checks.
+          mkdir -p /tmp/fakehome/Desktop
           HOME=/tmp/fakehome sh packaging/linux/install.sh
           test -x /tmp/fakehome/.local/bin/editor
           test -f /tmp/fakehome/.local/share/applications/editor.desktop
@@ -71,6 +75,26 @@ jobs:
             test -f "/tmp/fakehome/.local/share/icons/hicolor/${size}x${size}/apps/editor.png"
           done
           grep -q '^Exec=/tmp/fakehome/.local/bin/editor '             /tmp/fakehome/.local/share/applications/editor.desktop
+          # The Desktop shortcut: same entry, executable (GNOME will not run
+          # one that is not), pointing at the installed binary.
+          test -x /tmp/fakehome/Desktop/editor.desktop
+          grep -q '^Exec=/tmp/fakehome/.local/bin/editor '             /tmp/fakehome/Desktop/editor.desktop
+          diff /tmp/fakehome/Desktop/editor.desktop                        /tmp/fakehome/.local/share/applications/editor.desktop
+          # XDG_DESKTOP_DIR holds a literal $HOME that sed cannot expand, so
+          # the shortcut has to land in the directory it names, not in
+          # ~/Desktop.
+          rm -rf /tmp/fakehome2
+          mkdir -p /tmp/fakehome2/Bureau /tmp/fakehome2/.config
+          printf 'XDG_DESKTOP_DIR="$HOME/Bureau"\n' > /tmp/fakehome2/.config/user-dirs.dirs
+          HOME=/tmp/fakehome2 sh packaging/linux/install.sh > /dev/null
+          test -x /tmp/fakehome2/Bureau/editor.desktop
+          test ! -e /tmp/fakehome2/Desktop
+          # And the opt-out really opts out of one thing only.
+          rm -rf /tmp/fakehome3
+          mkdir -p /tmp/fakehome3/Desktop
+          HOME=/tmp/fakehome3 EDITOR_NO_DESKTOP_SHORTCUT=1 sh packaging/linux/install.sh > /dev/null
+          test ! -e /tmp/fakehome3/Desktop/editor.desktop
+          test -f /tmp/fakehome3/.local/share/applications/editor.desktop
 
   # The bundle is built for real here (macOS links its frameworks natively, so
   # nothing extra to install), then checked: the icon and the version-filled

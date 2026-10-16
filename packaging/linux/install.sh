@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install Editor for the current user: binary, .desktop entry, MIME package
-# for .jsonl/.ndjson, and xdg-mime defaults.
+# for .jsonl/.ndjson, a Desktop shortcut, and xdg-mime defaults.
 #
 # Two layouts are supported, because the release tarball is not a source
 # checkout and the local one is not a tarball:
@@ -10,6 +10,8 @@
 #   checkout  ./Cargo.toml + ./target/release/editor      (build if needed)
 #
 # Run it as `sh packaging/linux/install.sh` from wherever you unpacked.
+# EDITOR_NO_DESKTOP_SHORTCUT=1 skips the Desktop shortcut; everything else
+# still installs.
 set -e
 
 here=$(dirname "$0")
@@ -64,6 +66,33 @@ if [ -n "$icons" ]; then
 else
     echo "note: no icon PNGs found next to $here; the launcher will show a generic icon" >&2
 fi
+
+# A launcher on the Desktop as well as in the menu: the release is one binary
+# that people expect to click, and a menu entry alone is easy to miss. The
+# location follows the XDG user dirs when they are configured — the value there
+# is usually a literal `$HOME/Desktop`, which sed cannot expand, hence the
+# case — and falls back to ~/Desktop.
+desktop_dir=$(sed -n 's/^XDG_DESKTOP_DIR="\(.*\)"/\1/p' "$HOME/.config/user-dirs.dirs" 2>/dev/null | head -1)
+case $desktop_dir in
+    '$HOME'*) desktop_dir=$HOME${desktop_dir#'$HOME'} ;;
+esac
+[ -n "$desktop_dir" ] || desktop_dir=$HOME/Desktop
+
+desktop_launcher=""
+if [ -n "$EDITOR_NO_DESKTOP_SHORTCUT" ]; then
+    echo "skipping the Desktop shortcut (EDITOR_NO_DESKTOP_SHORTCUT is set)"
+elif [ -d "$desktop_dir" ]; then
+    install -m755 "$HOME/.local/share/applications/editor.desktop" "$desktop_dir/editor.desktop"
+    # GNOME refuses to launch a .desktop file it has not marked trusted; gio
+    # records the same flag the Files app sets when you click "Allow
+    # Launching". Harmless where gio is missing (KDE and XFCE run it either
+    # way) or where the metadata store is unavailable.
+    gio set "$desktop_dir/editor.desktop" metadata::trusted true >/dev/null 2>&1 || true
+    desktop_launcher="$desktop_dir/editor.desktop"
+else
+    echo "note: $desktop_dir does not exist; no Desktop shortcut was made" >&2
+fi
+
 update-mime-database "$HOME/.local/share/mime" || true
 update-desktop-database "$HOME/.local/share/applications" || true
 for t in text/markdown application/json application/x-ndjson text/plain text/csv text/x-yaml application/toml; do
@@ -73,8 +102,13 @@ done
 # Resolve the source to an absolute path for the message: the candidate may be
 # relative (`packaging/linux/../../editor`), which says nothing useful.
 abs=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
-echo "Installed $abs -> ~/.local/bin/editor"
-echo "Registered the .desktop entry, its icons, and the MIME package for .jsonl/.ndjson"
+echo "Editor installed:"
+echo "  binary    $abs -> ~/.local/bin/editor"
+echo "  launcher  ~/.local/share/applications/editor.desktop"
+if [ -n "$desktop_launcher" ]; then
+    echo "  shortcut  $desktop_launcher"
+fi
+echo "  defaults  Markdown, JSON, NDJSON, plain text, CSV, YAML and TOML"
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *) echo "note: ~/.local/bin is not on your PATH — add it to use 'editor' directly" ;;
