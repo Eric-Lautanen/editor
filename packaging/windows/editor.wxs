@@ -539,7 +539,7 @@
         <Shortcut
             Id="EditorDesktopShortcut"
             Name="Editor"
-            Description="Editor - native viewer for Markdown, JSON, CSV and code"
+            Description="Editor"
             Target="[INSTALLFOLDER]editor.exe"
             WorkingDirectory="INSTALLFOLDER"
             Icon="editor.ico" />
@@ -561,7 +561,7 @@
           <Shortcut
               Id="EditorShortcut"
               Name="Editor"
-              Description="Editor - native viewer for Markdown, JSON, CSV and code"
+              Description="Editor"
               Target="[INSTALLFOLDER]editor.exe"
               WorkingDirectory="INSTALLFOLDER"
               Icon="editor.ico" />
