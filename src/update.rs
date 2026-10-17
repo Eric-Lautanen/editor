@@ -739,27 +739,128 @@ mod sha256 {
 /// saved on the way out, so the last file and the window place come back.
 /// This process ends here: the `cmd` was spawned detached and survives it.
 fn install_windows(file: &std::path::Path, tag: &str) -> Result<()> {
-    let file = file
-        .to_str()
-        .ok_or_else(|| Error::Platform("temp path is not UTF-8".into()))?;
+    let dir = parent_dir(file)?;
+    // Where the installer's own exit code is left for the next launch: the
+    // About box is the only place an update the user asked for can report
+    // back, and a refused install used to be indistinguishable from one that
+    // worked — both ended with the old build on screen.
+    let result = install_result_path(&dir);
+    if let Some(parent) = result.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(&result);
+    let script = windows_install_script(file, &installed_exe(), std::process::id(), &result);
+    let bat = dir.join("install.bat");
+    std::fs::write(&bat, script)?;
     print_line(&format!("launching the installer for {tag}…"));
-    let script = windows_install_script(file, &installed_exe());
-    windows_hidden_cmd(&script)
+    // The script waits for this process to leave the process table before it
+    // runs msiexec, so nothing here holds a handle the upgrade wants.
+    windows_hidden_cmd(&format!("\"{}\"", bat.display()))
         .map_err(|e| Error::Platform(format!("msiexec could not start: {e}")))?;
-    // Hold nothing open the installer would want exclusive; the `cmd` was
-    // spawned detached above and survives this exit.
     std::process::exit(0);
 }
 
-/// The single command a Windows update runs: install, then open the result.
-/// Kept as a plain string so it can be asserted without an installer — `start`
-/// has to appear exactly once and only after `msiexec`, because a second launch
-/// path is what made an update come up twice and hang.
-fn windows_install_script(msi: &str, exe: &std::path::Path) -> String {
-    format!(
-        "msiexec /i \"{msi}\" /passive REBOOT=ReallySuppress & start \"\" \"{}\"",
-        exe.display()
-    )
+/// The file the installer's exit code is written to (see
+/// [`windows_install_script`]). The config directory survives the payload
+/// sweep that deletes the staged MSI on the next launch; a payload directory
+/// is only the fallback for an account with no config directory at all.
+const INSTALL_RESULT: &str = "last-install.txt";
+
+fn install_result_path(payload_dir: &std::path::Path) -> std::path::PathBuf {
+    crate::settings::config_dir()
+        .map(|d| d.join(INSTALL_RESULT))
+        .unwrap_or_else(|| payload_dir.join(INSTALL_RESULT))
+}
+
+/// msiexec's exit code from the last Windows install attempt, read *and
+/// cleared* so the notice appears once: an install that failed last week
+/// must not greet every launch. `None` when there has been no attempt or the
+/// last one succeeded (0, or 3010/1641 — installed, a restart is wanted).
+pub fn take_install_result() -> Option<u32> {
+    let path = crate::settings::config_dir()?.join(INSTALL_RESULT);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    text.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|code| !matches!(code, 0 | 3010 | 1641))
+}
+
+/// Put a failed update in front of the user, in the About box's status line —
+/// the same place a manual check answers. Called once at startup by `cli`.
+pub fn note_install_result(status: &Status) {
+    let Some(code) = take_install_result() else {
+        return;
+    };
+    report(
+        status,
+        Check::Failed(format!(
+            "The last update did not install (msiexec exit {code}). Download it from github.com/{REPO}/releases/latest and run the installer."
+        )),
+    );
+}
+
+/// How many one-second ticks the install script waits for this process to
+/// leave the process table before installing anyway.
+const WAIT_TICKS: u32 = 120;
+
+/// The batch file a Windows update runs. A file, not a `cmd /c` one-liner:
+/// the wait needs `goto`, and the exit code has to be read *after* msiexec
+/// runs — a one-liner expands `%errorlevel%` before anything starts.
+///
+/// Three things it has to get right, each one a failed update:
+///
+/// * **Wait for this process to exit.** An upgrade removes the old files, and
+///   `editor.exe` is one of them; deleting an executable a live process still
+///   maps is how an update ended in msiexec 1603 with no window and no new
+///   version.
+/// * **Record the installer's exit code**, where the next launch reads it. A
+///   refused install and a successful one used to look identical.
+/// * **Relaunch through Explorer, not `start`.** This console is created
+///   hidden (`CREATE_NO_WINDOW`), and `start` passes its show state on, which
+///   opened the new build invisibly — then its single-instance lock kept the
+///   next double-click from showing a window either.
+///
+/// Two details are load-bearing and easy to lose in a tidy-up:
+///
+/// * `find.exe` is named by full path. Git for Windows ships a GNU `find` and
+///   puts its `bin` on `PATH`; a bare `find` in that environment resolves to
+///   it, which fails on a bare number, so the loop decided on its first tick
+///   that this process was already gone — the wait was a no-op.
+/// * The wait is bounded. A PID that never leaves the table (the number was
+///   reused by something else) must not leave the update spinning for ever
+///   with no window, no new version and nothing to report.
+///
+/// Kept as a plain string so all of it can be asserted without an installer.
+fn windows_install_script(
+    msi: &std::path::Path,
+    exe: &std::path::Path,
+    pid: u32,
+    result: &std::path::Path,
+) -> String {
+    let mut s = String::new();
+    s.push_str("@echo off\r\n");
+    s.push_str("set /a waited=0\r\n");
+    s.push_str(":wait\r\n");
+    s.push_str(&format!(
+        "tasklist /FI \"PID eq {pid}\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" \"{pid}\" >nul\r\n"
+    ));
+    s.push_str("if errorlevel 1 goto install\r\n");
+    s.push_str(&format!("if %waited% geq {WAIT_TICKS} goto install\r\n"));
+    s.push_str("set /a waited+=1\r\n");
+    s.push_str("ping -n 2 127.0.0.1 >nul\r\n");
+    s.push_str("goto wait\r\n");
+    s.push_str(":install\r\n");
+    s.push_str(&format!(
+        "msiexec /i \"{}\" /passive REBOOT=ReallySuppress\r\n",
+        msi.display()
+    ));
+    // The redirection comes first on purpose: `echo %errorlevel%>file` becomes
+    // `echo 1603>file`, and cmd reads the digit before `>` as a stream number,
+    // so a `0` exit wrote the code nowhere at all.
+    s.push_str(&format!(">\"{}\" echo %errorlevel%\r\n", result.display()));
+    s.push_str(&format!("explorer.exe \"{}\"\r\n", exe.display()));
+    s
 }
 
 /// `%LOCALAPPDATA%\Programs\Editor\editor.exe` — where `editor.wxs` puts the
@@ -1290,20 +1391,81 @@ mod tests {
     }
 
     #[test]
-    fn windows_install_starts_the_app_once_after_the_installer() {
+    fn windows_install_waits_then_installs_then_relaunches() {
         let script = windows_install_script(
-            r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi",
+            std::path::Path::new(
+                r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi",
+            ),
             std::path::Path::new(r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe"),
+            4321,
+            std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-install.txt"),
         );
-        let (install, launch) = script.split_once(" & ").expect("install, then launch");
-        assert!(install.starts_with("msiexec /i \""));
-        assert!(install.contains("/passive"));
+        std::fs::write(std::env::temp_dir().join("editor-script-dump.bat"), &script).unwrap();
+        // The installer must install, then open the app exactly once.
+        let install = script.find("msiexec /i \"").expect("installer line");
+        let launch = script.find("explorer.exe \"").expect("relaunch line");
+        assert!(install < launch, "both present, install first");
+        assert_eq!(script.matches("msiexec /i ").count(), 1);
+        assert_eq!(script.matches("explorer.exe").count(), 1);
         // An update may close and reopen the app; it may never restart the box.
-        assert!(install.contains("REBOOT=ReallySuppress"));
+        assert!(script.contains("/passive"));
+        assert!(script.contains("REBOOT=ReallySuppress"));
         assert!(!script.contains("EDITOR_RESTART"));
-        // One launch, and only after the install has finished.
-        assert_eq!(script.matches("start \"\"").count(), 1);
-        assert!(launch.starts_with("start \"\" \""));
+
+        // The upgrade removes the old exe, so it must wait for this process to
+        // leave the process table first — that race is what produced 1603.
+        assert!(script.contains("PID eq 4321"), "waits on this process");
+        assert!(script.contains("goto wait"), "and keeps waiting");
+        assert!(
+            script.find("goto wait").unwrap() < install,
+            "the wait comes before the install"
+        );
+        // A bare `find` is whatever `PATH` says it is — on a machine with Git
+        // for Windows that is GNU find, which rejects a bare number and made
+        // the wait end on its first tick.
+        assert!(
+            script.contains(r#""%SystemRoot%\System32\find.exe""#),
+            "the Windows find is named by full path"
+        );
+        // Bounded, so a reused PID cannot spin here for ever.
+        let cap = script.find("if %waited% geq").expect("a bound on the wait");
+        assert!(cap < install, "and it is checked before the install");
+        assert!(script.contains("set /a waited=0"), "ticked from zero");
+
+        // The exit code has to be captured *after* msiexec, which a batch file
+        // does and a `/c` one-liner does not (it expands at parse time).
+        let echo = script
+            .find("echo %errorlevel%")
+            .expect("records the result");
+        assert!(echo > install, "after the installer runs");
+        assert!(script.contains("last-install.txt"));
+        // `echo %errorlevel%>file` turns into `echo 0>file` on success, and cmd
+        // reads that `0` as a stream number — the result went missing.
+        assert!(
+            script.contains(">\"C:\\Users\\me\\AppData\\Roaming\\Editor\\last-install.txt\" echo"),
+            "redirection first, so the code cannot be read as a stream number"
+        );
+
+        // `start` would inherit this hidden console's show state.
+        assert!(!script.contains("start \"\""));
+    }
+
+    #[test]
+    fn a_failed_install_is_reported_once_and_success_is_not() {
+        let dir = crate::settings::config_dir().expect("test config dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last-install.txt");
+
+        std::fs::write(&path, "1603\r\n").unwrap();
+        assert_eq!(take_install_result(), Some(1603));
+        assert!(!path.exists(), "taken, so the notice shows once");
+        assert_eq!(take_install_result(), None);
+
+        for ok in ["0", "3010", "1641"] {
+            std::fs::write(&path, ok).unwrap();
+            assert_eq!(take_install_result(), None, "{ok} is success");
+            assert!(!path.exists());
+        }
     }
 
     #[test]

@@ -295,6 +295,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
     if !o.no_update && session.auto_update && update::due_for_check() {
         update::background_check();
     }
+    // A Windows install that ran while this app was closing left its exit code
+    // behind. Read it here — after the headless exits above, so `--render` and
+    // `--pretty` never consume a notice meant for the window.
+    app.note_update_result();
     platform::run(app)
 }
 

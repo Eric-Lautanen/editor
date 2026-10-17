@@ -487,6 +487,14 @@ impl App {
         self.auto_update = on;
     }
 
+    /// Pick up the exit code a Windows update left behind and put it in the
+    /// About box's status line — the one surface an update the user asked for
+    /// has. Called once at startup by `cli`, not from `new`: the suite builds
+    /// `App`s everywhere and none of them ran an installer.
+    pub fn note_update_result(&mut self) {
+        crate::update::note_install_result(&self.update_check);
+    }
+
     /// Restore a persisted session (cli startup): reopen the tabs that still
     /// exist, focus `active`, switch to the saved view mode.
     pub fn restore(&mut self, files: &[PathBuf], active: usize, mode: Mode) {
