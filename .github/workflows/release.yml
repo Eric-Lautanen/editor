@@ -279,10 +279,10 @@ jobs:
             **Updating**: on Windows the app checks GitHub in the background
             and asks to install the new build for you (`editor --update` as a
             manual shortcut; `--no-update` opts a launch out). On Linux and
-            macOS the same `--update` exists. Omit the MSI story: every new
-            release still ships portable/overwrite-friendly binaries, and
-            associations keep working across upgrades unless you move the
-            executable. Run `editor --version` to check what you have.
+            macOS the same `--update` exists. Every release also ships
+            portable, overwrite-friendly binaries, and file associations keep
+            working across upgrades unless you move the executable. Run
+            `editor --version` to check what you have.
 
             **Signed builds.** When the repository has its signing secrets set,
             the Windows `.exe`/`.msi` are Authenticode-signed and the macOS
