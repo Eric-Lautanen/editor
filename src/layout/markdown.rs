@@ -378,7 +378,7 @@ impl Md<'_> {
 
     fn baseline(&self, top: f32, style: FontStyle, size: f32) -> f32 {
         let m = self.fonts.metrics(style, size);
-        (top + (self.line_h(size) - m.ascent - m.descent) / 2.0 + m.ascent).round()
+        (top + (self.line_h(size) - m.height()) / 2.0 + m.ascent).round()
     }
 
     /// Where a strike-through crosses the glyphs: the middle of the *x-height*,
@@ -1143,7 +1143,7 @@ mod tests {
         let f = FontSystem::load_embedded();
         let t = Theme::light();
         let c = ctx(&f, &t);
-        let src = include_str!("../../samples/sample.md");
+        let src = include_str!("../../samples/sample_markdown.md");
         let list = layout(&doc(src), 900.0, &c);
         assert!(!list.ops.is_empty());
         assert!(!list.hits.is_empty(), "sample link has no hit region");

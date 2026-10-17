@@ -33,6 +33,34 @@ Two supported shapes:
   updater installs often, so the checkpoint bought nothing a re-run of the MSI
   does not; drop the property (or set it to 0) to get it back.
 
+  An update ends with the app running again — but that relaunch is **not** in
+  this package. It started there (`RestartEditor`, a deferred `asyncNoWait`
+  action before `InstallFinalize`) and had to be removed: a major upgrade runs
+  the execute sequence twice, so the action fired twice and the second Editor
+  hung on the first one's single-instance mutex, while the process it left in
+  the transaction could hold a file the install wanted to replace — which is
+  how an update ends in a scheduled restart (a real reboot, seen once). The
+  updater now owns it, as one `cmd` line: `msiexec /i <msi> /passive
+  REBOOT=ReallySuppress & start "" <installed exe>`. `cmd` waits for msiexec,
+  so the window comes back after the install exits, once, argument-less into
+  the saved session; `REBOOT=ReallySuppress` means no update can reboot the
+  machine. Windows Installer alone does *not* relaunch anything: Restart
+  Manager closes the window whose exe it must replace and leaves it closed
+  (measured: a `/qn` install over a running Editor ended with no Editor at
+  all), which is why the updater does it. A manual wizard install and a
+  scripted `/qn` deploy install quietly and open nothing.
+  Argument-less is deliberate: the relaunched app restores the session it saved
+  on the way out, which is the last file and the window place.
+
+  The uninstall sequence runs `editor.exe --uninstall` (a deferred custom
+  action, `REMOVE="ALL"` only) before it removes the files. That call removes
+  the file associations the package wrote *and*, the part Windows Installer
+  cannot see, the staged update downloads under `%TEMP%`
+  (`editor-update-<tag>\` — the updater's own directory; the released 0.2.1
+  predates this and leaves its msi there). `Return="ignore"`, so a locked or
+  already-deleted exe never blocks the removal itself. User data
+  (`%APPDATA%\Editor`: settings, session, crash reports) is deliberately kept.
+
   Build defines: `Version`, `PublishDir` (where `editor.exe` lives), `Icon`
   (`assets/icon.ico` — both shortcuts' and Add/Remove Programs' icon) and
   `DialogIcon` (`assets/icon-setup.ico` — the header icon the dialogs draw).

@@ -171,6 +171,12 @@ mod win {
             )
         };
         super::super::print_line("unregistered Editor file associations");
+        if let Some(dir) = crate::settings::config_dir() {
+            super::super::print_line(&format!(
+                "settings and recent files kept in {} (delete it for a clean slate)",
+                dir.display()
+            ));
+        }
         Ok(())
     }
 }
@@ -205,6 +211,17 @@ pub fn install() -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    // Downloads first, everywhere: the installer leaves its msi/zip/tarball in
+    // a temp directory, and "uninstalled" should not mean "except the 1.6 MB
+    // still in %TEMP%". Works even where this flag has no registration to
+    // undo, so the cleanup is never skipped on a platform that errors below.
+    let gone = crate::update::clean_payloads();
+    if gone > 0 {
+        crate::platform::print_line(&format!(
+            "removed {gone} staged update download{}",
+            if gone == 1 { "" } else { "s" }
+        ));
+    }
     #[cfg(all(
         any(target_os = "windows", editor_check_win),
         not(editor_check_linux),

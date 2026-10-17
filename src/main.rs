@@ -16,6 +16,10 @@ mod mem;
 #[cfg(any(test, feature = "mem-census"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mem::Tracked = mem::Tracked;
+// Network access without a TLS stack: the updater's three requests go to
+// whatever the OS already ships (urlmon/curl on Windows, curl/wget/python3
+// elsewhere; never a script host — see src/net.rs).
+mod net;
 mod parse;
 #[cfg(test)]
 mod perf;

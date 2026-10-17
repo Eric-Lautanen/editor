@@ -44,13 +44,28 @@ pub struct Binding {
     /// a probe kept next to the row it exercises is a probe that gets updated
     /// when the row is, and a probe in a separate test file is one that
     /// quietly stops matching.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// `cfg(test)`, not a dead-code allow: the field genuinely does not exist
+    /// in a shipped build, where the table is documentation and the F1 legend
+    /// and nothing dispatches from it. The constructor keeps the third
+    /// argument in both builds so the rows read the same either way.
+    #[cfg(test)]
     pub probe: Option<(Key, Modifiers)>,
 }
 
 impl Binding {
     const fn key(keys: &'static str, what: &'static str, probe: Option<(Key, Modifiers)>) -> Self {
-        Binding { keys, what, probe }
+        // The probe is dropped at compile time in a release build (`cfg(test)`
+        // above); naming it keeps the parameter used rather than silently
+        // accepted, and keeps one constructor for both shapes.
+        #[cfg(not(test))]
+        let _ = probe;
+        Binding {
+            keys,
+            what,
+            #[cfg(test)]
+            probe,
+        }
     }
 
     /// A gesture or a context-dependent chord: documented, not probed.

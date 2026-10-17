@@ -187,7 +187,7 @@ up as text you can read and select.
 
 Collapsing and expanding works in the JSON tree, not here — this file is
 Markdown, so its structure is headings and blocks. Switch tabs (`Ctrl+T` for a
-new one) to see the tree view against `samples/sample.json`.
+new one) to see the tree view against `samples/sample_json.json`.
 
 ### Section nine
 

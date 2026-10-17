@@ -82,8 +82,42 @@
     <Launch
         Condition="NOT WIX_NEWER_VERSION_DETECTED"
         Message="A newer version of Editor is already installed." />
+    <!-- Uninstall runs the installed exe's own uninstall flag before its
+         files go: that removes the file associations this package wrote and,
+         the part Windows Installer cannot see, the staged update downloads
+         under %TEMP% (editor-update-<tag> directories the updater created).
+         An uninstall that leaves megabytes of installer behind is not an
+         uninstall. `Return="ignore"` so a removed or locked exe never blocks
+         the removal itself, and REMOVE=ALL keeps it to a real uninstall: a
+         repair or a component update must not run the uninstall path. -->
+    <CustomAction
+        Id="UnregisterOnUninstall"
+        FileRef="EditorExe"
+        ExeCommand="--uninstall"
+        Execute="deferred"
+        Impersonate="yes"
+        Return="ignore" />
+    <!-- This package deliberately launches nothing. An earlier revision did,
+         from a deferred `asyncNoWait` custom action before `InstallFinalize`,
+         and that caused two failures that are worth writing down so the action
+         does not come back:
+           1. A major upgrade runs the execute sequence more than once (the
+              old product's removal and the new product's install), so the
+              action fired twice. The second Editor found the first one's
+              single-instance mutex and hung instead of coming up.
+           2. A process started *inside* the transaction is still holding the
+              exe when the install finishes finalising; Windows Installer sees a
+              file in use and schedules a restart. On this machine that ended in
+              the box rebooting itself, which an app update must never do.
+         Restart Manager is not the answer either: it closes the app whose files
+         it replaces and does not reopen it. So the updater owns the relaunch —
+         `src/update.rs` runs msiexec and starts the new build in one `cmd` line
+         *after* the install exits, exactly once, with `REBOOT=ReallySuppress`
+         so no update can ever ask for a reboot. A wizard install and a scripted
+         `/qn` deploy install quietly and open nothing, which is what they want. -->
     <InstallExecuteSequence>
       <RemoveExistingProducts After="InstallInitialize" />
+      <Custom Action="UnregisterOnUninstall" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
     <!-- Per-user preferred, stated rather than implied: ALLUSERS=2 with

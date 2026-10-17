@@ -1,6 +1,7 @@
-//! Self-update: find the newest Editor release on GitHub, download it with
-//! the OS's built-in `curl` (no crates — see the Cargo.toml covenant), and
-//! install it. Two entry points:
+//! Self-update: find the newest Editor release on GitHub, download it through
+//! whatever the OS already ships (see `src/net.rs` — `urlmon` then `curl` on
+//! Windows, `curl`/`wget`/`python3` elsewhere; no crates, no bundled TLS, and
+//! no script host anywhere), and install it. Two entry points:
 //!
 //! * [`run`] — the `editor --update` CLI command: check, download, install,
 //!   narrated for the terminal.
@@ -12,7 +13,7 @@
 //!
 //! | OS | Asset | Install |
 //! |---|---|---|
-//! | Windows | `editor-<tag>-windows-x86_64.msi` | `msiexec /i <msi> /passive` — the per-user MSI needs no UAC, replaces the old build, and Windows Installer's restart manager relaunches the app |
+//! | Windows | `editor-<tag>-windows-x86_64.msi` | one `cmd` line: `msiexec /i <msi> /passive REBOOT=ReallySuppress & start "" <installed exe>`. The per-user MSI needs no UAC and replaces the old build; the relaunch happens after msiexec exits, from here, once — the package itself launches nothing (see `packaging/windows/editor.wxs` for why that matters) |
 //! | Linux | `editor-<tag>-linux-x86_64.tar.gz` | unpack, rename the fresh binary over the running one (legal while it runs on Linux), relaunch |
 //! | macOS | `editor-<tag>-macos.zip` | unpack to a staging dir, remove the old `Editor.app`, move the new one into place, relaunch |
 //!
@@ -21,6 +22,12 @@
 //! auto-install. Asset names are owned by `release.yml`; a drift between the
 //! two ends in a clear "download it manually" message, not a wrong download.
 //!
+//! Everything this module writes lives under `<temp>/editor-update-<tag>/`
+//! and nowhere else, so the whole footprint is one directory that [the launch
+//! sweep](sweep_stale_payloads), the installer's uninstall step
+//! ([`clean_payloads`]) and a user with a file manager can each delete without
+//! knowing anything about the update flow.
+//!
 //! Consent and integrity: the background check asks permission (native
 //! yes/no) BEFORE anything is downloaded; `--update` needs no ask because the
 //! user typed it. What always runs is the integrity gate: the release ships
@@ -28,6 +35,7 @@
 //! checked against it before anything executes — a truncated or tampered
 //! download is refused, never run.
 use crate::error::{Error, Result};
+use crate::net;
 use crate::platform::print_line;
 
 const REPO: &str = "Eric-Lautanen/editor";
@@ -37,6 +45,20 @@ const API_LATEST: &str = "https://api.github.com/repos/Eric-Lautanen/editor/rele
 /// budget. Skip the silent on-launch check when this is set; `--update` still
 /// works.
 const NO_CHECK_ENV: &str = "EDITOR_NO_UPDATE_CHECK";
+/// Where the release index comes from. Overridable so the whole flow —
+/// download, checksum, install, restart — can be exercised against a locally
+/// built package instead of a published release (which is the only way to test
+/// the install half before the release exists): point it at a loopback server
+/// serving the release JSON. That is the whole reach of the knob: the asset
+/// URLs *inside* that JSON still have to pass [`net::trusted`], so it can only
+/// redirect the updater to GitHub or to the local machine, never to some
+/// third-party host.
+const API_ENV: &str = "EDITOR_UPDATE_API";
+
+/// The release index URL for this run.
+fn api_latest() -> String {
+    std::env::var(API_ENV).unwrap_or_else(|_| API_LATEST.to_string())
+}
 
 /// The silent on-launch check runs at most this often: a timestamp file in
 /// the config dir records the last attempt (not the last success — a machine
@@ -44,6 +66,23 @@ const NO_CHECK_ENV: &str = "EDITOR_NO_UPDATE_CHECK";
 /// point). `--update` ignores it; only the *automatic* check is throttled.
 pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 const LAST_CHECK_FILE: &str = "last_update_check";
+
+/// Seconds since the epoch, or 0 if the clock is before it (a machine with a
+/// dead CMOS battery still gets an update check, it just is not throttled).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Record that a check just happened, so the launch check does not repeat one
+/// the user has already seen the result of — a manual check counts.
+fn note_check_time() {
+    if let Some(dir) = crate::settings::config_dir() {
+        let _ = std::fs::write(dir.join(LAST_CHECK_FILE), format!("{}\n", now_secs()));
+    }
+}
 
 /// Should this launch's background check run? Reads/creates the timestamp;
 /// any IO problems (no config dir, read failure) resolve to "check" — the
@@ -53,10 +92,7 @@ pub fn due_for_check() -> bool {
         return true;
     };
     let stamp = dir.join(LAST_CHECK_FILE);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = now_secs();
     let last = std::fs::read_to_string(&stamp)
         .ok()
         .and_then(|t| t.trim().parse::<u64>().ok());
@@ -74,6 +110,16 @@ pub fn due_for_check() -> bool {
 
 pub fn run() -> Result<()> {
     print_line("editor self-update:");
+    // Leftovers from an update that already installed and exited before it
+    // could tidy up (Windows: its own msi). The current tag's directory, if it
+    // exists, is about to be replaced by `download` anyway.
+    let swept = sweep_stale_payloads();
+    if swept > 0 {
+        print_line(&format!(
+            "removed {swept} staged installer{} from a previous update",
+            if swept == 1 { "" } else { "s" }
+        ));
+    }
     let Some(r) = newest_release()? else {
         print_line(&format!(
             "already on the latest version ({})",
@@ -117,6 +163,89 @@ pub fn background_check() {
         .ok();
 }
 
+// ------------------------------------------------------------ manual check
+
+/// What the About box has to say about the last manual check. The box paints
+/// this *inline*, under its button: "you are up to date" is not news, and a
+/// native message box for it made Windows play the alert sound for a
+/// non-event. The only dialog left in this path is the offer to install a
+/// version that actually exists, which has to ask before it downloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Check {
+    /// Nothing asked yet; the box shows no status line.
+    Idle,
+    /// In flight.
+    Checking,
+    /// The newest release is this build.
+    UpToDate,
+    /// A newer release exists (its tag).
+    Available(String),
+    /// The check could not complete, with the reason.
+    Failed(String),
+}
+
+/// Shared between the worker running the check and the UI painting it. A
+/// `Mutex` rather than a channel: the app already ticks every 40 ms, so it can
+/// read the current value and repaint when it changes, and nothing has to
+/// wake a window from a background thread.
+pub type Status = std::sync::Arc<std::sync::Mutex<Check>>;
+
+pub fn new_status() -> Status {
+    std::sync::Arc::new(std::sync::Mutex::new(Check::Idle))
+}
+
+/// The status right now. A poisoned lock reads as `Idle` rather than taking a
+/// paint frame down with it.
+pub fn current(status: &Status) -> Check {
+    status.lock().map(|c| c.clone()).unwrap_or(Check::Idle)
+}
+
+fn report(status: &Status, c: Check) {
+    if let Ok(mut slot) = status.lock() {
+        *slot = c;
+    }
+}
+
+/// The About box's "Check for updates now": the same flow as the launch check,
+/// off the clock (no [`CHECK_INTERVAL`] throttle) and off the automatic-check
+/// setting — the user asked, which is what `--update` means too. Runs on its
+/// own thread so the window never blocks on the network, and it answers in
+/// every case through [`Status`]: up to date, what went wrong, or an offer to
+/// install. A button that silently does nothing when there is nothing new is
+/// indistinguishable from a broken one.
+pub fn check_now(status: Status) {
+    // Before the spawn, so the box says "checking" the moment it is clicked
+    // rather than after the thread's first instruction.
+    report(&status, Check::Checking);
+    let worker = status.clone();
+    let spawned = std::thread::Builder::new()
+        .name("update-check-manual".into())
+        .spawn(move || {
+            note_check_time();
+            match newest_release() {
+                Ok(None) => report(&worker, Check::UpToDate),
+                Ok(Some(r)) => {
+                    report(&worker, Check::Available(r.tag.clone()));
+                    if ask_install(&r.tag) {
+                        if let Err(e) = install(&r) {
+                            report(
+                                &worker,
+                                Check::Failed(format!("The update could not be installed: {e}")),
+                            );
+                        }
+                    }
+                }
+                Err(e) => report(
+                    &worker,
+                    Check::Failed(format!("Could not check for updates: {e}")),
+                ),
+            }
+        });
+    if spawned.is_err() {
+        report(&status, Check::Failed("The check could not start.".into()));
+    }
+}
+
 // ---------------------------------------------------------------- discovery
 
 struct Release {
@@ -139,7 +268,7 @@ fn newest_release() -> Result<Option<Release>> {
             )));
         }
     };
-    let json = curl(&["-sS", "-m", "10", "-L", API_LATEST])?;
+    let json = net::get_text(&api_latest(), 10)?;
     let tag = extract_field(&json, "tag_name").ok_or_else(|| {
         Error::Platform("GitHub's response had no tag_name (rate-limited?)".into())
     })?;
@@ -258,68 +387,100 @@ fn newer(tag: &str, current: &str) -> bool {
     false
 }
 
-// ---------------------------------------------------------------- fetching
+// ---------------------------------------------------------------- footprint
 
-/// Runs the OS `curl` and captures stdout. Windows has shipped `curl.exe` in
-/// System32 since 1803; macOS since 10.9 (but `.curl` sits there either way);
-/// mainstream Linux distros all have it. No crates — the alternative is a
-/// TLS hand-rolled client, which is exactly the non-starter this covenant
-/// exists to avoid.
-fn curl(args: &[&str]) -> Result<String> {
-    let exe = if cfg!(target_os = "windows") {
-        "curl.exe" // The System32 one, not an msys2/babun PATH shadow.
-    } else {
-        "curl"
-    };
-    let mut cmd = std::process::Command::new(exe);
-    // GitHub's API 403s anything without a User-Agent.
-    cmd.arg("-H")
-        .arg(format!("User-Agent: editor/{}", env!("CARGO_PKG_VERSION")));
-    for a in args {
-        cmd.arg(a);
-    }
-    // On Windows a GUI-subsystem parent has no console to inherit, so a child
-    // curl would get one allocated for it — a black window that flashes for
-    // the length of the call. CREATE_NO_WINDOW suppresses that; every other
-    // platform runs curl as an ordinary child.
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-    let out = cmd
-        .output()
-        .map_err(|e| Error::Platform(format!("could not run {exe}: {e}")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        return Err(Error::Platform(format!("{exe} failed: {}", stderr.trim())));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Every staged download is one directory named with this prefix. The name is
+/// stable across versions on purpose: the sweep and the uninstaller find old
+/// payloads by it, without having to know which build wrote them.
+const PAYLOAD_PREFIX: &str = "editor-update-";
+/// A payload directory younger than this is left alone by the sweep: a
+/// concurrent `--update` (or another instance between download and install)
+/// may still be filling it. Older than this and nobody can be using it.
+const PAYLOAD_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn payload_dir(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("{PAYLOAD_PREFIX}{tag}"))
 }
+
+/// Delete payload directories under `root` older than `min_age`; returns how
+/// many went away. Only directories this app names are touched — a shared
+/// temp dir holds plenty that is not ours.
+fn sweep_in(root: &std::path::Path, min_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut gone = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(PAYLOAD_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let fresh = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age < min_age);
+        // A locked directory (Windows Installer still reading its own msi)
+        // just fails to delete and is retried on the next launch.
+        if !fresh && std::fs::remove_dir_all(entry.path()).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// Launch cleanup: whatever an earlier version left staged. The install that
+/// replaced that version cannot delete its own payload (Windows Installer is
+/// reading the file), so the first launch of the *new* build does it — see
+/// `cli::run`, which calls this on the GUI path rather than from the update
+/// check, so a build that is not due to check for 12 hours still tidies up.
+pub fn sweep_stale_payloads() -> usize {
+    sweep_in(&std::env::temp_dir(), PAYLOAD_MIN_AGE)
+}
+
+/// Remove every staged payload, whatever its age, plus the sidecar a failed
+/// Linux swap can leave next to the binary. `--uninstall` and the installer's
+/// uninstall step both call this: removing the app has to mean the megabytes
+/// it downloaded, not just its exe.
+///
+/// Settings, session state and crash reports live in the config dir and are
+/// deliberately *not* touched — they are the user's, and a reinstall should
+/// find the window where it was left.
+pub fn clean_payloads() -> usize {
+    let gone = sweep_in(&std::env::temp_dir(), std::time::Duration::ZERO);
+    if let Ok(me) = std::env::current_exe() {
+        let _ = std::fs::remove_file(me.with_extension("update-new"));
+    }
+    gone
+}
+
+// ---------------------------------------------------------------- fetching
 
 impl Release {
     /// Downloads the asset to `<temp>/editor-update-<tag>/`, each call on a
     /// clean slate (a half-written file from a crashed earlier install would
-    /// otherwise be silently reused).
+    /// otherwise be silently reused), and removes the directory again if the
+    /// download fails so a failed attempt costs no disk.
     fn download(&self) -> Result<std::path::PathBuf> {
-        let dir = std::env::temp_dir().join(format!("editor-update-{}", self.tag));
+        let dir = payload_dir(&self.tag);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
-        let file = dir
-            .join(format!(
-                "editor-{}-{}",
-                self.tag,
-                asset_name().unwrap_or_default()
-            ))
-            .display()
-            .to_string();
-        curl(&["-sS", "-m", "300", "-L", "-o", &file, &self.asset_url])?;
-        if std::fs::metadata(&file).map_or(true, |m| m.len() == 0) {
-            return Err(Error::Platform(format!(
-                "download of {} produced nothing; github may be down",
-                self.asset_url
-            )));
+        let file = dir.join(format!(
+            "editor-{}-{}",
+            self.tag,
+            asset_name().unwrap_or_default()
+        ));
+        if let Err(e) = net::get_file(&self.asset_url, &file, 300) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
         }
-        Ok(std::path::PathBuf::from(file))
+        Ok(file)
     }
 }
 
@@ -351,7 +512,7 @@ fn verify(file: &std::path::Path, r: &Release) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| Error::Platform("download path is not UTF-8".into()))?;
-    let sums = curl(&["-sS", "-m", "30", "-L", &r.sums_url])?;
+    let sums = net::get_text(&r.sums_url, 30)?;
     let want = parse_sums(&sums)
         .into_iter()
         .find(|(_, f)| f == name)
@@ -557,23 +718,81 @@ mod sha256 {
 
 // ---------------------------------------------------------------- installing
 
-/// Windows: run the per-user MSI. `/passive` shows a progress bar but asks
-/// no questions; Windows Installer's restart manager closes the running
-/// editor.exe and relaunches it, and a *newer* version installs over the old
-/// via the MSI's major-upgrade, all without a UAC prompt (per-user MSI).
-/// This process ends here: the relaunch after install comes from msiexec.
+/// Windows: run the per-user MSI. `/passive` shows a progress bar but asks no
+/// questions, and a *newer* version installs over the old via the MSI's
+/// major-upgrade, all without a UAC prompt (per-user MSI).
+///
+/// Restart Manager closes the running app when the exe has to be replaced, but
+/// it does not reopen it, so the relaunch is ours: install and reopen are one
+/// `cmd` line — `msiexec` runs synchronously, `&` then starts the installed exe
+/// — which means the window comes back *after* the install has finished, and
+/// exactly once. Neither part is optional. Launching from inside the package (a
+/// deferred custom action, which this used to do) fires on every pass of the
+/// upgrade's execute sequence: two Editors came up, the second hung on the
+/// first one's single-instance mutex, and a process started mid-transaction can
+/// still hold a file the install wants to replace — which is how Windows
+/// Installer ends up scheduling a restart, i.e. rebooting the machine.
+/// `REBOOT=ReallySuppress` closes that door for good: an update may close and
+/// reopen the app, never restart the computer.
+///
+/// The relaunched app is argument-less on purpose: it restores the session it
+/// saved on the way out, so the last file and the window place come back.
+/// This process ends here: the `cmd` was spawned detached and survives it.
 fn install_windows(file: &std::path::Path, tag: &str) -> Result<()> {
     let file = file
         .to_str()
         .ok_or_else(|| Error::Platform("temp path is not UTF-8".into()))?;
     print_line(&format!("launching the installer for {tag}…"));
-    std::process::Command::new("msiexec")
-        .args(["/i", file, "/passive"])
-        .spawn()
+    let script = windows_install_script(file, &installed_exe());
+    windows_hidden_cmd(&script)
         .map_err(|e| Error::Platform(format!("msiexec could not start: {e}")))?;
-    // Hold nothing open the installer would want exclusive; `msiexec` was
+    // Hold nothing open the installer would want exclusive; the `cmd` was
     // spawned detached above and survives this exit.
     std::process::exit(0);
+}
+
+/// The single command a Windows update runs: install, then open the result.
+/// Kept as a plain string so it can be asserted without an installer — `start`
+/// has to appear exactly once and only after `msiexec`, because a second launch
+/// path is what made an update come up twice and hang.
+fn windows_install_script(msi: &str, exe: &std::path::Path) -> String {
+    format!(
+        "msiexec /i \"{msi}\" /passive REBOOT=ReallySuppress & start \"\" \"{}\"",
+        exe.display()
+    )
+}
+
+/// `%LOCALAPPDATA%\Programs\Editor\editor.exe` — where `editor.wxs` puts the
+/// per-user install (`PerUserProgramFilesFolder` + the `Editor` folder). Falls
+/// back to this exe in an environment with no `LOCALAPPDATA`, which only a
+/// stripped account has.
+fn installed_exe() -> std::path::PathBuf {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(local) => std::path::PathBuf::from(local)
+            .join("Programs")
+            .join("Editor")
+            .join("editor.exe"),
+        None => std::env::current_exe().unwrap_or_default(),
+    }
+}
+
+/// Run the install script with no console of its own: this is a GUI process, so
+/// a `cmd` window would flash in front of the user for the length of an install.
+#[cfg(windows)]
+fn windows_hidden_cmd(script: &str) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd.exe")
+        .raw_arg(format!("/c {script}"))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .spawn()
+}
+
+#[cfg(not(windows))]
+fn windows_hidden_cmd(_script: &str) -> std::io::Result<std::process::Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "the MSI install path is Windows-only",
+    ))
 }
 
 /// Linux: unpack and rename the fresh binary over the running one. POSIX
@@ -601,6 +820,10 @@ fn install_linux(file: &std::path::Path, tag: &str) -> Result<()> {
     std::fs::copy(&fresh, &sidecar)?;
     match std::fs::rename(&sidecar, &me) {
         Ok(()) => {
+            // The tarball and its unpacked twin have done their job; delete
+            // them before the handoff (nothing else will: this is the only
+            // process that knows the directory).
+            let _ = std::fs::remove_dir_all(&dir);
             // `relaunch` ends the process on success; reaching the `Ok(())`
             // only happens when it stayed alive on a failed heroics path.
             relaunch(&me, tag);
@@ -638,6 +861,8 @@ fn install_macos(file: &std::path::Path, tag: &str) -> Result<()> {
     };
     std::fs::remove_dir_all(&bundle)?;
     std::fs::rename(&fresh, &bundle)?;
+    // The zip and any unpacking leftovers: nothing else removes them.
+    let _ = std::fs::remove_dir_all(&dir);
     relaunch(&bundle.join("Contents/MacOS/editor"), tag);
     Ok(())
 }
@@ -693,11 +918,12 @@ fn ask_install(tag: &str) -> bool {
             "Editor {tag} is available. Download and install it now?\n\nEditor will close and restart with the new version."
         ),
         "Editor update",
+        true,
     )
 }
 
 #[cfg(target_os = "windows")]
-fn win_dialog(text: &str, caption: &str) -> bool {
+fn win_dialog(text: &str, caption: &str, yes_no: bool) -> bool {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     // user32 + kernel32's wide-string charset — the rest of the backend uses
@@ -710,6 +936,7 @@ fn win_dialog(text: &str, caption: &str) -> bool {
     const MB_SETFOREGROUND: u32 = 0x1_0000;
     const MB_TOPMOST: u32 = 0x4_0000;
     const MB_YESNO: u32 = 0x0004;
+    const MB_OK: u32 = 0x0000;
     const MB_SYSTEMMODAL: u32 = 0x1000;
     const IDYES: i32 = 6;
     let to_wide = |s: &str| {
@@ -718,12 +945,30 @@ fn win_dialog(text: &str, caption: &str) -> bool {
             .chain(std::iter::once(0))
             .collect::<std::vec::Vec<u16>>()
     };
+    // Own the box to the app's window, and wait for that window to exist: this
+    // runs on the check's own thread, which on the launch path can get here
+    // before the window is created. An ownerless box mixes with the app's own
+    // window in z-order and can end up behind it — the shape of a user
+    // reporting "no update prompt at all". Capped: a headless or still-broken
+    // window must not hold the check forever.
+    let mut owner = crate::platform::main_window();
+    for _ in 0..20 {
+        if !owner.is_null() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        owner = crate::platform::main_window();
+    }
     unsafe {
         MessageBoxW(
-            std::ptr::null_mut(),
+            owner,
             to_wide(text).as_ptr(),
             to_wide(caption).as_ptr(),
-            MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL | MB_YESNO,
+            MB_ICONINFORMATION
+                | MB_SETFOREGROUND
+                | MB_TOPMOST
+                | MB_SYSTEMMODAL
+                | if yes_no { MB_YESNO } else { MB_OK },
         ) == IDYES
     }
 }
@@ -848,6 +1093,56 @@ mod tests {
         );
     }
 
+    /// The launched sweep is the only thing that deletes a staged installer
+    /// after it has been consumed, and the uninstall hook is the only
+    /// guarantee — so both directions are pinned here: old payload dirs go,
+    /// fresh ones and everything else in a shared temp dir stay.
+    #[test]
+    fn sweep_removes_old_payloads_and_nothing_else() {
+        let root = std::env::temp_dir().join("editor_sweep_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("editor-update-v0.0.1")).unwrap();
+        std::fs::write(
+            root.join("editor-update-v0.0.1")
+                .join("editor-v0.0.1-windows-x86_64.msi"),
+            b"payload",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("editor-update-v0.0.2")).unwrap();
+        std::fs::create_dir_all(root.join("someone-elses-dir")).unwrap();
+        std::fs::write(root.join("editor-update-file"), b"not a directory").unwrap();
+
+        assert_eq!(sweep_in(&root, std::time::Duration::ZERO), 2);
+        assert!(!root.join("editor-update-v0.0.1").exists());
+        assert!(!root.join("editor-update-v0.0.2").exists());
+        assert!(root.join("someone-elses-dir").exists());
+        assert!(root.join("editor-update-file").exists());
+
+        // A directory that is still being filled (younger than the guard) is
+        // left for the next launch.
+        std::fs::create_dir_all(root.join("editor-update-v0.0.3")).unwrap();
+        assert_eq!(sweep_in(&root, PAYLOAD_MIN_AGE), 0);
+        assert!(root.join("editor-update-v0.0.3").exists());
+
+        // `clean_payloads` (the uninstall hook) ignores age by construction.
+        assert_eq!(sweep_in(&root, std::time::Duration::ZERO), 1);
+        assert!(!root.join("editor-update-v0.0.3").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staged_payloads_live_in_one_named_temp_directory() {
+        let dir = payload_dir("v0.2.1");
+        assert_eq!(dir.parent().unwrap(), std::env::temp_dir());
+        assert_eq!(dir.file_name().unwrap(), "editor-update-v0.2.1");
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(PAYLOAD_PREFIX));
+    }
+
     fn join_lines(lines: &[&str]) -> String {
         let mut out = String::new();
         for l in lines {
@@ -961,5 +1256,34 @@ mod tests {
             _ => None,
         };
         assert_eq!(asset_name(), expected);
+    }
+
+    #[test]
+    fn windows_install_starts_the_app_once_after_the_installer() {
+        let script = windows_install_script(
+            r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi",
+            std::path::Path::new(r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe"),
+        );
+        let (install, launch) = script.split_once(" & ").expect("install, then launch");
+        assert!(install.starts_with("msiexec /i \""));
+        assert!(install.contains("/passive"));
+        // An update may close and reopen the app; it may never restart the box.
+        assert!(install.contains("REBOOT=ReallySuppress"));
+        assert!(!script.contains("EDITOR_RESTART"));
+        // One launch, and only after the install has finished.
+        assert_eq!(script.matches("start \"\"").count(), 1);
+        assert!(launch.starts_with("start \"\" \""));
+    }
+
+    #[test]
+    fn the_package_launches_nothing_itself() {
+        // Regression, and the reason this file owns the relaunch: a deferred
+        // `asyncNoWait` action in the MSI fired on both passes of a major
+        // upgrade, so a second Editor came up and hung on the first one's
+        // single-instance mutex, and the process it left behind mid-transaction
+        // pushed Windows Installer into scheduling a restart.
+        let wxs = std::fs::read_to_string("packaging/windows/editor.wxs").expect("editor.wxs");
+        assert!(!wxs.contains("Id=\"RestartEditor\""));
+        assert!(!wxs.contains("Return=\"asyncNoWait\""));
     }
 }

@@ -21,7 +21,7 @@ fn line_h(_fonts: &FontSystem, size: f32) -> f32 {
 
 fn baseline(fonts: &FontSystem, top: f32, style: FontStyle, size: f32, lh: f32) -> f32 {
     let m = fonts.metrics(style, size);
-    (top + (lh - m.ascent - m.descent) / 2.0 + m.ascent).round()
+    (top + (lh - m.height()) / 2.0 + m.ascent).round()
 }
 
 fn truncate_cell(
@@ -63,7 +63,7 @@ pub fn layout(sheet: &Sheet, width: f32, ctx: &Ctx) -> DisplayList {
         let m = ctx.fonts.metrics(FontStyle::Regular, size);
         ops.push(DrawOp::Text {
             x: x0,
-            y: (y + (lh - m.ascent - m.descent) / 2.0 + m.ascent).round(),
+            y: (y + (lh - m.height()) / 2.0 + m.ascent).round(),
             text: "(empty file)".into(),
             size,
             style: FontStyle::Regular,
@@ -151,7 +151,7 @@ pub fn layout(sheet: &Sheet, width: f32, ctx: &Ctx) -> DisplayList {
         let m = ctx.fonts.metrics(FontStyle::Regular, size);
         ops.push(DrawOp::Text {
             x: x0,
-            y: (y + (lh - m.ascent - m.descent) / 2.0 + m.ascent).round(),
+            y: (y + (lh - m.height()) / 2.0 + m.ascent).round(),
             text: format!(
                 "… showing first {} of {} rows",
                 sheet.rows.len(),

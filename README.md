@@ -17,31 +17,65 @@
 </p>
 
 <p align="center">
-  <img src="assets/screenshots/markdown-dark.png" width="100%" alt="Editor rendering samples/sample.md in the dark theme: a rendered heading, paragraphs with inline styles, a link and a table of contents of the file">
+  <img src="assets/screenshots/markdown-dark.png" width="100%" alt="Editor rendering samples/sample_markdown.md in the dark theme: a rendered heading, paragraphs with inline styles, a link and a table of contents of the file">
 </p>
 
 Editor opens a file, renders it the way you want to read it, and gets out of
 the way. Everything is drawn by its own software renderer onto a single
 window: no web view, no toolkit, no runtime to install. `Ctrl+E` cycles
 **Preview → Edit → Split**, so the same tab is both the document and the
-source.
+source, and `Ctrl+F`, `F1` and `F2` cover the rest without leaving the
+keyboard.
 
 ## Why this one
 
 - **Preview first.** Documents open as clean rendered previews — headings and
-  tables for Markdown, a collapsible tree for JSON, a real table for CSV —
-  with the raw text one keystroke away.
-- **Native.** A hand-drawn title bar with tabs, overlay scrollbars that stay
-  out of the way, a line-number gutter, per-file drag and drop, and dark and
-  light themes that follow your OS.
+  tables for Markdown, a collapsible tree for JSON, one tree per record for
+  JSONL, a real column table for CSV/TSV — with the raw text one keystroke
+  away. One renderer handles every kind of file, so a log, a TOML config and a
+  Rust source all look like they belong to the same program.
+- **Native, and it feels it.** A hand-drawn title bar with one tab per file,
+  overlay scrollbars that stay out of the way, a line-number gutter, find, a
+  right-click menu, drag and drop, touch panning, and crisp text at 150% and
+  200% display scaling. Dark and light themes follow your OS until you pick
+  one yourself with `Ctrl+T`.
+- **Editing that stays out of the way.** Real selection, undo/redo, clipboard,
+  save, and a Split view that re-renders the document as you type. Files that
+  change on disk reload themselves; `Ctrl+R` forces it if you would rather.
 - **Truly dependency-free.** `[dependencies]` in `Cargo.toml` is empty and
   stays that way: the Markdown, JSON and CSV parsers, the layout engine, a
   TrueType rasterizer with Unicode fallback, the software canvas, the SHA-256
   that verifies downloads, and the window and event layer for all three
   platforms (hand-bound Win32, AppKit and Xlib FFI) all live in this
   repository.
-- **Small and safe.** A single binary per OS, a per-user install that needs no
-  admin rights, and updates that are checksum-verified before anything runs.
+- **Installs cleanly, updates itself.** A per-user MSI with no admin prompt and
+  no UAC; "Open with Editor" entries you can choose per file type; an optional
+  Desktop shortcut. Updates are checked twice a day, verified against the
+  release's SHA-256 manifest before anything runs, and the app comes back on
+  the new version with your tabs where you left them. `--uninstall` removes
+  everything it put down, including the installers it staged.
+- **Never loses your place.** Open tabs, the file you were in, the view mode,
+  the theme and the window's size and position all survive a restart —
+  including a restart caused by an update.
+
+## What's new (October 2026)
+
+- **Self-update you can trust.** Checks run twice a day, the download is
+  verified against the release's `SHA256SUMS` before anything executes, and on
+  Windows the fetch happens inside the app through the OS's own HTTP stack —
+  never a script host — and no installer is left behind. An update
+  closes the window and brings it back with your session intact.
+- **An About box that answers quietly.** `F2 → Check for updates now` reports
+  on a status line in the box. No dialog, and no system alert sound for a
+  check that found nothing.
+- **A cleaner install.** Per-user MSI with an optional Desktop shortcut; the
+  uninstaller removes the staged update downloads along with the app.
+- **Open a pile of files at once.** `editor a.md b.json c.log` opens three
+  tabs, `--` ends the flags so a file called `-draft.md` opens fine, and one
+  file is one tab however its path is spelled.
+- **Text sits where it should.** Every centred row — status bar, menus, title
+  bar, editor — is measured from real font metrics rather than an em box with
+  the descender the wrong way round.
 
 ## Views
 
@@ -98,6 +132,23 @@ Every screenshot above was drawn headlessly by the app itself
 by [`tools/readme_shots.py`](tools/readme_shots.py) — there is no screenshot
 tool in the loop, so the pictures cannot drift from what the renderer draws.
 
+## Samples
+
+[`samples/`](samples) is the tour: every file there is something the app
+renders differently, and nothing there is filler.
+
+| File | What it shows |
+|---|---|
+| [`sample_markdown.md`](samples/sample_markdown.md) | the whole Markdown tour: headings, rules, emphasis, code spans and fences, links, quotes, nested and task lists, a GFM table |
+| [`sample_markdown_extra.md`](samples/sample_markdown_extra.md) | the edges of that tour — tables with alignment, awkward wrapping, unicode |
+| [`sample_json.json`](samples/sample_json.json) | a collapsible tree with tinted keys, strings, numbers and booleans |
+| [`sample_jsonl.jsonl`](samples/sample_jsonl.jsonl) | one tree per record, plus a deliberately broken line and the error banner it gets |
+| [`sample_csv.csv`](samples/sample_csv.csv) / [`sample_tsv.tsv`](samples/sample_tsv.tsv) | measured columns, a header band, ragged rows |
+| [`sample_yaml.yaml`](samples/sample_yaml.yaml) / [`sample_toml.toml`](samples/sample_toml.toml) / [`sample_ini.ini`](samples/sample_ini.ini) | config files, tinted by kind |
+| [`sample_log.log`](samples/sample_log.log) | log levels tinted, everything else left alone |
+| [`sample_rust.rs`](samples/sample_rust.rs) | source with a light syntax tint |
+| [`sample_text.txt`](samples/sample_text.txt) | plain text in the reading column, long enough to scroll |
+
 ## Download
 
 Grab the latest build from
@@ -138,7 +189,10 @@ different boxes ticked changes your choices.
 The portable zip is the alternative: unzip it wherever you like and run
 `editor --install` to register the same "Open with" entries (still per-user,
 still no admin, and no shortcuts — the zip stays where you put it).
-`editor --uninstall` removes them.
+`editor --uninstall` removes them — and the staged update downloads in your
+temp directory, so uninstalling does not leave a stray installer behind. Your
+settings and recent-files list are kept (they are yours); delete
+`%APPDATA%\Editor` to start completely fresh.
 
 ### Linux
 
@@ -166,7 +220,7 @@ launch of a downloaded copy: right-click the app and choose **Open** once
 ### From source
 
 ```
-cargo run -- samples/sample.md
+cargo run -- samples/sample_markdown.md
 cargo test
 ```
 
@@ -182,16 +236,38 @@ manifest before the installer runs, so a truncated or tampered download is
 refused, never executed.
 
 You can turn the automatic check off in the app: **F2 (About) → uncheck
-"Check for updates automatically"**. Manual updates stay available:
+"Check for updates automatically"**, and check on demand with the **Check for
+updates now** button right under it — that one runs off the clock and off the
+setting, and answers on a status line in the box itself ("up to date", or the
+version it can install). No dialog and no system sound for a check that found
+nothing. Manual updates stay available:
 
 ```
 editor --update      # check GitHub and install the newest release now
 --no-update          # skip the automatic check for one launch
 ```
 
+When an update installs, the app closes and comes back on the new version with
+what you had open — the session file it wrote on the way out (open tabs, the
+file you were in, the window's size and place) is what the fresh process reads.
+On Windows the updater runs the installer and reopens the app once it has
+finished, because Restart Manager closes a running app for an upgrade but does
+not reopen it.
+
 A newer install always replaces the older one in place, so file associations
 keep working — re-running `--install` is only needed if you *move* the
 executable. `editor --version` prints what you have.
+
+The download itself is handed to your operating system rather than to a TLS
+library compiled into the app. On Windows it happens **inside the app** —
+`urlmon`, the OS's own HTTP stack — with the system `curl.exe` as the fallback;
+nothing spawns a script host. `curl`, `wget` and `python3` elsewhere, tried in
+order until one answers. A machine that blocks one of them (managed
+corporate images, for instance) still updates through the next one, and a
+machine that has none of them says so instead of failing silently. The
+installer is staged under your temp directory and deleted by the next launch of
+the installed version — and by an uninstall, along with everything else the
+install put there.
 
 ## Using it
 
@@ -229,10 +305,12 @@ a row whose chord no longer works:
 | `Ctrl+Q` | quit |
 <!-- keymap:end -->
 
-A file also opens by double-clicking it or from right-click → Recent. Tabs hold
-one file each, and a second launch of Editor hands its file to the window
-already open (Windows today). The status bar carries the same mode, theme and
-zoom controls. Quit from `Ctrl+Q` or the window's ×.
+A file also opens by double-clicking it or from right-click → Recent, and
+`editor a.md b.md` opens several tabs at once. Tabs hold one file each, and a
+second launch of Editor hands its files to the window already open (Windows
+today), so "Open with Editor" lands as a tab rather than a second window. The
+status bar carries the same mode, theme and zoom controls. Quit from `Ctrl+Q`
+or the window's ×.
 
 Your session — theme, view mode, open tabs, window size and position — is
 restored on the next start.

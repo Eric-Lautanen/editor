@@ -266,6 +266,15 @@ pub struct App {
     /// Where the About box's update-toggle row is, refreshed by every paint
     /// of the box (hit-tested in `on_mouse_down`).
     about_toggle: Option<Rect>,
+    /// The About box's "Check for updates now" button, same deal.
+    about_check: Option<Rect>,
+    /// The manual check's result, shared with its worker thread.
+    update_check: crate::update::Status,
+    /// The value of `update_check` the last frame painted; the tick compares
+    /// the two and repaints when the worker has written a new answer. A
+    /// message box used to be how that answer arrived, which cost a modal and
+    /// the system alert sound for a "nothing new" result.
+    update_check_seen: crate::update::Check,
     /// Live Ctrl+F find bar, if open.
     find: Option<find::Find>,
     /// Live right-click context menu, if any.
@@ -395,6 +404,9 @@ impl App {
             help_open: false,
             about_open: false,
             about_toggle: None,
+            update_check: crate::update::new_status(),
+            update_check_seen: crate::update::Check::Idle,
+            about_check: None,
             find: None,
             menu: None,
             close_armed: false,
@@ -694,11 +706,11 @@ impl App {
     pub fn open_path(&mut self, path: PathBuf, host: &mut dyn Host) {
         self.close_armed = false;
         settings::note_recent(&mut self.recent, &path);
-        if let Some(i) = self
-            .tabs
-            .iter()
-            .position(|t| t.path.as_deref() == Some(path.as_path()))
-        {
+        if let Some(i) = self.tabs.iter().position(|t| {
+            t.path
+                .as_deref()
+                .is_some_and(|open| Self::same_file(open, &path))
+        }) {
             self.switch_to(i);
         } else {
             match Tab::from_path(path) {
@@ -723,6 +735,23 @@ impl App {
             }
         }
         host.request_redraw();
+    }
+
+    /// Whether two paths name the same file. Exact equality first (the common
+    /// case, and it costs nothing), then the filesystem's own answer, because
+    /// `C:\\x\\a.md`, `c:\\x\\.\\a.md` and a relative `a.md` are one file and
+    /// used to open as three tabs — three buffers over one file, each saving
+    /// over the others.
+    fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+        if a == b {
+            return true;
+        }
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            // A path that does not resolve (missing, or a name being created)
+            // is only the same file as itself, which the check above answered.
+            _ => false,
+        }
     }
 
     /// Landing on an Untitled buffer drops into Edit mode: there is nothing to
@@ -1463,8 +1492,23 @@ impl App {
                 host.request_redraw();
                 return;
             }
+            // The button runs the update flow on its own thread and answers
+            // in the box, on a status line under itself — "up to date" is not
+            // worth a modal, let alone the alert sound Windows plays for one.
+            // The box stays open so the answer is visible where it was asked
+            // for. Deliberately independent of the checkbox above it: asking
+            // off the clock is the user's call even when the automatic check
+            // is switched off, which is why `update::check_now` ignores that
+            // setting (as `--update` does).
+            if let Some(r) = self.about_check.filter(|r| r.contains(Point { x, y })) {
+                let _ = r;
+                crate::update::check_now(self.update_check.clone());
+                host.request_redraw();
+                return;
+            }
             self.about_open = false;
             self.about_toggle = None;
+            self.about_check = None;
             host.request_redraw();
             return;
         }
@@ -2006,6 +2050,15 @@ impl App {
     /// drag is held near a pane edge; every ~2 s, watch for on-disk changes.
     fn on_tick(&mut self, host: &mut dyn Host) {
         self.ticks = self.ticks.wrapping_add(1);
+        // The manual update check runs off the UI thread and writes its answer
+        // into shared state; this is where that answer reaches the screen.
+        // Only when it actually changed, so a 40 ms heartbeat costs a mutex
+        // read and no repaint.
+        let check = crate::update::current(&self.update_check);
+        if check != self.update_check_seen {
+            self.update_check_seen = check;
+            host.request_redraw();
+        }
         // Keep an in-flight glide moving even on a host that cannot run a
         // faster frame clock than this one; `Event::Frame` normally does it.
         if self.scrolling {
@@ -3074,16 +3127,20 @@ impl Handler for App {
             );
         }
         if self.about_open {
-            let (_f, toggle) = about::paint(
+            let (_f, toggle, check) = about::paint(
                 canvas,
                 &self.fonts,
                 &self.theme,
                 canvas.width as f32,
                 canvas.height as f32,
                 self.scale,
-                self.auto_update,
+                about::Updates {
+                    auto: self.auto_update,
+                    check: &self.update_check_seen,
+                },
             );
             self.about_toggle = Some(toggle);
+            self.about_check = Some(check);
         }
     }
 
@@ -3227,6 +3284,35 @@ mod tests {
         let dir = std::env::temp_dir().join(name);
         std::fs::write(&dir, content).unwrap();
         App::new(Some(dir)).unwrap()
+    }
+
+    /// One file, two spellings, one tab. Duplicate tabs over a single file are
+    /// not cosmetic: two buffers, two dirty flags, and whichever saves last
+    /// wins over the other's edits.
+    #[test]
+    fn the_same_file_spelled_differently_reuses_its_tab() {
+        let dir = std::env::temp_dir().join("editor_dupe_spelling");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dupe.md");
+        std::fs::write(&file, "# one\n").unwrap();
+        let mut app = App::new(None).unwrap();
+        let mut host = NullHost::default();
+        app.open_path(file.clone(), &mut host);
+        assert_eq!(
+            app.tabs.len(),
+            1,
+            "the placeholder tab should become the file"
+        );
+        // The same file by a detour through a subdirectory: a different string
+        // (a `.` segment is normalised away by `PathBuf::join`, so it has to be
+        // `..`) naming one file.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let detour = dir.join("sub").join("..").join("dupe.md");
+        assert_ne!(detour, file, "the test needs two distinct spellings");
+        app.open_path(detour, &mut host);
+        assert_eq!(app.tabs.len(), 1, "a second tab was opened over the first");
+        assert_eq!(app.path.as_deref(), Some(file.as_path()));
+        let _ = std::fs::remove_file(&file);
     }
 
     fn ctrl(key: char) -> Event {
@@ -4540,6 +4626,49 @@ mod tests {
             &mut host,
         );
         assert!(!app.help_open);
+    }
+
+    /// The About box's manual update check: the button is real estate the
+    /// click handler uses, it sits under the toggle, and a press elsewhere on
+    /// the overlay still dismisses the box. The button's own press starts a
+    /// network check on another thread (and answers with a native box), so what
+    /// is pinned here is the part that could silently rot — the geometry.
+    #[test]
+    fn about_box_has_a_check_now_button_under_the_toggle() {
+        let mut app = open("editor_test_ab_check.txt", "hello");
+        let mut host = NullHost::default();
+        app.on_event(
+            Event::KeyDown {
+                key: Key::F(2),
+                mods: Modifiers::default(),
+            },
+            &mut host,
+        );
+        let _ = app.render_headless(900, 640, 1.0);
+        let toggle = app.about_toggle.expect("toggle rect");
+        let button = app.about_check.expect("check-now button rect");
+        assert!(
+            button.y >= toggle.y + toggle.h,
+            "button at {} not under the toggle ending at {}",
+            button.y,
+            toggle.y + toggle.h
+        );
+        assert!(button.w > 0.0 && button.h > 0.0, "button rect empty");
+        assert!(
+            button.x + button.w <= 900.0 && button.y + button.h <= 640.0,
+            "button off the window"
+        );
+        // Anywhere else on the overlay dismisses it, as before.
+        app.on_event(
+            Event::MouseDown {
+                x: 6.0,
+                y: 6.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert!(!app.about_open);
+        assert!(app.about_check.is_none(), "rects clear with the box");
     }
 
     #[test]

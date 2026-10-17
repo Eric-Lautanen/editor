@@ -669,6 +669,8 @@ mod ffi {
         pub fn find_window_w(class: *const u16, title: *const u16) -> Hwnd;
         #[link_name = "SetForegroundWindow"]
         pub fn set_foreground_window(hwnd: Hwnd) -> i32;
+        #[link_name = "FlashWindowEx"]
+        pub fn flash_window_ex(info: *mut FlashInfo) -> i32;
         #[link_name = "IsIconic"]
         pub fn is_iconic(hwnd: Hwnd) -> i32;
         #[link_name = "GetDC"]
@@ -678,6 +680,21 @@ mod ffi {
         #[link_name = "CreateIconIndirect"]
         pub fn create_icon_indirect(info: *const IconInfo) -> Handle;
     }
+
+    /// `FLASHWINFO` for `FlashWindowEx`.
+    #[repr(C)]
+    pub struct FlashInfo {
+        pub size: u32,
+        pub hwnd: Hwnd,
+        pub flags: u32,
+        pub count: u32,
+        pub timeout: u32,
+    }
+
+    /// Flash both the caption and the taskbar button.
+    pub const FLASHW_ALL: u32 = 3;
+    /// …but stop as soon as the window comes to the foreground itself.
+    pub const FLASHW_TIMERNOFG: u32 = 12;
 
     #[link(name = "shell32")]
     extern "system" {
@@ -777,6 +794,39 @@ mod ffi {
     }
 }
 use ffi::*;
+
+/// The main window, published once it exists. `update::win_dialog` owns its
+/// update prompt to it — an ownerless message box can open behind the app's own
+/// window, which is how a user ends up reporting "no update dialogue".
+pub static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// The main window's handle, or null before the window is created (the update
+/// check can reach its dialog first; `win_dialog` waits for this).
+pub fn main_window() -> Hwnd {
+    MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed) as Hwnd
+}
+
+/// Put the window in front of the user, and if Windows refuses the foreground
+/// (this process was started by something that did not hold it — an installer's
+/// restart action, a background updater, a script), blink the taskbar button
+/// instead. A window that opens silently *behind* whatever the user is looking
+/// at is indistinguishable from one that never opened, which is exactly what an
+/// update-and-relaunch is judged by.
+fn come_to_the_front(hwnd: Hwnd) {
+    // Nonzero means it was brought to the foreground; zero means refused, so
+    // the flash is the only thing left that can be seen.
+    if unsafe { set_foreground_window(hwnd) } != 0 {
+        return;
+    }
+    let mut info = FlashInfo {
+        size: mem::size_of::<FlashInfo>() as u32,
+        hwnd,
+        flags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        count: 0,
+        timeout: 0,
+    };
+    unsafe { flash_window_ex(&mut info) };
+}
 
 /// Touch travel (client px) under which a contact is a tap rather than a pan.
 const TAP_SLOP: f32 = 8.0;
@@ -1867,9 +1917,11 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                     // with "strings passed to WinAPI cannot contain NULs" —
                     // which is exactly what happened before this truncation.
                     let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-                    if len > 0 {
-                        let path = String::from_utf16_lossy(&units[..len]);
-                        dispatch(st, hwnd, Event::FileOpen(std::path::PathBuf::from(path)));
+                    // One path per line (see `handoff_to_running`): a launch
+                    // that asked for several files opens each as its own tab.
+                    let payload = String::from_utf16_lossy(&units[..len]);
+                    for line in payload.split('\n').filter(|l| !l.is_empty()) {
+                        dispatch(st, hwnd, Event::FileOpen(std::path::PathBuf::from(line)));
                     }
                 }
             }
@@ -2106,7 +2158,7 @@ use ffi::HANDOFF_TAG;
 /// ever creating a second window. Returns `Ok(true)` when the handoff
 /// happened (the caller must not continue), `Ok(false)` when we are the
 /// first instance (and now hold the mutex marker for future ones).
-pub(crate) unsafe fn handoff_to_running(file: Option<&std::path::Path>) -> Result<bool> {
+pub(crate) unsafe fn handoff_to_running(files: &[std::path::PathBuf]) -> Result<bool> {
     // Named mutex keyed by the class name; ownership lasts only until the
     // first instance releases it at exit, so a crashed one frees future ones.
     let marker = wide("EditorWindow.Instance");
@@ -2125,10 +2177,21 @@ pub(crate) unsafe fn handoff_to_running(file: Option<&std::path::Path>) -> Resul
         let class = wide("EditorWindow");
         let target = find_window_w(class.as_ptr(), null());
         if !target.is_null() {
-            let arg = file
-                .and_then(|p| p.as_os_str().to_str())
-                .map(wide)
-                .unwrap_or_default();
+            // Every file, one path per line — a Win32 path cannot contain a
+            // newline (control characters are invalid there), so the split is
+            // unambiguous and the receiver needs no length-prefix protocol.
+            // A bare launch sends an empty payload, which is the "just focus"
+            // handoff.
+            let joined = files
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let arg = if joined.is_empty() {
+                std::vec::Vec::new()
+            } else {
+                wide(&joined)
+            };
             let payload = arg.as_ptr() as *const c_void;
             let cds = ffi::CopyDataStruct {
                 dw_data: HANDOFF_TAG as usize,
@@ -2145,9 +2208,16 @@ pub(crate) unsafe fn handoff_to_running(file: Option<&std::path::Path>) -> Resul
                 &cds as *const ffi::CopyDataStruct as Lparam,
             );
             if is_iconic(target) != 0 {
-                show_window(target, 9); /* SW_RESTORE */
+                show_window(target, SW_RESTORE);
             }
-            set_foreground_window(target);
+            // Whatever started this second process wanted the *existing*
+            // window: an "open with Editor", a Start-menu click, or the
+            // installer's restart action finding the old instance still
+            // running. Bring it forward — and when Windows refuses the
+            // foreground (the launcher was not the foreground process, which
+            // is exactly the installer's case), blink its taskbar button, so
+            // "the app came back" is visible either way.
+            come_to_the_front(target);
             return Ok(true);
         }
         // Mutex present but no window (startup race, or the window is
@@ -2306,6 +2376,22 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         // resize fires its own WM_SIZE on show; the pre-painted frame holds
         // until the resized one lands.
         show_window(hwnd, if maximized { SW_MAXIMIZE } else { SW_SHOW });
+        // …but that first call is *ignored* when the process was started with
+        // `STARTF_USESHOWWINDOW` set: Windows uses the `STARTUPINFO`'s
+        // `wShowWindow` for it, not our argument. Windows Installer's restart
+        // action starts the app exactly that way (`SW_SHOWMINNOACTIVE`), so an
+        // update that relaunches Editor reopened it *minimized* while everything
+        // else about it looked right — the report this fixes. Every later
+        // `ShowWindow` honours its argument, so recovering is just doing it
+        // again now that the flag's one free shot is spent.
+        if is_iconic(hwnd) != 0 {
+            show_window(hwnd, SW_RESTORE);
+            show_window(hwnd, if maximized { SW_MAXIMIZE } else { SW_SHOW });
+        }
+        // Published before the first frame: an update prompt that is waiting for
+        // the window to own itself to can proceed the moment it is up.
+        MAIN_HWND.store(hwnd as isize, std::sync::atomic::Ordering::Relaxed);
+        come_to_the_front(hwnd);
 
         let mut msg: Msg = mem::zeroed();
         loop {

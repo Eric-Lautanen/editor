@@ -40,15 +40,18 @@ OUT = ROOT / "assets" / "screenshots"
 WINDOW = (1440, 900)
 
 SHOTS = [
-    ("markdown-dark.png", "sample.md", WINDOW, 2, "preview", True, 0.0),
-    ("markdown-light.png", "sample-md-extra.md", WINDOW, 2, "preview", False, 0.0),
-    ("split-dark.png", "sample.md", WINDOW, 2, "split", True, 760.0),
-    ("edit-light.png", "sample.md", WINDOW, 2, "edit", False, 0.0),
-    ("json-tree.png", "sample.json", WINDOW, 2, "preview", True, 0.0),
-    ("csv.png", "sample.csv", WINDOW, 2, "preview", False, 0.0),
-    ("code-dark.png", "sample.rs", WINDOW, 2, "preview", True, 0.0),
-    ("config-light.png", "sample.toml", WINDOW, 2, "preview", False, 0.0),
-    ("log-dark.png", "sample.log", WINDOW, 2, "preview", True, 0.0),
+    ("markdown-dark.png", "sample_markdown.md", WINDOW, 2, "preview", True, 0.0),
+    # The full sample, not `sample_markdown_extra.md`: that one is 42 lines and
+    # left two thirds of the frame empty in the light shot, which is the first
+    # thing a reader sees in the render table.
+    ("markdown-light.png", "sample_markdown.md", WINDOW, 2, "preview", False, 0.0),
+    ("split-dark.png", "sample_markdown.md", WINDOW, 2, "split", True, 760.0),
+    ("edit-light.png", "sample_markdown.md", WINDOW, 2, "edit", False, 0.0),
+    ("json-tree.png", "sample_json.json", WINDOW, 2, "preview", True, 0.0),
+    ("csv.png", "sample_csv.csv", WINDOW, 2, "preview", False, 0.0),
+    ("code-dark.png", "sample_rust.rs", WINDOW, 2, "preview", True, 0.0),
+    ("config-light.png", "sample_toml.toml", WINDOW, 2, "preview", False, 0.0),
+    ("log-dark.png", "sample_log.log", WINDOW, 2, "preview", True, 0.0),
 ]
 
 

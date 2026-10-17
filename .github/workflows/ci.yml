@@ -187,7 +187,7 @@ jobs:
       - run: cargo build --release
       - name: the app starts and puts a window on screen
         run: |
-          ./target/release/editor --no-update samples/sample.md > /tmp/editor.log 2>&1 &
+          ./target/release/editor --no-update samples/sample_markdown.md > /tmp/editor.log 2>&1 &
           pid=$!
           sleep 6
           if ! kill -0 "$pid" 2>/dev/null; then

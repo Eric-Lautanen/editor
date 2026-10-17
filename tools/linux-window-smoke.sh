@@ -17,7 +17,7 @@ set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${1:-./target/release/editor}
-sample="$here/../samples/sample.md"
+sample="$here/../samples/sample_markdown.md"
 log=/tmp/editor-window-smoke.log
 
 if [ ! -x "$bin" ]; then

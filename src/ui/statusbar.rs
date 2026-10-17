@@ -82,18 +82,28 @@ pub fn paint(
     );
     let size = 12.5 * scale;
     let m = fonts.metrics(FontStyle::Regular, size);
-    // Optical centering: bias 1px up so cap-height text reads centred with
-    // a touch more air below than above.
-    let baseline = (area.y + (area.h - m.height()) / 2.0 + m.ascent - 1.0 * scale).round();
+    // One centre line for the whole bar: the labels, the active pill and the
+    // Copy button are all measured from it, so nothing can drift `descent`-deep
+    // inside its own box the way the old `-1px` fudge was papering over.
+    let mid = area.y + area.h / 2.0;
+    let baseline = (mid - m.height() / 2.0 + m.ascent).round();
+    // Pill inset. Small enough to read as a selection, tall enough to hold the
+    // text without clipping it, and symmetric about `mid` by construction.
+    let pill_h = (m.height() + 8.0 * scale).min(area.h - 6.0 * scale).round();
     let pad = 14.0 * scale;
     let gap = 6.0 * scale;
 
     // Buttons, right-aligned; the vec order is left-to-right on screen, so we
     // walk it in reverse. [Find] [Open] | [Preview] [Edit] [Split] | [Help] [About] [Theme]
     let mut bx = area.right() - pad;
+    // Horizontal breathing room around a label, and the pill's corner: the
+    // text is centred on `mid` above, so these are the only two numbers that
+    // decide whether the highlight reads as a considered button or a smear.
+    let pad_x = 9.0 * scale;
+    let radius = (6.0 * scale).min(pill_h / 2.0);
     for (i, b) in buttons.iter_mut().enumerate().rev() {
         let tw = fonts.measure(FontStyle::Regular, b.label, size);
-        let w = tw + 14.0 * scale;
+        let w = tw + pad_x * 2.0;
         // Full bar height, so a finger lands even when it strays vertically;
         // the pill below paints inset inside it.
         b.rect = Rect::new(bx - w, area.y, w, area.h);
@@ -114,23 +124,19 @@ pub fn paint(
             // Neutral "selected pill": a subtle fg tint with fg text. The old
             // accent-blue wash read as cheap next to the otherwise grey
             // chrome; this matches the title-bar hover language and stays
-            // legible in both themes.
+            // legible in both themes. Centred on `mid`, so the label sits in the
+            // middle of the pill rather than in the bottom half of it.
             canvas.fill_rounded_rect(
-                Rect::new(
-                    b.rect.x,
-                    area.y + 4.0 * scale,
-                    b.rect.w,
-                    area.h - 8.0 * scale,
-                ),
-                5.0 * scale,
+                Rect::new(b.rect.x, (mid - pill_h / 2.0).round(), b.rect.w, pill_h),
+                radius, // a soft rect, not a capsule: the label keeps its air
                 Color::rgba(theme.fg.r, theme.fg.g, theme.fg.b, 32),
             );
         }
         canvas.draw_text(
             fonts,
             b.label,
-            b.rect.x + 7.0 * scale,
-            (b.rect.y + (b.rect.h - m.height()) / 2.0 + m.ascent - 1.0 * scale).round(),
+            b.rect.x + pad_x,
+            baseline,
             TextSpec {
                 size,
                 style: FontStyle::Regular,
@@ -174,24 +180,19 @@ pub fn paint(
     // landed, which is the feedback that used to be a status message.
     if let Some(cb) = copy.as_mut() {
         let tw = fonts.measure(FontStyle::Regular, cb.label, size);
-        let w = tw + 14.0 * scale;
+        let w = tw + pad_x * 2.0;
         let cbx = (x + 10.0 * scale).min((limit - w).max(area.x + pad));
         cb.rect = Rect::new(cbx, area.y, w, area.h);
         canvas.fill_rounded_rect(
-            Rect::new(
-                cb.rect.x,
-                area.y + 4.0 * scale,
-                cb.rect.w,
-                area.h - 8.0 * scale,
-            ),
-            5.0 * scale,
+            Rect::new(cb.rect.x, (mid - pill_h / 2.0).round(), cb.rect.w, pill_h),
+            radius,
             Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, 48),
         );
         canvas.draw_text(
             fonts,
             cb.label,
-            cb.rect.x + 7.0 * scale,
-            (cb.rect.y + (cb.rect.h - m.height()) / 2.0 + m.ascent - 1.0 * scale).round(),
+            cb.rect.x + pad_x,
+            baseline,
             TextSpec {
                 size,
                 style: FontStyle::Regular,
@@ -283,6 +284,108 @@ mod tests {
             }
         }
         (first.expect("the bar painted nothing"), last)
+    }
+
+    /// First and last row carrying ink between two columns, so a measurement
+    /// can be limited to one button's label instead of the whole bar.
+    fn ink_rows_between(c: &Canvas, x0: f32, x1: f32) -> (usize, usize) {
+        let bg = Theme::light().code_bg.pack() & 0xFFFFFF;
+        let (x0, x1) = (x0.max(0.0) as usize, x1.min(c.width as f32) as usize);
+        // The bar's top hairline runs the whole width, so it would answer "the
+        // text starts at row 0" at any scale; start below it.
+        let rule_rows = (c.height as f32 / HEIGHT).max(1.0).round() as usize;
+        let rows: Vec<usize> = (rule_rows..c.height)
+            .filter(|&y| (x0..x1).any(|x| c.pixels[y * c.width + x] & 0xFFFFFF != bg))
+            .collect();
+        (rows[0], rows[rows.len() - 1])
+    }
+
+    /// One bar with a single, *inactive* button, so no pill hides the glyphs.
+    fn bar_with_button(scale: f32) -> (Canvas, StatusButton, Rect) {
+        let fonts = FontSystem::load_embedded();
+        let theme = Theme::light();
+        let area = Rect::new(0.0, 0.0, 400.0 * scale, (HEIGHT * scale).round());
+        let mut c = Canvas::new(area.w as usize, area.h as usize);
+        let mut buttons = [StatusButton {
+            id: 0,
+            label: "Preview",
+            active: false,
+            group_start: false,
+            rect: Rect::default(),
+        }];
+        let mut copy = None;
+        paint(
+            &mut c,
+            &fonts,
+            &theme,
+            area,
+            Bar {
+                info: "",
+                detail: "",
+                link: None,
+            },
+            &mut buttons,
+            &mut copy,
+        );
+        (c, buttons[0], area)
+    }
+
+    #[test]
+    fn the_button_label_is_centred_on_the_bar_not_sunk_into_it() {
+        // The regression this pins: `Metrics::height()` added a *negative*
+        // descent, so every centred label sat |descent|/2 (≈1.3 px at 1x,
+        // 2.6 px at 2x) below the middle — the text hugged the bottom of its
+        // pill. Measured from pixels, at both scales the app runs at.
+        for scale in [1.0f32, 2.0] {
+            let (c, b, area) = bar_with_button(scale);
+            let (top, bottom) = ink_rows_between(&c, b.rect.x + 2.0, b.rect.right() - 2.0);
+            let above = top as f32 - area.y;
+            let below = area.h - 1.0 - bottom as f32;
+            assert!(
+                (above - below).abs() <= 1.0,
+                "scale {scale}: {above} px of air above the label, {below} below"
+            );
+        }
+    }
+
+    #[test]
+    fn the_active_pill_is_symmetric_about_the_same_centre_line() {
+        let fonts = FontSystem::load_embedded();
+        let theme = Theme::light();
+        let area = Rect::new(0.0, 0.0, 400.0, HEIGHT);
+        let mut c = Canvas::new(400, HEIGHT as usize);
+        let mut buttons = [StatusButton {
+            id: 0,
+            label: "Preview",
+            active: true,
+            group_start: false,
+            rect: Rect::default(),
+        }];
+        let mut copy = None;
+        paint(
+            &mut c,
+            &fonts,
+            &theme,
+            area,
+            Bar {
+                info: "",
+                detail: "",
+                link: None,
+            },
+            &mut buttons,
+            &mut copy,
+        );
+        // A column two pixels inside the pill's left edge: rounded corners keep
+        // it clear of the glyphs, so what it finds is the pill itself.
+        let b = buttons[0];
+        let (top, bottom) = ink_rows_between(&c, b.rect.x + 2.0, b.rect.x + 3.0);
+        let above = top as f32 - area.y;
+        let below = area.h - 1.0 - bottom as f32;
+        assert!(
+            (above - below).abs() <= 1.0,
+            "the pill is off-centre: {above} px above, {below} below"
+        );
+        assert!(bottom - top + 1 < HEIGHT as usize, "the pill fills the bar");
     }
 
     #[test]

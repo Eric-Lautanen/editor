@@ -47,6 +47,31 @@ mod macos;
 #[cfg(any(target_os = "windows", editor_check_win))]
 mod windows;
 
+/// The main window's handle, or null if there is not one yet.
+///
+/// Exists for one caller: `update::win_dialog` owns the update prompt to this
+/// window, because a message box with no owner mixes with the app's own window
+/// in z-order and can open *behind* it — which looks exactly like no prompt at
+/// all. Only Windows backends have a handle to give; the others drive their
+/// prompts through the desktop's own dialog helper, which places them itself.
+#[cfg(all(
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
+))]
+pub fn main_window() -> *mut std::ffi::c_void {
+    windows::main_window()
+}
+
+#[cfg(not(all(
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
+)))]
+pub fn main_window() -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
+}
+
 #[cfg(any(
     all(
         unix,
@@ -149,7 +174,7 @@ pub fn run(handler: impl Handler + 'static) -> Result<()> {
 /// opening a second one — clicking the taskbar icon while one is open does
 /// the friendly thing rather than spawning a duplicate. `cli::run` calls
 /// this right before `platform::run`.
-pub fn forward_to_running(file: Option<&std::path::Path>) -> Result<bool> {
+pub fn forward_to_running(files: &[std::path::PathBuf]) -> Result<bool> {
     // Gated on the *selected backend*, not on the host: the `editor_check_*`
     // cfgs exist to type-check one backend from another OS, and a bare
     // `target_os = "windows"` arm would call `backend::handoff_to_running`
@@ -165,7 +190,7 @@ pub fn forward_to_running(file: Option<&std::path::Path>) -> Result<bool> {
         // SAFETY: the FFI here is the platform's own single-instance plumbing
         // (mutex + FindWindow + SendMessage), none of which touches Rust
         // invariants; see `windows::handoff_to_running`.
-        unsafe { backend::handoff_to_running(file) }
+        unsafe { backend::handoff_to_running(files) }
     }
     #[cfg(not(all(
         any(target_os = "windows", editor_check_win),
@@ -176,7 +201,7 @@ pub fn forward_to_running(file: Option<&std::path::Path>) -> Result<bool> {
         // The linux/macos backends do the same trick (they open at their
         // window-creation site — same as the win one) once their GUI (M8/M9)
         // lands; until then a second launch keeps the classic behavior.
-        let _ = file;
+        let _ = files;
         Ok(false)
     }
 }

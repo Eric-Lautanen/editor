@@ -94,12 +94,19 @@ pub struct Glyph {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
+    /// Above the baseline, positive.
     pub ascent: f32,
+    /// Below the baseline, and therefore negative: it grows downward, like a
+    /// y axis, not away from the baseline.
     pub descent: f32,
 }
 
 impl Metrics {
+    /// Depth of the line box, baseline included — the span a centred row has
+    /// to leave room for. `descent` is negative, so this *adds* the air below
+    /// the baseline; `ascent + descent` would subtract it and drop the text
+    /// half a descender too low in every box that centres on it.
     pub fn height(&self) -> f32 {
-        self.ascent + self.descent
+        self.ascent - self.descent
     }
 }

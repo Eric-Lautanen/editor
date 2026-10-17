@@ -5,10 +5,12 @@
 use crate::{
     gfx::{
         canvas::{Canvas, TextSpec},
+        color::Color,
         font::{FontStyle, FontSystem},
         geom::Rect,
     },
     layout::theme::Theme,
+    update::Check,
 };
 
 use super::overlay;
@@ -44,8 +46,60 @@ const HINT: &str = "F2 or Esc to close";
 /// switch only decides whether the check happens at all.
 const UPDATE_TOGGLE: &str = "Check for updates automatically (twice a day)";
 
+/// The manual check, right under the toggle it complements: the toggle is
+/// "may this app ask GitHub on its own", this is "ask now". It exists because
+/// the automatic check is silent and bounded to twice a day — a user who wants
+/// to know right now had only the command line, and a check that quietly does
+/// nothing when there is nothing new is indistinguishable from a broken one,
+/// so this one always answers (see `update::check_now`).
+const CHECK_NOW: &str = "Check for updates now";
+
+/// What the last manual check has to say, in the box's own voice: muted for
+/// "nothing to do", accent for "there is something", fg for a failure. `None`
+/// before anything has been asked.
+fn status_line(check: &Check, theme: &Theme) -> Option<(String, Color)> {
+    match check {
+        Check::Idle => None,
+        Check::Checking => Some(("Checking for updates…".into(), theme.muted)),
+        Check::UpToDate => Some((
+            format!("Up to date — {VERSION} is the latest version."),
+            theme.muted,
+        )),
+        Check::Available(tag) => Some((format!("{tag} is available."), theme.accent)),
+        Check::Failed(why) => Some((why.clone(), theme.fg)),
+    }
+}
+
+/// Cut `text` to `max_w` with an ellipsis. A failure message can be long (it
+/// names every download route that failed); the box is sized for its table, so
+/// the line is trimmed rather than widening the panel around an error.
+fn clip(fonts: &FontSystem, text: &str, size: f32, max_w: f32) -> String {
+    if fonts.measure(FontStyle::Regular, text, size) <= max_w {
+        return text.to_string();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let mut s: String = chars.iter().collect();
+        s.push('…');
+        if fonts.measure(FontStyle::Regular, &s, size) <= max_w {
+            return s;
+        }
+    }
+    "…".to_string()
+}
+
+/// The update half of the box: the automatic-check setting and the answer to
+/// the last manual check (painted as a status line under the button, because
+/// the box is the answer surface — "up to date" does not need a message box,
+/// nor the system alert sound that comes with one).
+pub struct Updates<'a> {
+    pub auto: bool,
+    pub check: &'a Check,
+}
+
 /// Paint the box over the whole window, returning the panel it drew and the
-/// toggle row's clickable rect.
+/// two clickable rects: the update toggle row, then the check-now button.
 pub fn paint(
     canvas: &mut Canvas,
     fonts: &FontSystem,
@@ -53,8 +107,12 @@ pub fn paint(
     width: f32,
     height: f32,
     scale: f32,
-    auto_update: bool,
-) -> (overlay::Frame, crate::gfx::geom::Rect) {
+    updates: Updates<'_>,
+) -> (
+    overlay::Frame,
+    crate::gfx::geom::Rect,
+    crate::gfx::geom::Rect,
+) {
     let (size, line_h) = overlay::metrics(scale);
     let pad = overlay::pad(scale);
     let col_gap = (size * 1.6).round();
@@ -87,8 +145,15 @@ pub fn paint(
         .max(fonts.measure(FontStyle::Regular, HINT, size));
     let panel_w = (content_w + 2.0 * pad).min(width - 40.0 * scale);
 
+    let auto_update = updates.auto;
+    let check = updates.check;
+    let button_h = (line_h * 1.15).round();
     let content_h = title_h + TAGLINE.len() as f32 * line_h + gap + FIELDS.len() as f32 * line_h + gap
             + line_h // the update toggle row
+            + gap
+            + button_h // the Check-now button
+            + gap
+            + line_h // the check's status line (blank until asked)
             + gap
             + line_h; // the hint
     let f = overlay::frame(
@@ -236,6 +301,50 @@ pub fn paint(
     let toggle = Rect::new(f.panel.x + pad, toggle_y, f.panel.w - 2.0 * pad, line_h);
 
     y += line_h;
+
+    // The check-now button: the same slab-drawn chrome as the checkbox (a
+    // bordered rect), wide enough for its own label plus padding, sized to the
+    // other rows rather than to whatever a native button would want.
+    y += gap;
+    let btn_pad_x = (size * 0.7).round();
+    let btn_w = fonts.measure(FontStyle::Regular, CHECK_NOW, size) + 2.0 * btn_pad_x;
+    let button = Rect::new(x, y, btn_w, button_h);
+    canvas.fill_rect(Rect::new(x, y, btn_w, edge), theme.accent);
+    canvas.fill_rect(Rect::new(x, y + button_h - edge, btn_w, edge), theme.accent);
+    canvas.fill_rect(Rect::new(x, y, edge, button_h), theme.accent);
+    canvas.fill_rect(Rect::new(x + btn_w - edge, y, edge, button_h), theme.accent);
+    canvas.draw_text(
+        fonts,
+        CHECK_NOW,
+        x + btn_pad_x,
+        f.baseline(y + (button_h - line_h) / 2.0),
+        TextSpec {
+            size,
+            style: FontStyle::Regular,
+            color: theme.fg,
+        },
+    );
+
+    y += button_h;
+    y += gap;
+    // The answer to the button above it, in the box rather than in a dialog.
+    // The line is reserved whether or not there is anything to say, so the
+    // panel does not change size when a check comes back.
+    if let Some((text, color)) = status_line(check, theme) {
+        let shown = clip(fonts, &text, size, content_w);
+        canvas.draw_text(
+            fonts,
+            &shown,
+            x,
+            f.baseline(y),
+            TextSpec {
+                size,
+                style: FontStyle::Regular,
+                color,
+            },
+        );
+    }
+    y += line_h;
     y += gap;
     canvas.draw_text(
         fonts,
@@ -248,7 +357,7 @@ pub fn paint(
             color: theme.muted,
         },
     );
-    (f, toggle)
+    (f, toggle, button)
 }
 
 #[cfg(test)]
@@ -286,7 +395,18 @@ mod tests {
         let bg = theme.bg.pack() & 0xFFFFFF;
         c.fill_rect(Rect::new(0.0, 0.0, w, h), theme.bg);
 
-        let (f, toggle) = paint(&mut c, &fonts, &theme, w, h, 1.0, true);
+        let (f, toggle, button) = paint(
+            &mut c,
+            &fonts,
+            &theme,
+            w,
+            h,
+            1.0,
+            Updates {
+                auto: true,
+                check: &Check::Idle,
+            },
+        );
         assert!(
             (f.panel.x - (w - f.panel.w) / 2.0).abs() < 1.0,
             "not centred"
@@ -295,6 +415,15 @@ mod tests {
         // uses — non-degenerate and within the panel's horizontal padding.
         assert!(toggle.w > 0.0 && toggle.h > 0.0, "toggle rect empty");
         assert!(toggle.x >= f.panel.x + f.pad && toggle.y > f.panel.y);
+        // The check-now button sits below the checkbox, inside the panel and
+        // above its bottom edge — where the user was told to look for it.
+        assert!(button.w > 0.0 && button.h > 0.0, "button rect empty");
+        assert!(
+            button.y >= toggle.y + toggle.h,
+            "button not under the toggle"
+        );
+        assert!(button.x >= f.panel.x + f.pad);
+        assert!(button.y + button.h <= f.panel.y + f.panel.h - f.pad);
         assert_ne!(c.pixels[10 * 900 + 2] & 0xFFFFFF, bg, "page not dimmed");
 
         let (x0, x1) = (
@@ -312,6 +441,79 @@ mod tests {
         assert!(ink > 200, "box looks empty: {ink} non-background px");
     }
 
+    /// The answer to "Check for updates now" belongs in the box: an "up to
+    /// date" result paints a line under the button instead of raising a
+    /// message box (which also plays the Windows alert sound). Measured as ink
+    /// in the reserved band between the button and the hint.
+    #[test]
+    fn the_check_result_is_painted_under_the_button() {
+        let fonts = FontSystem::load_embedded();
+        let theme = Theme::light();
+        let (w, h) = (900.0, 640.0);
+        let band_ink = |check: &Check| {
+            let mut c = Canvas::new(900, 640);
+            let (f, _, button) = paint(
+                &mut c,
+                &fonts,
+                &theme,
+                w,
+                h,
+                1.0,
+                Updates { auto: true, check },
+            );
+            let (size, line_h) = overlay::metrics(1.0);
+            let gap = (size * 1.1).round();
+            let y0 = (button.y + button.h + gap) as usize;
+            let y1 = y0 + line_h as usize;
+            let bg = theme.bg.pack() & 0xFFFFFF;
+            let (x0, x1) = (
+                f.content_x() as usize,
+                (f.panel.x + f.panel.w - f.pad) as usize,
+            );
+            (y0..y1.min(640))
+                .flat_map(|y| (x0..x1.min(900)).map(move |x| y * 900 + x))
+                .filter(|&i| c.pixels[i] & 0xFFFFFF != bg)
+                .count()
+        };
+        assert_eq!(band_ink(&Check::Idle), 0, "idle must leave the band blank");
+        assert!(
+            band_ink(&Check::UpToDate) > 40,
+            "the up-to-date result was not painted in the box"
+        );
+        assert!(band_ink(&Check::Failed("no route to github".into())) > 40);
+        // A long failure (the download chain names every route) is trimmed to
+        // the panel instead of widening it around an error message.
+        let long = Check::Failed("x".repeat(400));
+        let mut c = Canvas::new(900, 640);
+        let (f, _, _) = paint(
+            &mut c,
+            &fonts,
+            &theme,
+            w,
+            h,
+            1.0,
+            Updates {
+                auto: true,
+                check: &long,
+            },
+        );
+        let (size, _) = overlay::metrics(1.0);
+        // `paint` clips to its content column, so the same column must hold the
+        // trimmed line — 400 characters of "x" would otherwise run off the
+        // panel's right edge and over the dimmed page behind it.
+        let content_w = f.panel.w - 2.0 * f.pad;
+        let shown = clip(&fonts, &"x".repeat(400), size, content_w);
+        let width = fonts.measure(FontStyle::Regular, &shown, size);
+        assert!(
+            width <= content_w,
+            "the status line runs past the panel: {width} > {content_w}"
+        );
+        assert!(
+            shown.ends_with('…'),
+            "the trimmed line must be marked: {shown}"
+        );
+    }
+
     /// Nothing may be clipped: the panel has to be wide enough for the widest
     /// row plus padding at both sides.
     #[test]
@@ -320,7 +522,25 @@ mod tests {
         let theme = Theme::light();
         let (w, h) = (1200.0, 700.0);
         let mut c = Canvas::new(1200, 700);
-        let (f, _) = paint(&mut c, &fonts, &theme, w, h, 1.0, false);
+        let (f, _, button) = paint(
+            &mut c,
+            &fonts,
+            &theme,
+            w,
+            h,
+            1.0,
+            Updates {
+                auto: false,
+                check: &Check::Idle,
+            },
+        );
+        // The button's own label fits inside its border.
+        assert!(
+            f.panel.w >= button.w + f.pad,
+            "button {} wider than the panel {}",
+            button.w,
+            f.panel.w
+        );
         let (size, _) = overlay::metrics(1.0);
         let widest = FIELDS
             .iter()

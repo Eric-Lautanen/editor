@@ -287,7 +287,7 @@ fn tree<'a>(width: f32, ctx: &'a Ctx, collapsed: &'a HashSet<usize>) -> Tree<'a>
         size,
         line_h: (size * 1.55).round(),
         ascent: m.ascent,
-        height: m.ascent + m.descent,
+        height: m.height(),
         adv,
         indent_w: adv * 2.0,
         x0,

@@ -2,9 +2,9 @@
     (`error 2:5`, `3 records, 1 error`); `--pretty` re-anchors JSONL errors to file lines.
 
 ### M3 acceptance checklist (all verified headlessly; window pass still manual)
-- [x] `samples/sample.json` renders a tinted tree; `--pretty` output re-parses identically
+- [x] `samples/sample_json.json` renders a tinted tree; `--pretty` output re-parses identically
 - [x] Invalid JSON shows a banner (`! line:col: msg` + snippet + caret) and a status error
-- [x] `samples/sample.jsonl` shows one tree per valid record + 1 error banner + separators (incl. its broken line 3)
+- [x] `samples/sample_jsonl.jsonl` shows one tree per valid record + 1 error banner + separators (incl. its broken line 3)
 - [x] Clicking `[+]`/`[-]` collapses/expands; inner toggles keep working; zoom/reflow keeps place
 - [ ] Same three checks eyeballed in a real window (tree colors, toggle hit areas, banner)
 
@@ -31,7 +31,7 @@
     whole line fit) + inline code spans blocking emphasis matches, both caught by rendered snapshots.
 
 ### M4 acceptance checklist (verified headlessly + eyeballed via `--render` PNGs)
-- [x] `samples/sample.md` renders: scaled headings + rules, bold/italic/code/link row, nested +
+- [x] `samples/sample_markdown.md` renders: scaled headings + rules, bold/italic/code/link row, nested +
       task lists, quote bar, code panel, aligned table with rule, closing rule
 - [x] Adversarial inputs (unclosed fences/markers, deep nesting, ragged tables, unicode, empty
       file) degrade gracefully with no panics
@@ -209,7 +209,7 @@
 
 ### Memory round (Oct 2026) — fallback fonts cost the whole file, so map them
 
-Baseline, release build, `samples/sample.md` (1100×800): **41.7 MB working set,
+Baseline, release build, `samples/sample_markdown.md` (1100×800): **41.7 MB working set,
 31.4 MB private**, of which 22.9 MB was live heap. The census attributed 22.9 MB
 to "untagged", and a size-class histogram in `mem.rs` narrowed it to *one*
 19,704,352-byte allocation — exactly the size of `C:\Windows\Fonts\msyh.ttc`.
@@ -238,7 +238,7 @@ working set**, and one emoji pulled in `seguiemj.ttf` (12.9 MB) on top.
   of parsing every face of every candidate file eagerly. A lookup stops at the
   first face that answers, so the members behind it never allocate.
 - **Measured, before → after** (same binaries, same documents, `--mem-report` and
-  `Get-Process` on the live window): `samples/sample.md` live heap **22.9 MB →
+  `Get-Process` on the live window): `samples/sample_markdown.md` live heap **22.9 MB →
   359 KB**, working set **41.7 → 19.8 MB**, private **31.4 → 9.4 MB**; the
   CJK+emoji document live heap **35.5 MB → 739 KB**, working set **54.5 →
   20.4 MB**, private **44.1 → 9.4 MB**. An emoji now costs what a Latin
@@ -338,8 +338,8 @@ working set**, and one emoji pulled in `seguiemj.ttf` (12.9 MB) on top.
   `editor_check_linux`, and both cfgs are declared in `Cargo.toml`. The X11
   backend type-checked for the first time under that flag (a stray brace and a
   duplicated `intern` signature were blocking it).
-- **Samples are long enough to scroll** (`samples/sample.md`, `sample.txt`,
-  `sample.jsonl`, `sample.json`): the old samples fit on one screen, which is
+- **Samples are long enough to scroll** (`samples/sample_markdown.md`, `sample_text.txt`,
+  `sample_jsonl.jsonl`, `sample_json.json`): the old samples fit on one screen, which is
   why no scrollbar ever appeared in a window or a `--render` snapshot.
 
 ### M8 round (Oct 2026) — Linux X11 backend lands (type-checked), 229 tests green
@@ -704,7 +704,7 @@ survived restarts (theme, mode, tabs); the window did not.
 
 ### Scroll-smoothness round (Oct 2026) — a wheel notch glides instead of jumping, 269 tests green
 - **The report**: scrolling "seems a little choppy or lagging just a little". Measured first, and the
-  frame was never the problem: a full repaint of `sample.md` at 1100×800 costs ~1 ms in release
+  frame was never the problem: a full repaint of `sample_markdown.md` at 1100×800 costs ~1 ms in release
   (`cargo test --release -- --ignored --nocapture paint_cost`), so the eye had time to spare — the
   *cadence* was wrong. A wheel notch was applied as one 48 px jump, and the only clock the app had
   was the 25 Hz / 40 ms heartbeat, so nothing could ever happen in between.
@@ -964,3 +964,158 @@ Time: 2026-10-12 13:42:24 UTC
   with the control boxes. Fifteen names double-spaced cleared the documents
   list's right edge by 5px, so the lists now use single spaces — the same line
   clears it by 37px, and no two text rows overlap.
+
+### Update-transport round (Oct 2026) — no curl, no leftovers, 379 tests green
+- **Fetching** (`src/net.rs`, new): the updater's three requests no longer assume
+  `curl` exists. Each is handed to the first of the OS's own routes that works —
+  Windows: `curl.exe` (System32 since 10 1803) → PowerShell's
+  `Invoke-WebRequest` → `urlmon!URLDownloadToFileW` (one FFI call, WinINet does
+  the TLS, no child process at all) → `certutil -urlcache`; macOS: `curl` →
+  `python3`; other Unix: `curl` → GNU/busybox `wget` → `python3`. Still no
+  crates and no TLS of our own; a rung that is missing, or that security
+  software refuses to start, reports why and the next one runs, and the
+  all-failed message lists every rung instead of one opaque failure. URLs are
+  gated first (`trusted`): HTTPS on GitHub's release hosts, or plain HTTP to
+  loopback (which is how the tests drive the real helper commands against a
+  server they start). Helpers get argv, never a command line to split —
+  PowerShell is the one exception, and its single quotes are doubled.
+- **Footprint**: everything the updater stages is one directory,
+  `<temp>/editor-update-<tag>`, stable across versions by name. The next launch
+  deletes older ones (2-minute age guard so a concurrent `--update` is never
+  raced, and a locked directory simply retries later), Linux/macOS delete theirs
+  before relaunching, and a failed download deletes what it wrote.
+- **Restart after an update** (Windows): the running app used to be closed and
+  left closed. Measured, in the verbose log of a silent install over a running
+  Editor: Restart Manager shut the window down and never reopened it, so the
+  update dialog's "close and restart" was only true where `src/update.rs`
+  relaunches by hand (Linux/macOS). The first attempt put the relaunch *inside*
+  the package (`RestartEditor`, deferred `asyncNoWait` before `InstallFinalize`)
+  and had to be taken back out: on a major upgrade the execute sequence runs
+  twice, so two Editors started, the second hung on the first one's
+  single-instance mutex, and the process a custom action leaves behind in the
+  transaction can still hold the exe — which made Windows Installer schedule a
+  restart (on the test machine, an actual reboot). The relaunch now lives in
+  `src/update.rs` only, as one `cmd` line — `msiexec /i … /passive
+  REBOOT=ReallySuppress & start "" <installed exe>` — so the new window opens
+  after the install exits, exactly once, argument-less into the saved session
+  (last file, window place), and no update can ever reboot the machine. The
+  package launches nothing, so a wizard install or a `/qn` deploy stays quiet.
+- **Visible when it happens**: two Windows fixes for what the user kept
+  reporting as "no update prompt" and "it doesn't come back". The prompt's
+  message box is now *owned* by the main window (and waits up to 2 s for that
+  window to exist — the check runs on its own thread and can reach the dialog
+  before `CreateWindowExW` has finished), because an ownerless box mixes with
+  the app's own window in z-order and can open behind it. And the app asks for
+  the foreground when it appears: `SetForegroundWindow`, or `FlashWindowEx` on
+  the taskbar button when Windows refuses (which it does for anything started
+  by a process that was not itself in front — an installer's restart action is
+  exactly that case, so the relaunched window used to appear silently *behind*
+  whatever the user was looking at). The same rule now applies on the
+  single-instance handoff path, where a second launch asks the *existing*
+  window forward instead of creating one.
+- **Check now** (About box, F2): the automatic check is silent and bounded to
+  twice a day, so a user who wants to know *now* had only the command line — and
+  a silent check is indistinguishable from a broken one. A button under the
+  auto-update checkbox runs the same flow off the clock and off that setting
+  (`update::check_now`, its own thread, so the window never blocks on the
+  network) and always answers: **in the box**, on a status line under the
+  button. Only the "install this version?" question is still a dialog — a
+  message box for "you are up to date" played the Windows alert sound for a
+  non-event (user report), so `update::Check` (`Idle`/`Checking`/`UpToDate`/
+  `Available`/`Failed`) travels back through a shared `Mutex` and the app
+  repaints when the 40 ms tick sees it change. The panel reserves the line so
+  it does not resize when an answer arrives, and a long failure is trimmed to
+  the panel instead of widening it. Pinned by
+  `about_box_has_a_check_now_button_under_the_toggle`, `the_check_result_is_
+  painted_under_the_button` (idle band blank, result band inked, long text
+  trimmed with an ellipsis) and the geometry tests.
+- **Uninstall**: `--uninstall` (portable, and the MSI's uninstall custom action)
+  drops the associations *and* every staged payload plus the sidecar a failed
+  Linux swap can leave. Settings/session/crash reports are kept, and the command
+  says where they are.
+- **Measured, on this machine**: the published 0.2.1 msi (1.6 MB) fetched and
+  checksum-verified through the new code path, ending in a real `msiexec`
+  install; a *fresh* 0.2.1 install timed 0.9 s against 13.4 s before
+  `MSIFASTINSTALL=1` (12.4 s of it inside `SRSetRestorePoint`); a rebuilt 0.2.3
+  msi's uninstall removed the fake `%TEMP%\editor-update-v9.9.9` payload, the
+  install folder, the HKCU ProgID and the ARP row; `editor.exe --uninstall`
+  removed a staged payload and printed where the settings stayed; and a launch
+  swept a 3-hour-old payload while keeping a 36-second-old one.
+- **Windows downloads spawn nothing any more** (Oct 2026, user report: Defender
+  noise that started with the updater). The chain used to be `curl.exe` →
+  `powershell -ExecutionPolicy Bypass -Command Invoke-WebRequest` → `urlmon` →
+  `certutil -urlcache`. The last three are the problem, not the fix: a text
+  editor running a bypassed script host to fetch JSON is precisely the shape
+  endpoint protection interrupts, and `certutil -urlcache` is a malware
+  favourite this machine refuses to start at all (`ERROR_ACCESS_DENIED` at
+  process creation). The order is now `urlmon` (in-process WinINet via one FFI
+  call, the OS's own TLS, no child process) → `curl.exe`, and PowerShell and
+  certutil are gone from the code, not merely demoted. Verified live on this
+  machine, not by inspection: `cargo test --ignored net::tests::live` fetched
+  `https://api.github.com/` through **both** rungs and the body parsed as JSON
+  (WinINet's default User-Agent is accepted; the assertion rejects an HTML
+  error page that a status-blind rung would otherwise report as success).
+  `the_chain_carries_the_url_and_never_runs_a_script_host` fails the build if a
+  script host comes back.
+- **The log named it.** `Microsoft-Windows-Windows Defender/Operational`,
+  event 1116/1117: 31 detections, **27 of them on 2026-10-17** (during this
+  work), every one `Trojan:Win32/Ceprolad.A` with a
+  `CmdLine:_…certutil.exe -urlcache -split -f http://127.0.0.1:<port>/asset
+  %TEMP%\editor_fetch_rung_test` path — that is `net::tests::`
+  `every_available_rung_works_on_its_own` spawning the certutil rung, twice
+  (detect + remediate) per `cargo test`. The rest are the same command typed by
+  hand while building the chain. **Zero events name `editor.exe`**: the app was
+  never the thing being flagged, the test harness was. Proof rather than
+  assertion: the newest 1116 before the fix was 04:00:33Z; a full `cargo test`
+  run after removing the rung left the count at 31 (08:06Z).
+- **Not verified**: the macOS/Linux rungs beyond `curl` (`wget`, `busybox
+  wget`, `python3`) are type-checked, not executed on this OS.
+
+### Status-bar centring (Oct 2026) — a sign error, measured in pixels
+- Reported from the running app: the status-bar labels sat low in the bar, with
+  more air above than below, and the selected pill made it obvious.
+- Cause: `Metrics::descent` is negative by convention (it grows *downward*, the
+  same sign as a y axis), but `Metrics::height()` computed `ascent + descent`, so
+  every centred row was told its line box was `descent` shorter than it is and
+  pushed the baseline down by |descent|/2 — 1.3 px at 1x, 2.6 px at 2x. Three
+  copies of the same `(h - ascent - descent) / 2 + ascent` arithmetic lived in
+  `layout::{markdown,csv,json_tree}`, and the status bar had a `-1px` “optical”
+  fudge that was cancelling part of the error instead of fixing it.
+- Fix: `height()` is now `ascent - descent` (documented in place), the three
+  duplicated call sites use it, and the status bar has one `mid` line from which
+  the labels, the active pill and the Copy button are all measured — no bias.
+  The pill also shrank to the text box plus 8 px and took a 6 px corner, so the
+  highlight and the word inside it are the same shape.
+- Pinned by pixels, not by eye: `the_button_label_is_centred_on_the_bar_not_sunk_into_it`
+  and `the_active_pill_is_symmetric_about_the_same_centre_line` rasterize the
+  bar at 1x and 2x and require the ink above and below to differ by at most 1 px.
+  Both fail on the pre-fix code (13 px above / 10 below at 1x).
+
+### Open pipeline (Oct 2026) — four things that were odd, found on request
+- **The handoff happened too late.** `cli::run` built the whole `App` (parsing
+  the file, laying it out) and only then asked `platform::forward_to_running`
+  whether another window owned the launch. A big file was loaded to be thrown
+  away, and — worse — a file that failed to open exited with an error *instead
+  of* being handed to the window that was already running, which is an "Open
+  with Editor" that appears to do nothing. The forward is now the first thing
+  after argument parsing, skipped for `--render`/`--pretty`/`--mem-report`,
+  which never open a window.
+- **One file, two spellings, two tabs.** `open_path` compared `PathBuf`s for
+  exact equality, so `C:\x\a.md` and `C:\x\sub\..\a.md` opened twice: two
+  buffers over one file, two dirty flags, last save wins. It now falls back to
+  `fs::canonicalize` on both sides (`App::same_file`), pinned by
+  `the_same_file_spelled_differently_reuses_its_tab`.
+- **Arguments were being dropped.** A second positional argument silently
+  replaced the first, there was no `--` terminator (so a file called
+  `-draft.md` could not be opened at all), and the parsing lived inside `run`,
+  where nothing could test it. `parse()` is now separate and returns a list of
+  files; `editor a.md b.json` opens both as tabs, in order, and the handoff
+  carries the list (newline-separated — a Win32 path cannot contain a newline,
+  so the receiver splits unambiguously) so a second launch with three files
+  opens three tabs in the running window. Four tests in `cli::tests` pin the
+  rules, including that `--` makes a later `--help` a *file*.
+- **Startup did everything twice.** `restore_recent` and `note_recent` were each
+  called twice in `cli::run`; the second pair is gone, along with a duplicate
+  `restore_recent` that rewrote the list after `restore_window`. `--render` and
+  `--pretty` now insist on exactly one FILE instead of rendering an Untitled
+  buffer or ignoring the extra names.
