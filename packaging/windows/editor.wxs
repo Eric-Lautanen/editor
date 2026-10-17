@@ -109,6 +109,28 @@
     <!-- Sensible defaults for ARP metadata. -->
     <Property Id="ARPNOMODIFY" Value="1" /> <!-- replace-don't-tweak: updates come as new MSIs -->
 
+    <!-- No System Restore point for this install: `MSIFASTINSTALL` bit 1 is
+         Microsoft's documented switch for it, and Microsoft's own
+         single-package-authoring example uses the same value.
+
+         This is the "installer sits there doing nothing" report. Windows
+         Installer snapshots the system before copying files whenever the
+         product is not already installed in that context, and on a real
+         machine that silent call is the whole wait: a fresh install of this
+         package measured 13.4 s, 12.4 s of it inside `SRSetRestorePoint`
+         (the log goes straight from "Calling SRSetRestorePoint API ...
+         szDescription: \"Installed Editor\"" to "The call to
+         SRSetRestorePoint API succeeded", with the progress bar on screen the
+         whole time). Reinstalls over an existing version skip it, which is
+         why the stall looks intermittent.
+
+         Editor installs one exe and a set of HKCU rows; a restore point buys
+         back nothing that re-running the MSI or uninstalling does not, and
+         the auto-updater installs often enough that 12 s per version would be
+         the normal experience. Set this back to 0 if you would rather keep
+         the checkpoint. -->
+    <Property Id="MSIFASTINSTALL" Value="1" />
+
     <Feature Id="Main" Title="Editor" Description="The editor and this installer's choices." Level="1">
       <ComponentRef Id="AppExe" />
       <ComponentRef Id="StartMenuShortcut" />
