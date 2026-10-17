@@ -1119,3 +1119,33 @@ Time: 2026-10-12 13:42:24 UTC
   `restore_recent` that rewrote the list after `restore_window`. `--render` and
   `--pretty` now insist on exactly one FILE instead of rendering an Untitled
   buffer or ignoring the extra names.
+
+### Host-capability gating (Oct 2026) — the last `allow(dead_code)` is gone, 390 tests green
+
+The event enum carried an `#[allow(dead_code)]` because a build sees one
+backend, and the variants the other backends construct looked dead. It was
+load-bearing, not stale: Linux never constructs `Pan`/`PanEnd`/`FileOpen`/
+`ThemeChanged`, and macOS never constructs `Pan`/`PanEnd`/`Frame`/
+`ThemeChanged` either. Suppressing that made the vocabulary a lie.
+
+Now the vocabulary tells the truth. A variant exists only where a host can
+produce it (`cfg(any(target_os = …, test))`), the app's exhaustive match
+carries the handler under the same gate, and the touch-selection state that
+only pointer touch can arm — `TouchSel`, `PreviewTouch`, the two `arm_*`
+helpers, the pan handlers, the release coast — follows it out of the Linux and
+macOS builds. `test` is in every gate, so every path is still compiled and
+driven on all three hosts. Nothing is suppressed; a backend that grows a
+capability opts in at the enum, the match arm, and nothing else.
+
+Verified by linting the real targets instead of a cfg simulation:
+`cargo clippy --target x86_64-unknown-linux-gnu` and
+`--target x86_64-apple-darwin`, both `--all-targets -- -D warnings`, are
+clean (they need no linker, which is why they work from a Windows checkout).
+The `editor_check_*` cross-builds cannot verify this: they leave `target_os`
+alone, so on a Windows host the Linux build still lacks `unix` (and vice
+versa) — they were already failing that way before this round.
+
+Three release blockers fell out of the same `-D warnings` run: a `mut` binding
+in `net::rungs` that only Windows uses, the deprecated `io::Error::new` form
+in the MSI stub, and a null-returning `platform::main_window` stub that
+nothing called once the gating above was honest about who owns the window.

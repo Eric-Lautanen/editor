@@ -114,15 +114,20 @@ impl Rung {
 /// leave the bytes in; `timeout` is a whole-request cap in seconds, for the
 /// rungs that take one (the in-process ones bound themselves instead).
 fn rungs(url: &str, out: &Path, timeout: u32) -> Vec<Rung> {
-    let mut v: Vec<Rung> = helpers(url, out, timeout)
-        .into_iter()
-        .map(Rung::Helper)
-        .collect();
+    let helpers = helpers(url, out, timeout).into_iter().map(Rung::Helper);
+    // Windows: urlmon first, and usually only — it is not a child process, so
+    // a check leaves no spawned executable behind for endpoint protection to
+    // comment on. Built per branch rather than pushed into a `mut` vector: the
+    // other two platforms have no first rung to insert, and a `mut` there is
+    // an unused-mut error under `-D warnings`.
     #[cfg(target_os = "windows")]
-    // First, and usually only: it is not a child process, so a check leaves no
-    // spawned executables behind for endpoint protection to comment on.
-    v.insert(0, Rung::UrlMon);
-    v
+    {
+        std::iter::once(Rung::UrlMon).chain(helpers).collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        helpers.collect()
+    }
 }
 
 fn helpers(url: &str, out: &Path, timeout: u32) -> Vec<Helper> {
@@ -216,9 +221,10 @@ fn helpers(url: &str, out: &Path, timeout: u32) -> Vec<Helper> {
 }
 
 /// Obtain `url` into `out` via one rung. Success means a non-empty file is
-/// there afterwards — `certutil` in particular reports some failures in its
-/// output while exiting 0, and an empty download must never be mistaken for an
-/// install asset.
+/// there afterwards — a rung can report success while writing nothing, so the
+/// file itself is the evidence, and an empty download must never be mistaken
+/// for an install asset. `url` is named in that failure for every platform,
+/// including the ones whose rungs carry it inside their own argv.
 fn run(rung: &Rung, url: &str, out: &Path) -> Result<()> {
     let _ = std::fs::remove_file(out);
     match rung {
@@ -228,7 +234,10 @@ fn run(rung: &Rung, url: &str, out: &Path) -> Result<()> {
     }
     match std::fs::metadata(out) {
         Ok(m) if m.len() > 0 => Ok(()),
-        _ => Err(Error::Platform(format!("{} wrote no data", rung.name()))),
+        _ => Err(Error::Platform(format!(
+            "{} wrote no data for {url}",
+            rung.name()
+        ))),
     }
 }
 

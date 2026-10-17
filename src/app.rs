@@ -64,6 +64,10 @@ struct SbDrag {
 /// drive a virtual pointer from where the tap landed, because a moving
 /// finger reports `Pan`, never `MouseMove`. Retired by `PanEnd` (no coast —
 /// a selection drag is not a flick) and by the next press.
+///
+/// Pointer touch is a Windows capability, so this state (like the `Pan`
+/// events that drive it) exists only in that build — see `Event`.
+#[cfg(any(target_os = "windows", test))]
 #[derive(Clone, Copy)]
 struct TouchSel {
     /// Selection anchor the drag extends from.
@@ -78,7 +82,8 @@ struct TouchSel {
 /// A double-tap's row anchor for a finger drag that extends the preview
 /// selection: the counterpart of [`TouchSel`] for read-only panes. A finger
 /// reports `Pan`, never `MouseMove`, so the drag rides its own virtual
-/// pointer from the spot the tap landed.
+/// pointer from the spot the tap landed. Gated exactly like [`TouchSel`].
+#[cfg(any(target_os = "windows", test))]
 #[derive(Clone, Copy)]
 struct PreviewTouch {
     /// Row the double-tap selected; the drag extends from it.
@@ -305,6 +310,7 @@ pub struct App {
     preview_drag: bool,
     /// A double-tap's row anchor for a finger drag extending the preview
     /// selection, mirroring [`TouchSel`] for the editor pane.
+    #[cfg(any(target_os = "windows", test))]
     preview_touch: Option<PreviewTouch>,
     /// The address under the pointer, shown in the status bar after the Copy
     /// button. Kept as the string, not a bool: the bar needs the value.
@@ -352,6 +358,7 @@ pub struct App {
     /// Live overlay-scrollbar drag, if any.
     sb_drag: Option<SbDrag>,
     /// A double-tap's selection armed for a finger drag (see [`TouchSel`]).
+    #[cfg(any(target_os = "windows", test))]
     touch_sel: Option<TouchSel>,
     /// Click counting for double/triple selection: the running count and
     /// where/when (tick) the last press landed.
@@ -419,6 +426,7 @@ impl App {
             preview_word: None,
             preview_drag_row: None,
             preview_drag: false,
+            #[cfg(any(target_os = "windows", test))]
             preview_touch: None,
             hover_link: None,
             last_mouse: (0.0, 0.0),
@@ -434,6 +442,7 @@ impl App {
             geometry_dirty: false,
             geometry_idle: 0,
             sb_drag: None,
+            #[cfg(any(target_os = "windows", test))]
             touch_sel: None,
             clicks: 0,
             last_click: None,
@@ -597,6 +606,7 @@ impl App {
     /// in flight ends (its remaining distance belongs to the wheel, not to
     /// the finger) — the horizontal half of what `scroll_direct` does
     /// vertically.
+    #[cfg(any(target_os = "windows", test))]
     fn pan_horizontal_direct(&mut self, dx: f32) {
         if self.mode != Mode::Preview {
             self.set_h_scroll(self.h_scroll - dx);
@@ -640,6 +650,7 @@ impl App {
     /// release after the finger held still coasts zero and stays put. Pan's
     /// sign flips like every other vertical input: dragging up the screen
     /// moves the content down the document, so the velocity does too.
+    #[cfg(any(target_os = "windows", test))]
     fn coast(&mut self, _vx: f32, vy: f32, host: &mut dyn Host) {
         // Horizontal momentum is dropped on purpose: the coast state lives on
         // the vertical scroller, preview panes have nothing to pan sideways,
@@ -1465,10 +1476,14 @@ impl App {
         self.drag_anchor = None;
         self.preview_drag = false;
         self.preview_drag_row = None;
-        self.preview_touch = None;
         self.sb_drag = None;
-        // A fresh press retires any armed double-tap selection.
-        self.touch_sel = None;
+        // A fresh press retires the previous one's touch state too: an armed
+        // double-tap selection and the preview's row anchor.
+        #[cfg(any(target_os = "windows", test))]
+        {
+            self.preview_touch = None;
+            self.touch_sel = None;
+        }
         // Anything that can change the selection retires the Copy button's
         // "Copied" flash; the Copy branch below re-arms it.
         self.copy_done = false;
@@ -1697,13 +1712,19 @@ impl App {
                     let tab = &mut self.tabs[self.active];
                     tab.editor.select_word(&tab.buffer, pos);
                     self.drag_anchor = tab.editor.selection().map(|(a, _)| a);
-                    self.arm_touch_sel(x, y);
+                    #[cfg(any(target_os = "windows", test))]
+                    {
+                        self.arm_touch_sel(x, y);
+                    }
                 }
                 3.. => {
                     let tab = &mut self.tabs[self.active];
                     tab.editor.select_line(&tab.buffer, pos);
                     self.drag_anchor = tab.editor.selection().map(|(a, _)| a);
-                    self.arm_touch_sel(x, y);
+                    #[cfg(any(target_os = "windows", test))]
+                    {
+                        self.arm_touch_sel(x, y);
+                    }
                 }
                 _ => {
                     self.editor.caret = pos;
@@ -1761,9 +1782,10 @@ impl App {
                     self.preview_drag = row.is_some();
                 }
             }
-            // A double/triple tap is how a finger selects text; the drag that
-            // may follow extends it. A single tap leaves nothing armed.
+            #[cfg(any(target_os = "windows", test))]
             if let Some(anchor) = self.preview_drag_row {
+                // A double/triple tap is how a finger selects text; the drag
+                // that may follow extends it. A single tap arms nothing.
                 self.arm_preview_touch(x, y, anchor);
             }
             host.request_redraw();
@@ -1941,6 +1963,7 @@ impl App {
     /// Arm the double-tap selection for a finger drag (see [`TouchSel`]):
     /// called from the double/triple-click branches, which have just made the
     /// selection the drag would extend.
+    #[cfg(any(target_os = "windows", test))]
     fn arm_touch_sel(&mut self, x: f32, y: f32) {
         if let Some(anchor) = self.editor.selection().map(|(a, _)| a) {
             self.touch_sel = Some(TouchSel {
@@ -1953,6 +1976,7 @@ impl App {
 
     /// Arm the preview counterpart of [`TouchSel`]: a finger drag after a tap
     /// selects rows from `anchor` instead of scrolling.
+    #[cfg(any(target_os = "windows", test))]
     fn arm_preview_touch(&mut self, x: f32, y: f32, anchor: usize) {
         self.preview_touch = Some(PreviewTouch {
             anchor,
@@ -1964,6 +1988,7 @@ impl App {
     /// A finger drag while an editor double-tap's selection is armed extends
     /// that selection instead of scrolling; otherwise it does the same for the
     /// preview. Returns `true` when the pan was consumed.
+    #[cfg(any(target_os = "windows", test))]
     fn on_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
         // A drag extends a selection, so the Copy button's "Copied" flash is
         // no longer about the text that was copied.
@@ -1977,6 +2002,7 @@ impl App {
     /// The editor half of [`App::on_touch_pan`]. The virtual pointer starts
     /// where the tap landed and rides the pan deltas — a moving finger reports
     /// `Pan`, never `MouseMove`.
+    #[cfg(any(target_os = "windows", test))]
     fn on_editor_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
         let Some(mut ts) = self.touch_sel.take() else {
             return false;
@@ -2016,6 +2042,7 @@ impl App {
     /// The preview half of [`App::on_touch_pan`]: rows from the tap's anchor
     /// to the row under the virtual pointer. The same ~1 s recency gate as the
     /// editor keeps a drag that starts long after the tap a scroll.
+    #[cfg(any(target_os = "windows", test))]
     fn on_preview_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
         let Some(mut pt) = self.preview_touch.take() else {
             return false;
@@ -2300,7 +2327,10 @@ impl App {
         self.preview_word = None;
         self.preview_drag = false;
         self.preview_drag_row = None;
-        self.preview_touch = None;
+        #[cfg(any(target_os = "windows", test))]
+        {
+            self.preview_touch = None;
+        }
     }
 
     /// Text of the preview selection, if any: a double-clicked word, or else
@@ -2996,6 +3026,7 @@ impl Handler for App {
                 self.pan_horizontal(dx, host);
                 self.scroll_input(-dy, host);
             }
+            #[cfg(any(target_os = "windows", test))]
             Event::Pan { dx, dy } => {
                 // A double-tap's finger drag extends the selection the tap
                 // made (the touch counterpart of double-click-and-drag);
@@ -3009,6 +3040,7 @@ impl Handler for App {
                 self.pan_horizontal_direct(dx);
                 self.scroll_direct(-dy, host);
             }
+            #[cfg(any(target_os = "windows", test))]
             Event::PanEnd { vx, vy } => {
                 // A selection drag is not a flick: it retires the gesture
                 // without a coast. That goes for a preview selection too.
@@ -3021,13 +3053,16 @@ impl Handler for App {
                 self.coast(vx, vy, host);
             }
             Event::KeyDown { key, mods } => self.on_key(key, mods, host),
+            #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos")), test))]
             Event::Frame => self.on_frame(host),
             Event::MouseDown { x, y, button } => self.on_mouse_down(x, y, button, host),
             Event::MouseMove { x, y } => self.on_mouse_move(x, y, host),
             Event::MouseUp { x, y, button } => self.on_mouse_up(x, y, button, host),
             Event::Text(s) => self.on_text(&s, host),
+            #[cfg(any(target_os = "windows", target_os = "macos", test))]
             Event::FileOpen(path) => self.open_path(path, host),
             Event::Tick => self.on_tick(host),
+            #[cfg(any(target_os = "windows", test))]
             Event::ThemeChanged { dark } => {
                 if !self.theme_manual {
                     self.set_dark(dark);

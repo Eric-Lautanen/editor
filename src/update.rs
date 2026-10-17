@@ -789,8 +789,7 @@ fn windows_hidden_cmd(script: &str) -> std::io::Result<std::process::Child> {
 
 #[cfg(not(windows))]
 fn windows_hidden_cmd(_script: &str) -> std::io::Result<std::process::Child> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
+    Err(std::io::Error::other(
         "the MSI install path is Windows-only",
     ))
 }
@@ -911,7 +910,17 @@ fn relaunch(exe: &std::path::Path, tag: &str) {
 /// Native yes/no per OS, shown only by the silent background check —
 /// `--update` from a terminal needs no permission (the user already asked
 /// for an update by typing it).
-#[cfg(target_os = "windows")]
+///
+/// Each surface is gated on the *backend* the build carries, not on the host
+/// OS: this box's owner comes from `platform::main_window`, which only the
+/// Win32 backend has, and the `editor_check_*` builds compile one backend at
+/// a time to lint it from another host. The three gates below are mutually
+/// exclusive and cover every build, so exactly one surface exists.
+#[cfg(all(
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
+))]
 fn ask_install(tag: &str) -> bool {
     win_dialog(
         &format!(
@@ -922,7 +931,11 @@ fn ask_install(tag: &str) -> bool {
     )
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
+))]
 fn win_dialog(text: &str, caption: &str, yes_no: bool) -> bool {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
@@ -992,7 +1005,11 @@ fn ask_install(tag: &str) -> bool {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(all(
+    any(all(unix, not(target_os = "macos")), editor_check_linux),
+    not(editor_check_win),
+    not(editor_check_macos)
+))]
 fn ask_install(tag: &str) -> bool {
     // The same zenity/kdialog pair the file dialogs use (see
     // `platform::linux`), so on a kit where the user picked dialogs with,
@@ -1008,7 +1025,11 @@ fn ask_install(tag: &str) -> bool {
 
 /// Runs a dialog helper and maps its exit code; `None` = helper not installed
 /// (its name is not on `PATH`), the caller tries the next.
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(all(
+    any(all(unix, not(target_os = "macos")), editor_check_linux),
+    not(editor_check_win),
+    not(editor_check_macos)
+))]
 fn ask_with(helper: &str, args: &[&str]) -> Option<bool> {
     match std::process::Command::new(helper).args(args).status() {
         Ok(s) => Some(s.success()),

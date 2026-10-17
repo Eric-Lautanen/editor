@@ -60,18 +60,18 @@ pub enum CursorShape {
 }
 
 /// Platform-neutral events delivered by `platform::run`.
-/// Grows per milestone: macOS open-file arrives with M9.
 ///
-// Continuous manipulation and theme keys reach the app through whichever
-// backend the executable was built for — Win32 constructs `Pan`/
-// `PanEnd`/`ThemeChanged` from its pointer and `WM_SETTINGCHANGE` paths,
-// X11 constructs `Frame` from its poll loop, AppKit constructs `FileOpen`
-// from Finder — so when the enum is type-checked against one backend the
-// others' variants go unconstructed dead-code. (The cross-build cfgs use
-// the same enum, hence an enum-level allow rather than per-variant: the
-// set differs by target.) It covers construction only; the app's matching
-// arms are exhaustive and lint-free everywhere.
-#[allow(dead_code)]
+/// The vocabulary is the *union* of what the hosts can produce, and a variant
+/// exists only where a host can produce it — the backends differ (only Windows
+/// has pointer touch, only Windows and macOS receive a file from the host
+/// window, only Windows hears about the OS theme flipping, and only Windows and
+/// X11 run a sub-heartbeat frame clock). Gating the variant says that at compile
+/// time: the app's exhaustive match then carries no handler for an event the
+/// host cannot emit, and a platform that grows the capability opts in here and
+/// in the match, in one place each.
+///
+/// `test` is in every gate so the tests that drive platform-shaped input keep
+/// running on every host, not just the one that can produce it.
 #[derive(Clone, Debug)]
 pub enum Event {
     Resized {
@@ -110,6 +110,7 @@ pub enum Event {
     /// Continuous manipulation: a finger (or pen) dragging the content. This
     /// tracks the input exactly — a glide in the way of a finger reads as lag
     /// — and on release hands over to [`Event::PanEnd`].
+    #[cfg(any(target_os = "windows", test))]
     Pan {
         dx: f32,
         dy: f32,
@@ -117,20 +118,26 @@ pub enum Event {
     /// The finger came up, with its velocity across the last ~100 ms in client
     /// px/ms. A quick flick coasts from there; a release after the finger held
     /// still reports ~0 and stops dead.
+    #[cfg(any(target_os = "windows", test))]
     PanEnd {
         vx: f32,
         vy: f32,
     },
     /// A file opened by the host: drag-and-drop (anywhere on the window) or a
     /// macOS open-file message. The app opens it as a tab.
+    #[cfg(any(target_os = "windows", target_os = "macos", test))]
     FileOpen(std::path::PathBuf),
     /// Periodic host heartbeat (e.g. Win32 WM_TIMER) for drag auto-scroll.
     Tick,
     /// One animation frame, while the app has asked the host for them
     /// (`Host::set_animating`): the heartbeat is far too slow to look smooth,
     /// so the platform runs a faster clock for as long as something is moving.
+    /// AppKit has no such clock here, and the app steps its animations from
+    /// the heartbeat instead — see the default `Host::set_animating`.
+    #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos")), test))]
     Frame,
     /// The OS light/dark preference changed (e.g. WM_SETTINGCHANGE).
+    #[cfg(any(target_os = "windows", test))]
     ThemeChanged {
         dark: bool,
     },

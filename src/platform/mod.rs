@@ -52,8 +52,11 @@ mod windows;
 /// Exists for one caller: `update::win_dialog` owns the update prompt to this
 /// window, because a message box with no owner mixes with the app's own window
 /// in z-order and can open *behind* it — which looks exactly like no prompt at
-/// all. Only Windows backends have a handle to give; the others drive their
-/// prompts through the desktop's own dialog helper, which places them itself.
+/// all. That caller is Windows-only, so this is too: the null-returning stub
+/// the other two backends used to get was never called by anything (dead code
+/// under `-D warnings`), and a handle that is always null is not an API worth
+/// carrying. Linux and macOS drive their prompts through the desktop's own
+/// dialog helper, which places them itself.
 #[cfg(all(
     any(target_os = "windows", editor_check_win),
     not(editor_check_linux),
@@ -61,15 +64,6 @@ mod windows;
 ))]
 pub fn main_window() -> *mut std::ffi::c_void {
     windows::main_window()
-}
-
-#[cfg(not(all(
-    any(target_os = "windows", editor_check_win),
-    not(editor_check_linux),
-    not(editor_check_macos)
-)))]
-pub fn main_window() -> *mut std::ffi::c_void {
-    std::ptr::null_mut()
 }
 
 #[cfg(any(

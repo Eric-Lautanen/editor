@@ -59,6 +59,7 @@ const COAST_MIN_PX_PER_MS: f32 = 0.06;
 /// cap exists to stop a violent fling ripping past hundreds of screens, not
 /// to slow the fast scroll a power user is asking for. (A release this hard
 /// carries ~1600 px of travel at the current decay.)
+#[cfg(any(target_os = "windows", test))]
 const COAST_MAX_PX_PER_MS: f32 = 8.0;
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -106,6 +107,7 @@ impl ScrollState {
     /// Near-zero velocities start nothing (a release after the finger held
     /// still simply stops, like any other direct manipulation). Any glide in
     /// flight is abandoned — the finger's momentum replaces it.
+    #[cfg(any(target_os = "windows", test))]
     pub fn coast_from(&mut self, v: f32) {
         self.target = self.offset;
         // Deliberately not gated on `reduce_motion`: the coast is the finger's
