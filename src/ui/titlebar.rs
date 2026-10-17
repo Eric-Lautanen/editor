@@ -21,6 +21,14 @@ const TAB_MAX_W: f32 = 180.0;
 const TAB_MIN_W: f32 = 56.0;
 /// Left edge of the first tab: no wordmark, so tabs start at the padding.
 const TABS_X: f32 = 12.0;
+/// The tab's own chrome, in logical px. A tab is `name  save  ×`, so its
+/// width is the label's inset, the label, the air before the buttons, and the
+/// buttons — the save square only counts while it is there.
+const TAB_PAD_L: f32 = 10.0;
+const TAB_PAD_R: f32 = 4.0;
+const LABEL_GAP: f32 = 8.0;
+const TAB_BTN: f32 = 20.0;
+const TAB_BTN_GAP: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitleHit {
@@ -55,7 +63,15 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
     let avail = (width - TABS_X * scale - 3.0 * BTN_W * scale).max(0.0);
     let ideal: Vec<f32> = names
         .iter()
-        .map(|(n, _)| fonts.measure(FontStyle::Regular, n, size) + 36.0 * scale)
+        .map(|(n, dirty)| {
+            fonts.measure(FontStyle::Regular, n, size)
+                + (TAB_PAD_L + LABEL_GAP + TAB_BTN + TAB_PAD_R) * scale
+                + if *dirty {
+                    (TAB_BTN + TAB_BTN_GAP) * scale
+                } else {
+                    0.0
+                }
+        })
         .collect();
     let sum: f32 = ideal.iter().sum();
     let shrink = if sum > avail && sum > 0.0 {
@@ -78,15 +94,19 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
             w.clamp(TAB_MIN_W * scale, TAB_MAX_W * scale)
         };
         tabs.push(Rect::new(x, tab_y, w, TAB_H * scale));
-        // Close/save zones: 20 px wide and the tab's full height, so a
-        // finger that lands high or low still hits them (the painted glyph
-        // stays centered).
-        let cs = 20.0 * scale;
-        let close = Rect::new(x + w - cs - 4.0 * scale, tab_y, cs, TAB_H * scale);
-        // The save button sits just left of the close ×, and only exists for
-        // a tab with unsaved edits.
+        // Close/save squares: one button wide and the tab's full height, so a
+        // finger that lands high or low still hits them (the painted mark
+        // stays centred). The save button sits just left of the close × and
+        // only exists for a tab with unsaved edits.
+        let cs = TAB_BTN * scale;
+        let close = Rect::new(x + w - TAB_PAD_R * scale - cs, tab_y, cs, TAB_H * scale);
         saves.push(if names[i].1 {
-            Some(Rect::new(close.x - cs - 2.0 * scale, close.y, cs, cs))
+            Some(Rect::new(
+                close.x - TAB_BTN_GAP * scale - cs,
+                tab_y,
+                cs,
+                TAB_H * scale,
+            ))
         } else {
             None
         });
@@ -143,7 +163,7 @@ pub fn paint(
     // bar_baseline).
     let bar_baseline = |r: Rect| (r.y + (r.h - m.height()) / 2.0 + m.ascent).round();
 
-    for (i, (name, dirty)) in names.iter().enumerate() {
+    for (i, (name, _)) in names.iter().enumerate() {
         let r = lay.tabs[i];
         let is_active = i == active;
         let hovered = matches!(hover, Some(TitleHit::Tab(j)) if j == i);
@@ -161,13 +181,21 @@ pub fn paint(
             );
         }
         // No dirty dot any more: the save button below is the edited marker.
-        let close_w = 20.0 * scale;
-        let reserve = if *dirty { 2.0 * close_w } else { close_w };
-        let label = ellipsize(fonts, name, r.w - reserve - 10.0 * scale, size);
+        // The label gets exactly the room left of the first button, less the
+        // air that keeps an ellipsis from touching it — never a guessed
+        // reserve that let a long name run under the floppy.
+        let first_button = lay.saves[i].map_or(lay.closes[i].x, |sr| sr.x);
+        let label_right = first_button - LABEL_GAP * scale;
+        let label = ellipsize(
+            fonts,
+            name,
+            (label_right - (r.x + TAB_PAD_L * scale)).max(0.0),
+            size,
+        );
         canvas.draw_text(
             fonts,
             &label,
-            r.x + 8.0 * scale,
+            r.x + TAB_PAD_L * scale,
             bar_baseline(r),
             TextSpec {
                 size,
@@ -185,17 +213,19 @@ pub fn paint(
                 scale,
             );
         }
+        // The tab's × is the same two-bar cross the window's close button
+        // draws: the "×" glyph sits high and slightly right in Liberation, so
+        // the tab × and the window × did not read as one row of chrome.
         let close_hover = matches!(hover, Some(TitleHit::TabClose(j)) if j == i);
-        canvas.draw_text(
-            fonts,
-            "×",
-            lay.closes[i].x + 2.0 * scale,
-            bar_baseline(lay.closes[i]),
-            TextSpec {
-                size: 13.0 * scale,
-                style: FontStyle::Regular,
-                color: if close_hover { theme.fg } else { theme.muted },
-            },
+        if close_hover {
+            button_wash(canvas, lay.closes[i], theme);
+        }
+        paint_x(
+            canvas,
+            lay.closes[i],
+            8.0 * scale,
+            scale.max(1.0).round(),
+            if close_hover { theme.fg } else { theme.muted },
         );
     }
 
@@ -230,34 +260,43 @@ pub fn paint(
     // close: × drawn from bars, like the dash and square above — the text
     // pipeline's "×" glyph is stroked thinner and sits off-centre (Liberation
     // puts it high and slightly right), so the three buttons did not read as
-    // one row of chrome. Two crossed diagonal bars, each as long as the
-    // maximize square (10px) and stroked at the same weight `t`, drawn as
-    // corner-to-corner runs of unit steps; the round()s make it crisp the
-    // same way fill_rect does.
-    let cs = 10.0 * scale;
-    let (cx, cyc) = (
-        lay.close.x + lay.close.w / 2.0,
-        lay.close.y + lay.close.h / 2.0,
-    );
-    let (hx, hy) = (cx - cs / 2.0, cyc - cs / 2.0);
+    // one row of chrome. `paint_x` is shared with the tab close.
     let close_color = if hover == Some(TitleHit::Close) {
         Color::hex(0xFFFFFF)
     } else {
         theme.fg
     };
-    for (dx0, dy0, dx1, dy1) in [
-        (hx, hy, hx + cs, hy + cs), // \ diagonal
-        (hx, hy + cs, hx + cs, hy), // / diagonal
-    ] {
-        let steps = (cs / t).ceil().max(1.0) as i32;
+    paint_x(canvas, lay.close, 10.0 * scale, t, close_color);
+    canvas.set_clip(None);
+}
+
+/// The faint pill a tab button wears under the pointer — the save icon's
+/// hover, reused by the close × so the two buttons answer alike.
+fn button_wash(canvas: &mut Canvas, r: Rect, theme: &Theme) {
+    let scale = (r.h / TAB_H).max(1.0).round();
+    canvas.fill_rounded_rect(
+        r,
+        4.0 * scale,
+        Color::rgba(theme.rule.r, theme.rule.g, theme.rule.b, 90),
+    );
+}
+
+/// Two crossed bars, `s` wide and `t` thick, centred in `r` — the same
+/// font-independent × the window buttons and the tab close share.
+fn paint_x(canvas: &mut Canvas, r: Rect, s: f32, t: f32, color: Color) {
+    let (x0, y0) = (
+        (r.x + (r.w - s) / 2.0).round(),
+        (r.y + (r.h - s) / 2.0).round(),
+    );
+    for (ax, ay, bx, by) in [(x0, y0, x0 + s, y0 + s), (x0, y0 + s, x0 + s, y0)] {
+        let steps = (s / t).ceil().max(1.0) as i32;
         for k in 0..=steps {
             let f = k as f32 / steps as f32;
-            let px = (dx0 + (dx1 - dx0) * f).round();
-            let py = (dy0 + (dy1 - dy0) * f).round();
-            canvas.fill_rect(Rect::new(px, py, t, t), close_color);
+            let px = (ax + (bx - ax) * f).round();
+            let py = (ay + (by - ay) * f).round();
+            canvas.fill_rect(Rect::new(px, py, t, t), color);
         }
     }
-    canvas.set_clip(None);
 }
 
 /// Paint the floppy-disk "save" affordance inside the square `r`.
@@ -274,14 +313,10 @@ fn paint_save_icon(
     scale: f32,
 ) {
     if hover {
-        canvas.fill_rounded_rect(
-            r,
-            4.0 * scale,
-            Color::rgba(theme.rule.r, theme.rule.g, theme.rule.b, 90),
-        );
+        button_wash(canvas, r, theme);
     }
     let t = scale.max(1.0).round();
-    let s = 11.0 * scale;
+    let s = 10.0 * scale;
     let x = (r.x + (r.w - s) / 2.0).round();
     let y = (r.y + (r.h - s) / 2.0).round();
     // Body outline (the floppy shell).
@@ -369,6 +404,40 @@ mod tests {
         assert_eq!(
             hit_test(&lay, 60.0, lay.bar.bottom() + 4.0),
             TitleHit::Client
+        );
+    }
+
+    #[test]
+    fn a_dirty_tab_makes_room_for_its_name_and_both_buttons() {
+        // The report: the floppy sat on top of the file name (the label's
+        // "reserve" was a guess, and the ideal width ignored the button).
+        let fonts = FontSystem::load_embedded();
+        let names = vec![
+            ("sample.md".to_string(), true),
+            ("sample.md".to_string(), false),
+        ];
+        let lay = layout(&fonts, &names, 900.0, 1.0);
+        let text = fonts.measure(FontStyle::Regular, "sample.md", 12.0);
+        let save = lay.saves[0].expect("dirty tab");
+        assert!(
+            save.x - (lay.tabs[0].x + TAB_PAD_L) >= text + LABEL_GAP - 0.5,
+            "the floppy leaves no gap after the whole name"
+        );
+        assert!(
+            save.right() + TAB_BTN_GAP <= lay.closes[0].x + 0.5,
+            "the floppy and the × overlap"
+        );
+        assert!(
+            (lay.closes[0].right() - (lay.tabs[0].right() - TAB_PAD_R)).abs() <= 0.5,
+            "the × is flush with the tab's right padding"
+        );
+        assert_eq!(save.h, lay.tabs[0].h, "the button is the tab's full height");
+        // Only the extra button separates a dirty tab from a clean one.
+        assert!(
+            (lay.tabs[0].w - lay.tabs[1].w - (TAB_BTN + TAB_BTN_GAP)).abs() <= 0.5,
+            "a dirty tab is one button wider: {} vs {}",
+            lay.tabs[0].w,
+            lay.tabs[1].w
         );
     }
 
