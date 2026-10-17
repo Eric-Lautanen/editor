@@ -186,6 +186,29 @@ impl PaneScroll {
     }
 }
 
+/// A word picked out of the preview by a double-click.
+///
+/// Preview selection is row-granular (a drag takes whole rows), so a word needs
+/// its own shape: the row it sits in, the exact span it occupies — for the
+/// highlight — and the text, which is what Copy hands to the clipboard.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordSel {
+    /// Index into the row list the word was found in.
+    pub row: usize,
+    /// Painted span, in document space (baseline-relative `y` comes from the
+    /// row).
+    pub x0: f32,
+    pub x1: f32,
+    pub text: String,
+}
+
+/// A character that a double-click treats as part of a word. Deliberately the
+/// editor's idea of one (`is_alphanumeric` plus underscore), so the same
+/// gesture picks the same text in both panes.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
 /// One visual row of the preview: text ops grouped by baseline. Backs
 /// drag-selection in Preview mode.
 #[derive(Clone, Debug)]
@@ -247,6 +270,97 @@ impl PreviewView {
     /// Index of the row containing document-space `y`, if any.
     pub fn row_at(&self, rows: &[Row], y: f32) -> Option<usize> {
         rows.iter().position(|r| y >= r.top && y < r.bottom)
+    }
+
+    /// The word under a document-space point (`x`, `doc_y`), for the
+    /// double-click that selects one. `None` over blank space, over the gap
+    /// past a row's text, and over whitespace between words — callers fall
+    /// back to the row there, which keeps every double-click selecting
+    /// *something*.
+    ///
+    /// Runs once per double-click, not per paint, so the allocations here
+    /// (one `Vec` of chars, one `String` for the word) are not a hot path.
+    pub fn word_at(&self, fonts: &FontSystem, rows: &[Row], x: f32, doc_y: f32) -> Option<WordSel> {
+        let row = rows
+            .iter()
+            .position(|r| doc_y >= r.top && doc_y < r.bottom)?;
+        // The text op under the pointer, in reverse paint order (the topmost
+        // run wins where two overlap, which is how `action_at` resolves hits
+        // too). A row can be several ops — bold, code, plain — and the word
+        // comes out of whichever one the pointer is actually on.
+        let mut hit = None;
+        for op in self.list.ops.iter().rev() {
+            if let DrawOp::Text {
+                x: ox,
+                y: oy,
+                text,
+                size,
+                style,
+                ..
+            } = op
+            {
+                if text.is_empty() || *oy < rows[row].top || *oy > rows[row].bottom {
+                    continue;
+                }
+                if x >= *ox && x <= *ox + fonts.measure(*style, text, *size) {
+                    hit = Some((text.as_str(), *ox, *style, *size));
+                    break;
+                }
+            }
+        }
+        let (text, ox, style, size) = hit?;
+        let chars: Vec<char> = text.chars().collect();
+        // Which character is under `x`: walk the advances, which is exact
+        // where measuring prefixes and subtracting is not.
+        let rel = x - ox;
+        let mut acc = 0.0;
+        let mut idx = None;
+        for (i, ch) in chars.iter().enumerate() {
+            let adv = fonts.advance(style, *ch, size);
+            if rel < acc + adv {
+                idx = Some(i);
+                break;
+            }
+            acc += adv;
+        }
+        let idx = idx?;
+        let clicked = chars[idx];
+        // A double-click on a space has nothing to take; punctuation takes its
+        // own run, so "..." or "--" highlights as a unit instead of nothing.
+        if clicked.is_whitespace() {
+            return None;
+        }
+        let same = |c: char| {
+            if is_word_char(clicked) {
+                is_word_char(c)
+            } else {
+                !c.is_whitespace() && !is_word_char(c)
+            }
+        };
+        let mut start = idx;
+        while start > 0 && same(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = idx + 1;
+        while end < chars.len() && same(chars[end]) {
+            end += 1;
+        }
+        let x0 = ox
+            + chars[..start]
+                .iter()
+                .map(|c| fonts.advance(style, *c, size))
+                .sum::<f32>();
+        let x1 = x0
+            + chars[start..end]
+                .iter()
+                .map(|c| fonts.advance(style, *c, size))
+                .sum::<f32>();
+        Some(WordSel {
+            row,
+            x0,
+            x1,
+            text: chars[start..end].iter().collect(),
+        })
     }
 
     /// Hit action under a document-space point (`x`, `doc_y`), topmost first.

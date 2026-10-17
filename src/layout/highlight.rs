@@ -222,6 +222,43 @@ fn tint_yaml(line: &str, theme: &Theme) -> Vec<(String, Color)> {
     vec![(line.to_string(), theme.fg)]
 }
 
+/// Severity class of a log line's level word.
+///
+/// One definition for both the tint and the status-bar counts — they used to
+/// keep separate copies of the level lists and disagree by construction. The
+/// comparison is ASCII-case-insensitive on the borrowed word, so a log line
+/// costs no case-folding allocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Other,
+}
+
+/// Classify `word` (already stripped of punctuation) as a log level.
+pub fn level_of(word: &str) -> Level {
+    const ERROR: [&str; 7] = [
+        "ERROR", "ERR", "FATAL", "CRIT", "CRITICAL", "FAIL", "FAILED",
+    ];
+    const WARN: [&str; 2] = ["WARN", "WARNING"];
+    const INFO: [&str; 2] = ["INFO", "NOTICE"];
+    const DEBUG: [&str; 2] = ["DEBUG", "TRACE"];
+    let eq = |set: &[&str]| set.iter().any(|k| k.eq_ignore_ascii_case(word));
+    if eq(&ERROR) {
+        Level::Error
+    } else if eq(&WARN) {
+        Level::Warn
+    } else if eq(&INFO) {
+        Level::Info
+    } else if eq(&DEBUG) {
+        Level::Debug
+    } else {
+        Level::Other
+    }
+}
+
 fn tint_log(line: &str, theme: &Theme) -> Vec<(String, Color)> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -246,26 +283,17 @@ fn tint_log(line: &str, theme: &Theme) -> Vec<(String, Color)> {
             rest = &rest[prefix..];
         }
     }
-    // First bare word: a known level colors the whole tail's head word.
-    let words: Vec<&str> = rest.split_whitespace().collect();
-    if let Some(first) = words.first() {
-        let level = first
-            .trim_matches(|c: char| !c.is_alphanumeric())
-            .to_uppercase();
-        let color = if [
-            "ERROR", "ERR", "FATAL", "CRIT", "CRITICAL", "FAIL", "FAILED",
-        ]
-        .contains(&level.as_str())
-        {
-            Some(theme.error)
-        } else if ["WARN", "WARNING"].contains(&level.as_str()) {
-            Some(theme.json_number)
-        } else if ["INFO", "NOTICE"].contains(&level.as_str()) {
-            Some(theme.json_key)
-        } else if ["DEBUG", "TRACE"].contains(&level.as_str()) {
-            Some(theme.muted)
-        } else {
-            None
+    // First bare word: a known level colors the whole tail's head word. The
+    // iterator is consumed one word at a time — collecting the words only to
+    // read the first one allocated a Vec per log line.
+    if let Some(first) = rest.split_whitespace().next() {
+        let level = first.trim_matches(|c: char| !c.is_alphanumeric());
+        let color = match level_of(level) {
+            Level::Error => Some(theme.error),
+            Level::Warn => Some(theme.json_number),
+            Level::Info => Some(theme.json_key),
+            Level::Debug => Some(theme.muted),
+            Level::Other => None,
         };
         if let Some(color) = color {
             let start = rest.find(first).unwrap_or(0);
@@ -290,7 +318,7 @@ pub fn layout(buf: &Buffer, width: f32, ctx: &Ctx, kind: Kind, code_lang: &str) 
     let mut ops = Vec::new();
     let mut y = p.pad;
     for i in 0..buf.line_count() {
-        let line = buf.line(i).replace('\t', "    ");
+        let line = text::expand_tabs(buf.line(i));
         let runs = tint_line(&line, kind, code_lang, ctx.theme);
         // Char offsets of each run for slicing wrapped rows.
         let mut offsets = Vec::with_capacity(runs.len() + 1);
@@ -313,15 +341,19 @@ pub fn layout(buf: &Buffer, width: f32, ctx: &Ctx, kind: Kind, code_lang: &str) 
                 if piece.is_empty() {
                     continue;
                 }
+                // Measure before the op takes ownership: cloning the piece
+                // just to keep a copy for `measure` doubled the run count in
+                // allocations on every laid-out row.
+                let w = ctx.fonts.measure(style, &piece, p.size);
                 ops.push(DrawOp::Text {
                     x: pen,
                     y: baseline,
-                    text: piece.clone(),
+                    text: piece,
                     size: p.size,
                     style,
                     color: *color,
                 });
-                pen += ctx.fonts.measure(style, &piece, p.size);
+                pen += w;
             }
             y += p.line_h;
         }

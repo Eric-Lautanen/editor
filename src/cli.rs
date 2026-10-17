@@ -1,6 +1,7 @@
 use crate::{
     app::{App, Mode},
     core::file_kind::FileKind,
+    crash,
     error::{Error, Result},
     parse::{json, jsonl},
     platform, settings, update,
@@ -127,6 +128,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
     } else {
         app.set_dark(platform::system_prefers_dark());
     }
+    // The OS's reduce-motion switch, read once like the theme. The app's own
+    // preference (there isn't one) would win here if it ever gains one.
+    app.set_reduce_motion(platform::prefers_reduced_motion());
     // Restore the last session's tabs and view unless a file was given.
     if o.file.is_none() && !session.files.is_empty() {
         let mode = match session.mode {
@@ -161,6 +165,14 @@ pub fn run(args: Vec<String>) -> Result<()> {
     app.restore_recent(&session.recent);
     if let Some(f) = &o.file {
         app.note_recent(f);
+    }
+    // A crash report left by an earlier run is worth naming: the file is the
+    // only witness a stripped, console-less release build leaves behind (see
+    // src/crash.rs). Set last, so nothing in the startup path overwrites it —
+    // and it clears itself on the user's first action, like every other
+    // status hint.
+    if let Some(report) = crash::latest() {
+        app.status_extra = format!("previous run crashed — report: {}", report.display());
     }
     if o.pretty {
         return pretty_print(o.file.as_deref());

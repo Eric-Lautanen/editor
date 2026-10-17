@@ -7,6 +7,7 @@
 mod app;
 mod cli;
 mod core;
+mod crash;
 mod error;
 mod gfx;
 mod layout;
@@ -16,6 +17,8 @@ mod mem;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mem::Tracked = mem::Tracked;
 mod parse;
+#[cfg(test)]
+mod perf;
 mod platform;
 #[cfg(test)]
 mod scratch_test;
@@ -26,6 +29,10 @@ mod update;
 // src/update.rs for the whole self-update story.
 
 fn main() {
+    // Before anything else: a release build has no console and aborts on
+    // panic, so without this hook a crash leaves nothing behind (see
+    // src/crash.rs).
+    crash::install();
     let code = match cli::run(std::env::args().skip(1).collect()) {
         Ok(()) => 0,
         Err(e) => {

@@ -150,14 +150,28 @@ pub fn run(handler: impl Handler + 'static) -> Result<()> {
 /// the friendly thing rather than spawning a duplicate. `cli::run` calls
 /// this right before `platform::run`.
 pub fn forward_to_running(file: Option<&std::path::Path>) -> Result<bool> {
-    #[cfg(any(target_os = "windows", editor_check_win))]
+    // Gated on the *selected backend*, not on the host: the `editor_check_*`
+    // cfgs exist to type-check one backend from another OS, and a bare
+    // `target_os = "windows"` arm would call `backend::handoff_to_running`
+    // against the Linux or macOS module — which has no such function. The
+    // cfg names below are exactly the ones that pick `windows as backend`
+    // (see the `use ... as backend` block above), so the two cannot disagree.
+    #[cfg(all(
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
+    ))]
     {
         // SAFETY: the FFI here is the platform's own single-instance plumbing
         // (mutex + FindWindow + SendMessage), none of which touches Rust
         // invariants; see `windows::handoff_to_running`.
         unsafe { backend::handoff_to_running(file) }
     }
-    #[cfg(not(any(target_os = "windows", editor_check_win)))]
+    #[cfg(not(all(
+        any(target_os = "windows", editor_check_win),
+        not(editor_check_linux),
+        not(editor_check_macos)
+    )))]
     {
         // The linux/macos backends do the same trick (they open at their
         // window-creation site — same as the win one) once their GUI (M8/M9)
@@ -225,6 +239,20 @@ pub(crate) fn title_reachable(
     let overlap_w = (x + w as i32).min(sx + sw) - x.max(sx);
     let overlap_h = (y + strip).min(sy + sh) - y.max(sy);
     overlap_w >= REACHABLE_MIN_W.min(w as i32) && overlap_h >= REACHABLE_MIN_H.min(strip)
+}
+
+/// Does the OS ask apps to reduce motion?
+///
+/// The accessibility switch by another name on each platform: macOS's Reduce
+/// Motion, Windows' "Show animations in Windows", GNOME's `enable-animations`.
+/// Read once at startup — like the theme preference, a change mid-session needs
+/// a restart to be picked up.
+///
+/// Deliberately conservative: anything other than an explicit "reduce" answer
+/// (an absent key, a desktop that is not GNOME, a probe that fails) reports
+/// `false`, so the app only stops animating when it was actually asked to.
+pub fn prefers_reduced_motion() -> bool {
+    backend::prefers_reduced_motion()
 }
 
 /// Thickness (logical 96-dpi px) of the widest strip along each window border

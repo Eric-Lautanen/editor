@@ -851,12 +851,26 @@ survived restarts (theme, mode, tabs); the window did not.
   selection* instead of scrolling, riding a virtual pointer from the tap spot (a moving
   finger reports `Pan`, never `MouseMove`). `PanEnd` retires the gesture with no coast —
   a selection drag is not a flick. A later drag scrolls as before.
-- **A Copy button on the status bar** (`ui/statusbar.rs`, `app.rs`): far left, only while
-  a selection exists (editor selection or preview rows), accent-tinted, full bar height;
-  pressing it copies and says "copied" in the status text.
+- **The status bar reads left to right** (`ui/statusbar.rs`, `app.rs`): the document's
+  own facts (`Markdown · 186 lines · 100%`) at the far left in every mode, then the
+  contextual detail (caret in Edit, a parse error, "reloaded"), then the accent-tinted
+  Copy button — full bar height, only while a selection exists — and last the address
+  of the link under the pointer. The bar describes what is under the eye, it is not a
+  log: clicking a link no longer writes its address there, hovering does.
+- **Copy acknowledges itself where it was pressed** (`app.rs`): the label becomes
+  "Copied" until the selection changes (any press, key, typed text or finger drag),
+  then back to "Copy"; with nothing selected the button is gone. No second message in
+  another corner of the bar.
+- **Preview clicks speak the editor's language** (`app.rs`, `ui/preview_view.rs`): one
+  click clears, two select the word under the pointer (`PreviewView::word_at` measures
+  the exact span from the op's advances, falling back to the row on white space), three
+  select the row. A press that turns into a drag still selects the rows it crosses, so
+  drag-select is unchanged; on touch the double-tap arms the row anchor and the pan
+  after it extends the selection, retired by `PanEnd` with no coast.
 - Tests: narrowing equals the full search (append, append, backspace, edit-then-rescan),
   the × and Find button toggle the bar, double-tap-drag extends without scrolling or
-  coasting, the Copy button appears with a selection and copies. 329 tests,
+  coasting, the Copy button sits after the data and says "Copied", preview clicks clear/word/row,
+  a finger drag after a preview double-tap selects rows. 368 tests,
   `clippy --all-targets` and `rustfmt --check` clean.
 - **Editor geometry is O(line), not O(buffer)** (`layout/text.rs`): the editor pane never
   wraps, so `hit_test` jumps straight to the clicked line, `caret_point` to the caret's

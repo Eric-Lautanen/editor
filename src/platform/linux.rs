@@ -575,6 +575,18 @@ pub fn system_prefers_dark() -> bool {
     out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("dark"))
 }
 
+/// Is GNOME (or any desktop that honours it) asked to reduce motion?
+///
+/// `enable-animations` is the GTK/GNOME-wide switch; `gsettings` missing or a
+/// non-GNOME desktop leaves the answer `false`, which keeps the app's own
+/// animations on rather than guessing.
+pub fn prefers_reduced_motion() -> bool {
+    let out = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "enable-animations"])
+        .output();
+    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("false"))
+}
+
 /// The widest manual edge-resize band (px) this backend claims, exposed through
 /// `platform::edge_grip` so `App` keeps its overlay scrollbars clear of it.
 pub fn edge_grip() -> f32 {

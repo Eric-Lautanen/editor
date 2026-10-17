@@ -623,6 +623,13 @@ mod ffi {
         pub fn get_cursor_pos(pt: *mut Point) -> i32;
         #[link_name = "SetTimer"]
         pub fn set_timer(hwnd: Hwnd, id: usize, ms: u32, proc: *const c_void) -> usize;
+        #[link_name = "SystemParametersInfoW"]
+        pub fn system_parameters_info_w(
+            action: u32,
+            param: u32,
+            data: *mut c_void,
+            win_ini: u32,
+        ) -> i32;
         #[link_name = "CreateWaitableTimerExW"]
         pub fn create_waitable_timer_ex_w(
             attrs: *const c_void,
@@ -1308,6 +1315,26 @@ fn write_std(handle_id: u32, s: &str) {
             close_handle(h);
         }
     }
+}
+
+/// Is "Show animations in Windows" switched off?
+///
+/// `SPI_GETCLIENTAREAANIMATION` is the flag behind Settings → Accessibility →
+/// Visual effects → Animation effects. A failed call reports animations on:
+/// the app should only drop them when the system actually said so.
+pub fn prefers_reduced_motion() -> bool {
+    /// `SPI_GETCLIENTAREAANIMATION` (see winuser.h).
+    const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+    let mut on: i32 = 1;
+    let ok = unsafe {
+        system_parameters_info_w(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            &mut on as *mut i32 as *mut c_void,
+            0,
+        )
+    };
+    ok != 0 && on == 0
 }
 
 /// The Windows dark-mode preference: `AppsUseLightTheme` (0 = dark).
@@ -2130,6 +2157,22 @@ pub(crate) unsafe fn handoff_to_running(file: Option<&std::path::Path>) -> Resul
     Ok(false)
 }
 
+/// Per-window margins for `DwmExtendFrameIntoClientArea` (dwmapi).
+/// -1 on all sides removes the DWM-drawn non-client sheet entirely while
+/// keeping resize and snap: the documented borderless idiom.
+#[repr(C)]
+struct Margins {
+    cx_left_width: i32,
+    cx_right_width: i32,
+    cy_top_height: i32,
+    cy_bottom_height: i32,
+}
+
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmExtendFrameIntoClientArea(hwnd: Hwnd, margins: *mut Margins) -> i32;
+}
+
 pub fn run(handler: Box<dyn Handler>) -> Result<()> {
     unsafe {
         // Best effort: fails harmlessly on pre-1703 Windows 10.
@@ -2219,6 +2262,37 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         }
         drag_accept_files(hwnd, 1);
         register_touch_window(hwnd, 0);
+        // Kill the DWM non-client sheet: with WS_THICKFRAME the first DWM
+        // composition draws the OS frame around the still-blank surface — the
+        // "white window with a thick gray border" a double-clicked file opens
+        // into while the first client paint catches up. Margins of -1 drop
+        // every non-client visual; resize and snap keep working (the resize
+        // edges stay because WM_NCHITTEST claims them, not the frame).
+        let mut margins = Margins {
+            cx_left_width: -1,
+            cx_right_width: -1,
+            cy_top_height: -1,
+            cy_bottom_height: -1,
+        };
+        DwmExtendFrameIntoClientArea(hwnd, &mut margins);
+        // First frame before first sight: size the canvas, tell the app the
+        // geometry (its WM_SIZE has not fired yet — the window is still
+        // hidden), and let it paint through UpdateWindow. When ShowWindow
+        // finally composes, the redirection surface already holds the
+        // document: no white flash, and nothing left for the border-stripping
+        // NCCALCSIZE pass to mix a bare frame in front of.
+        (*state).canvas.resize(win_w as usize, win_h as usize);
+        dispatch(
+            &mut *state,
+            hwnd,
+            Event::Resized {
+                width: win_w as usize,
+                height: win_h as usize,
+                scale: dpi_scale(hwnd),
+            },
+        );
+        invalidate_rect(hwnd, null(), 0);
+        update_window(hwnd);
         set_timer(hwnd, TIMER_TICK, 40, null());
         if !icon.is_null() {
             // The class icon covers most of the shell; WM_SETICON is what the
@@ -2228,9 +2302,10 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         }
         // A session that ended maximized opens maximized — at the normal rect,
         // so un-maximizing lands where the user left it (and the rect the app
-        // keeps for the next restore is never the work area).
+        // keeps for the next restore is never the work area). The maximized
+        // resize fires its own WM_SIZE on show; the pre-painted frame holds
+        // until the resized one lands.
         show_window(hwnd, if maximized { SW_MAXIMIZE } else { SW_SHOW });
-        update_window(hwnd);
 
         let mut msg: Msg = mem::zeroed();
         loop {

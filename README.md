@@ -112,6 +112,10 @@ Grab the latest build from
 
 Every release publishes a `SHA256SUMS` manifest listing the SHA-256 of each
 asset; verify the file you download against it if you want to check it yourself.
+The Windows build is Authenticode-signed and the macOS bundle is signed and
+notarized when the release workflow has its signing secrets configured (see
+[packaging/SIGNING.md](packaging/SIGNING.md)); without them the binaries are
+unsigned and the OS will show its usual unknown-publisher warning.
 
 ## Install
 
@@ -191,15 +195,44 @@ executable. `editor --version` prints what you have.
 
 ## Using it
 
-| Action | How |
+Every shortcut the app knows, generated from `src/ui/keymap.rs` — the F1
+overlay paints the same table, and `cargo test` refuses a stale paste here or
+a row whose chord no longer works:
+
+<!-- keymap:start -->
+| Keys | Action |
 |---|---|
-| Open a file | double-click it, drag it onto the window, `Ctrl+O`, or a right-click → Recent |
-| Preview / Edit / Split | status bar buttons or `Ctrl+E` cycles them |
-| Find | `Ctrl+F` |
-| Theme | `Ctrl+T` or the status-bar toggle (persists) |
-| About / help | `F2` / `F1` |
-| Tabs | one per open file; a second launch of Editor hands its file to the window already open (Windows today) |
-| Quit | `Ctrl+Q` or the window's × |
+| `Ctrl+E` | cycle Preview → Edit → Split |
+| `Ctrl+O` | open a file in a new tab |
+| `drag & drop` | drop files onto the window to open them (Windows, macOS) |
+| `Ctrl+Tab` | next tab (Shift = previous) |
+| `Ctrl+R` | reload the active file from disk |
+| `Ctrl+W` | close tab (press twice if unsaved) |
+| `Ctrl+S` | save |
+| `type` | edit the document |
+| `arrows` | move the caret (Shift = select) |
+| `mouse drag` | select text |
+| `Ctrl+A` | select all |
+| `Ctrl+C / X / V` | copy / cut / paste |
+| `Ctrl+Z / Y` | undo / redo |
+| `Tab` | insert four spaces |
+| `wheel, arrows` | scroll |
+| `double-click` | select a word in the preview; a third click takes the row |
+| `Ctrl+F` | find bar (Enter/F3 next, Shift back) |
+| `Ctrl + / - / 0` | zoom in / out / reset |
+| `Ctrl+T` | light / dark theme |
+| `click [+]` | fold / unfold JSON nodes |
+| `hover a link` | show its address in the status bar; click to open it |
+| `F1` | this help |
+| `F2` | about editor |
+| `right-click` | context menu |
+| `Ctrl+Q` | quit |
+<!-- keymap:end -->
+
+A file also opens by double-clicking it or from right-click → Recent. Tabs hold
+one file each, and a second launch of Editor hands its file to the window
+already open (Windows today). The status bar carries the same mode, theme and
+zoom controls. Quit from `Ctrl+Q` or the window's ×.
 
 Your session — theme, view mode, open tabs, window size and position — is
 restored on the next start.

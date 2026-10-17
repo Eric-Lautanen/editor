@@ -1,5 +1,9 @@
 //! F1 help overlay: the whole legend — modes, shortcuts, file types, how to
 //! select and copy — painted over the document. Any click or Escape closes it.
+//!
+//! The rows come from [`super::keymap`], which is also what the README's
+//! shortcut table is generated from and what `app::tests` fires chords at, so
+//! the three cannot drift apart.
 
 use crate::{
     gfx::{
@@ -9,54 +13,7 @@ use crate::{
     layout::theme::Theme,
 };
 
-use super::overlay;
-
-/// `(section, &[(key, description)])`
-const SECTIONS: &[(&str, &[(&str, &str)])] = &[
-    ("Modes", &[("Ctrl+E", "cycle Preview → Edit → Split")]),
-    (
-        "Files",
-        &[
-            ("Ctrl+O", "open a file in a new tab"),
-            ("drag & drop", "drop files anywhere to open them"),
-            ("Ctrl+Tab", "next tab (Shift = previous)"),
-            ("Ctrl+W", "close tab (press twice if unsaved)"),
-            ("Ctrl+S", "save"),
-        ],
-    ),
-    (
-        "Editing  (Edit / Split)",
-        &[
-            ("type", "edit the document"),
-            ("arrows", "move the caret (Shift = select)"),
-            ("mouse drag", "select text"),
-            ("Ctrl+A", "select all"),
-            ("Ctrl+C / X / V", "copy / cut / paste"),
-            ("Ctrl+Z / Y", "undo / redo"),
-            ("Tab", "insert four spaces"),
-        ],
-    ),
-    (
-        "View",
-        &[
-            ("wheel, arrows", "scroll"),
-            ("Ctrl+F", "find bar (Enter/F3 next, Shift back)"),
-            ("Ctrl + / - / 0", "zoom in / out / reset"),
-            ("Ctrl+T", "light / dark theme"),
-            ("click [+]", "fold / unfold JSON nodes"),
-            ("click a link", "show its address in the status bar"),
-        ],
-    ),
-    (
-        "App",
-        &[
-            ("F1", "this help"),
-            ("F2", "about editor"),
-            ("right-click", "context menu"),
-            ("Ctrl+Q", "quit"),
-        ],
-    ),
-];
+use super::{keymap, overlay};
 
 const FOOTER: &[&str] = &[
     "Preview renders Markdown, JSON as a tree, JSONL per-line, CSV as a table,",
@@ -68,7 +25,7 @@ const FOOTER: &[&str] = &[
 /// One row of the legend, in paint order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
-    /// Section heading, by index into `SECTIONS`.
+    /// Section heading, by index into `keymap::SECTIONS`.
     Heading(usize),
     /// An item: `(section, item)`.
     Item(usize, usize),
@@ -94,13 +51,13 @@ fn layout(scale: f32) -> (Vec<(Row, f32)>, f32) {
     let gap = section_gap(scale);
     let mut out = Vec::new();
     let mut y = overlay::pad(scale);
-    for (si, &(_, items)) in SECTIONS.iter().enumerate() {
+    for (si, section) in keymap::SECTIONS.iter().enumerate() {
         if si > 0 {
             y += gap;
         }
         out.push((Row::Heading(si), y));
         y += line_h;
-        for ii in 0..items.len() {
+        for ii in 0..section.items.len() {
             out.push((Row::Item(si, ii), y));
             y += line_h;
         }
@@ -129,14 +86,14 @@ pub fn paint(
     // Size the columns from the widest strings rather than a magic number:
     // a fixed 110px key column left "Ctrl+C / X / V" flush against its
     // description, with a single pixel to spare.
-    let key_w = SECTIONS
+    let key_w = keymap::SECTIONS
         .iter()
-        .flat_map(|(_, items)| items.iter().map(|(k, _)| *k))
+        .flat_map(|section| section.items.iter().map(|b| b.keys))
         .map(|k| fonts.measure(FontStyle::Mono, k, size))
         .fold(0.0_f32, f32::max);
-    let desc_w = SECTIONS
+    let desc_w = keymap::SECTIONS
         .iter()
-        .flat_map(|(_, items)| items.iter().map(|(_, d)| *d))
+        .flat_map(|section| section.items.iter().map(|b| b.what))
         .map(|d| fonts.measure(FontStyle::Regular, d, size))
         .fold(0.0_f32, f32::max);
     let foot_w = FOOTER
@@ -169,18 +126,18 @@ pub fn paint(
             Row::Heading(si) => {
                 canvas.draw_text(
                     fonts,
-                    SECTIONS[si].0,
+                    keymap::SECTIONS[si].title,
                     x,
                     y,
                     spec(FontStyle::Bold, theme.accent),
                 );
             }
             Row::Item(si, ii) => {
-                let (key, desc) = SECTIONS[si].1[ii];
-                canvas.draw_text(fonts, key, x, y, spec(FontStyle::Mono, theme.fg));
+                let b = &keymap::SECTIONS[si].items[ii];
+                canvas.draw_text(fonts, b.keys, x, y, spec(FontStyle::Mono, theme.fg));
                 canvas.draw_text(
                     fonts,
-                    desc,
+                    b.what,
                     desc_x,
                     y,
                     spec(FontStyle::Regular, theme.muted),
@@ -267,7 +224,7 @@ mod tests {
         }
         assert_eq!(
             checked,
-            SECTIONS.len() - 1,
+            keymap::SECTIONS.len() - 1,
             "expected a gap between sections"
         );
     }

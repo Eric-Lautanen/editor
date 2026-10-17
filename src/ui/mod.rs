@@ -4,6 +4,7 @@ pub mod event;
 pub mod find;
 pub mod gutter;
 pub mod help;
+pub mod keymap;
 pub mod menu;
 pub mod overlay;
 pub mod preview_view;

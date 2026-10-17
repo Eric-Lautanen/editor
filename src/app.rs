@@ -75,6 +75,21 @@ struct TouchSel {
     active: bool,
 }
 
+/// A double-tap's row anchor for a finger drag that extends the preview
+/// selection: the counterpart of [`TouchSel`] for read-only panes. A finger
+/// reports `Pan`, never `MouseMove`, so the drag rides its own virtual
+/// pointer from the spot the tap landed.
+#[derive(Clone, Copy)]
+struct PreviewTouch {
+    /// Row the double-tap selected; the drag extends from it.
+    anchor: usize,
+    /// The finger's virtual window position: the tap's spot plus the pan
+    /// deltas since.
+    pointer: (f32, f32),
+    /// The drag has begun — the recency window only gates the start.
+    active: bool,
+}
+
 /// Caret blink half-period, in 40 ms `Event::Tick`s (~0.5 s).
 const BLINK_TICKS: u32 = 12;
 
@@ -235,6 +250,8 @@ pub struct App {
     /// Window size in physical px, and OS DPI scale.
     size: (usize, usize),
     scale: f32,
+    /// The OS asked for reduced motion (see [`App::set_reduce_motion`]).
+    reduce_motion: bool,
     /// Full window-edge strip the platform claims for resizing (physical px).
     /// Overlay scrollbars are inset by the *bar-safe* share of it
     /// ([`App::bar_grip`]) so a press on the bar scrolls instead of starting a
@@ -262,12 +279,27 @@ pub struct App {
     /// The status bar's Copy button, present only while a selection exists.
     /// Rect refreshed on every paint, hit-tested on press.
     copy_btn: Option<statusbar::StatusButton>,
+    /// A press on the Copy button landed: its label reads "Copied" until the
+    /// selection changes. The button is the feedback, so no second place on
+    /// the bar has to repeat it.
+    copy_done: bool,
     /// Visual rows of the active tab's preview (for drag-selection).
     preview_rows: Vec<PreviewRow>,
     /// Preview selection: (anchor row, caret row).
     preview_sel: Option<(usize, usize)>,
+    /// A double-click's word selection; exclusive with `preview_sel`.
+    preview_word: Option<preview_view::WordSel>,
+    /// Row a preview press landed on, so a drag can extend from it while a
+    /// press that never moves stays a click (and clears, like the editor).
+    preview_drag_row: Option<usize>,
     /// Left button held over the preview (drag-selecting).
     preview_drag: bool,
+    /// A double-tap's row anchor for a finger drag extending the preview
+    /// selection, mirroring [`TouchSel`] for the editor pane.
+    preview_touch: Option<PreviewTouch>,
+    /// The address under the pointer, shown in the status bar after the Copy
+    /// button. Kept as the string, not a bool: the bar needs the value.
+    hover_link: Option<String>,
     /// Last mouse position (window space), for Tick-driven auto-scroll.
     last_mouse: (f32, f32),
     /// User pressed Ctrl+T (or passed --dark): stop following the OS theme.
@@ -354,6 +386,9 @@ impl App {
             drag_anchor: None,
             size: platform::DEFAULT_SIZE,
             scale: 1.0,
+            // Off unless the OS says otherwise; `cli::run` reads the real
+            // preference, and tests set it directly rather than shelling out.
+            reduce_motion: false,
             edge: platform::edge_grip(),
             zoom: 1.0,
             layout_dirty: true,
@@ -366,9 +401,14 @@ impl App {
             hover_title: None,
             status_buttons: Vec::new(),
             copy_btn: None,
+            copy_done: false,
             preview_rows: Vec::new(),
             preview_sel: None,
+            preview_word: None,
+            preview_drag_row: None,
             preview_drag: false,
+            preview_touch: None,
+            hover_link: None,
             last_mouse: (0.0, 0.0),
             theme_manual: false,
             ticks: 0,
@@ -403,6 +443,15 @@ impl App {
 
     /// Pick the view mode directly (Ctrl+E cycles into it, `--mode` names it).
     /// Any preview selection belongs to the pane that just went away.
+    /// Follow the OS accessibility preference for motion. Read once at
+    /// startup by `cli::run` (see `platform::prefers_reduced_motion`); the
+    /// scroller is told too, so wheel glides and release coasts stop animating
+    /// while the distance they cover is unchanged.
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        self.reduce_motion = on;
+        self.scroll.reduce_motion = on;
+    }
+
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.clear_preview_sel();
@@ -517,7 +566,9 @@ impl App {
             return;
         }
         let step = -dx;
-        if step.abs() >= GLIDE_MIN_STEP {
+        // Reduced motion: the horizontal ride is the same decoration as the
+        // vertical one, so it lands at once instead of gliding there.
+        if step.abs() >= GLIDE_MIN_STEP && !self.reduce_motion {
             self.h_target = (self.h_target + step).clamp(0.0, self.h_max);
             self.h_scroll = self.h_scroll.clamp(0.0, self.h_max);
             if (self.h_target - self.h_scroll).abs() <= crate::ui::scroll::GLIDE_SETTLED {
@@ -992,14 +1043,17 @@ impl App {
             // expanded buffer line: tracking it during one line walk and
             // measuring only that line gives the identical max.
             let p = layout::text::plain_params(edit_w, &ctx, false);
-            let mut longest: String = String::new();
+            // Only the widened line is ever materialized: the scan itself
+            // borrows each line, so a document without tabs allocates nothing
+            // here (it used to allocate one String per line, twice over).
+            let mut longest = String::new();
             let mut longest_w: usize = 0;
             for i in 0..tab.buffer.line_count() {
-                let line = tab.buffer.line(i).replace('\t', "    ");
-                let w = line.len();
-                if w > longest_w {
-                    longest_w = w;
-                    longest = line;
+                let line = layout::text::expand_tabs(tab.buffer.line(i));
+                if line.len() > longest_w {
+                    longest_w = line.len();
+                    longest.clear();
+                    longest.push_str(&line);
                 }
             }
             let extent = ctx.fonts.measure(FontStyle::Mono, &longest, p.size);
@@ -1013,6 +1067,13 @@ impl App {
             tab.scroll.viewport_height = view_h;
             tab.scroll.offset = ratio * content;
             tab.scroll.scroll_by(0.0);
+            // This branch used to `return` without clearing the flag, so Edit
+            // mode re-laid-out the whole buffer on every frame — 200 ms a
+            // paint on a 754k-line file. The reader half below clears it at
+            // the end; this early exit has to do the same, and has to rescan
+            // the find bar for itself now that it no longer runs by accident.
+            self.rescan_find();
+            self.layout_dirty = false;
             return;
         }
         let list = match tab.kind {
@@ -1147,17 +1208,23 @@ impl App {
         tab.scroll.scroll_by(0.0);
         self.preview.list = list;
         self.preview_rows = self.preview.rows(&self.fonts);
-        // The find bar's matches belong to the active buffer: re-run the
-        // search whenever the content, tab, or view changed (all of which
-        // dirty layout). A full rescan, not the incremental narrow — the
-        // buffer may have moved under the old match list. No jump — paint
-        // must not move the view.
+        // The word's span was measured against the old layout; after a
+        // reflow it would highlight the wrong text.
+        self.preview_word = None;
+        self.rescan_find();
+        self.layout_dirty = false;
+    }
+
+    /// The find bar's matches belong to the active buffer: re-run the search
+    /// whenever the content, tab, or view changed (all of which dirty layout).
+    /// A full rescan, not the incremental narrow — the buffer may have moved
+    /// under the old match list. No jump — paint must not move the view.
+    fn rescan_find(&mut self) {
         if let Some(mut f) = self.find.take() {
             let caret = self.tabs[self.active].editor.caret;
             f.rescan(&self.tabs[self.active].buffer, caret);
             self.find = Some(f);
         }
-        self.layout_dirty = false;
     }
 
     /// Buffer changed: live re-render the document pane and keep the caret on
@@ -1199,6 +1266,9 @@ impl App {
         if self.close_armed && !(mods.ctrl && key == Key::Char('w')) {
             self.close_armed = false;
         }
+        // Any key can move the caret or the selection, so the Copy button's
+        // "Copied" flash ends here; Ctrl+C below starts a new one.
+        self.copy_done = false;
         let page = self.scroll.viewport_height * 0.9;
         let step = 48.0 * self.scale;
         match key {
@@ -1302,8 +1372,10 @@ impl App {
             Key::Char('c') if mods.ctrl => {
                 if let Some(text) = self.preview_selection_text() {
                     host.clipboard_set(&text);
+                    self.copy_done = true;
                 } else if let Some(text) = self.editor.copy(&self.buffer) {
                     host.clipboard_set(&text);
+                    self.copy_done = true;
                 }
             }
             Key::Char('x') if mods.ctrl && self.mode != Mode::Preview => {
@@ -1363,9 +1435,14 @@ impl App {
         // rather than leaving the app waiting for a release that never comes.
         self.drag_anchor = None;
         self.preview_drag = false;
+        self.preview_drag_row = None;
+        self.preview_touch = None;
         self.sb_drag = None;
         // A fresh press retires any armed double-tap selection.
         self.touch_sel = None;
+        // Anything that can change the selection retires the Copy button's
+        // "Copied" flash; the Copy branch below re-arms it.
+        self.copy_done = false;
         // A live menu consumes the click (item or dismiss).
         if let Some(m) = &self.menu {
             let action = m.hit(x, y);
@@ -1446,7 +1523,9 @@ impl App {
                         .or_else(|| self.editor.copy(&self.buffer))
                     {
                         host.clipboard_set(&text);
-                        self.status_extra = "copied".into();
+                        // The button itself says so — it reads "Copied"
+                        // until the selection changes.
+                        self.copy_done = true;
                     }
                     host.request_redraw();
                     return;
@@ -1592,14 +1671,56 @@ impl App {
             host.request_redraw();
             return;
         }
-        // Preview panes: toggles/links first, then drag-selection of rows.
+        // Preview panes: links/toggles first, then the same click language as
+        // the editor — one click clears, two take the word, three the row.
+        // The row under the press is remembered either way, so a press that
+        // turns into a drag still selects (and a press that does not stays a
+        // click, leaving nothing selected).
         if !self.preview_click(x, y, host) {
-            if let Some((_, dy)) = self.toggle_point(x, y) {
-                let row = self.preview.row_at(&self.preview_rows, dy);
-                self.preview_sel = row.map(|r| (r, r));
-                self.preview_drag = row.is_some();
-            } else {
-                self.preview_sel = None;
+            let point = self.toggle_point(x, y);
+            let row = point.and_then(|(_, dy)| self.preview.row_at(&self.preview_rows, dy));
+            match self.click_seq(x, y) {
+                // Double-click: the word under the pointer, or its row when
+                // there is no word there (a blank line, the space past the
+                // end of the text) so the gesture always selects something.
+                2 => {
+                    let word = point.and_then(|(dx, dy)| {
+                        self.preview
+                            .word_at(&self.fonts, &self.preview_rows, dx, dy)
+                    });
+                    match (word, row) {
+                        (Some(w), _) => {
+                            self.preview_drag_row = Some(w.row);
+                            self.preview_word = Some(w);
+                            self.preview_sel = None;
+                            self.preview_drag = true;
+                        }
+                        (None, Some(r)) => {
+                            self.preview_word = None;
+                            self.preview_sel = Some((r, r));
+                            self.preview_drag_row = Some(r);
+                            self.preview_drag = true;
+                        }
+                        (None, None) => self.clear_preview_sel(),
+                    }
+                }
+                3.. => {
+                    self.preview_word = None;
+                    self.preview_sel = row.map(|r| (r, r));
+                    self.preview_drag_row = row;
+                    self.preview_drag = row.is_some();
+                }
+                _ => {
+                    self.preview_word = None;
+                    self.preview_sel = None;
+                    self.preview_drag_row = row;
+                    self.preview_drag = row.is_some();
+                }
+            }
+            // A double/triple tap is how a finger selects text; the drag that
+            // may follow extends it. A single tap leaves nothing armed.
+            if let Some(anchor) = self.preview_drag_row {
+                self.arm_preview_touch(x, y, anchor);
             }
             host.request_redraw();
         }
@@ -1684,6 +1805,15 @@ impl App {
             self.hover_title = hit;
             host.request_redraw();
         }
+        // A link under the pointer is named in the status bar. The preview is
+        // read-only, so hovering is the only way to see where one goes without
+        // leaving the app; the address used to appear only after the click,
+        // which is too late to decide whether to make it.
+        let link = self.link_under(x, y);
+        if self.hover_link != link {
+            self.hover_link = link;
+            host.request_redraw();
+        }
         // Overlay-scrollbar drag: the thumb follows the pointer. A vertical
         // drag sets the shared ratio through whichever pane's bar is held,
         // so both Split thumbs stay locked together.
@@ -1700,12 +1830,16 @@ impl App {
             }
             return;
         }
-        // Preview drag: extend the row selection.
+        // Preview drag: extend the row selection from the press's anchor. The
+        // first move onto another row is what creates the selection, so a
+        // press followed by a release (a click) selects nothing.
         if self.preview_drag {
-            if let Some((_, dy)) = self.toggle_point(x, y) {
+            if let (Some(anchor), Some((_, dy))) = (self.preview_drag_row, self.toggle_point(x, y))
+            {
                 if let Some(row) = self.preview.row_at(&self.preview_rows, dy) {
-                    if let Some((anchor, _)) = self.preview_sel {
+                    if row != anchor || self.preview_sel.is_some() {
                         self.preview_sel = Some((anchor, row));
+                        self.preview_word = None;
                         host.request_redraw();
                     }
                 }
@@ -1731,9 +1865,33 @@ impl App {
         if button == MouseButton::Left {
             self.drag_anchor = None;
             self.preview_drag = false;
+            self.preview_drag_row = None;
             self.sb_drag = None;
         }
         host.request_redraw();
+    }
+
+    /// The address of the link under a window point, if the pointer is over
+    /// one in a preview pane.
+    ///
+    /// The pane's own box is checked first: in Split the editor sits under the
+    /// preview, and in every mode the status and title bars sit outside it, so
+    /// without that a link from the document's own coordinates could be
+    /// reported while the pointer is nowhere near the text.
+    fn link_under(&self, x: f32, y: f32) -> Option<String> {
+        let pane = match self.mode {
+            Mode::Preview => self.viewport(),
+            Mode::Split => self.split_panes().0,
+            Mode::Edit => return None,
+        };
+        if !pane.contains(Point { x, y }) {
+            return None;
+        }
+        let (dx, dy) = self.toggle_point(x, y)?;
+        match self.preview.action_at(dx, dy) {
+            Some(crate::layout::display_list::HitAction::Link(href)) => Some(href),
+            _ => None,
+        }
     }
 
     /// Arm the double-tap selection for a finger drag (see [`TouchSel`]):
@@ -1749,11 +1907,33 @@ impl App {
         }
     }
 
-    /// A finger drag while a double-tap's selection is armed extends that
-    /// selection instead of scrolling. Returns `true` when the pan was
-    /// consumed. The virtual pointer starts where the tap landed and rides
-    /// the pan deltas — a moving finger reports `Pan`, never `MouseMove`.
+    /// Arm the preview counterpart of [`TouchSel`]: a finger drag after a tap
+    /// selects rows from `anchor` instead of scrolling.
+    fn arm_preview_touch(&mut self, x: f32, y: f32, anchor: usize) {
+        self.preview_touch = Some(PreviewTouch {
+            anchor,
+            pointer: (x, y),
+            active: false,
+        });
+    }
+
+    /// A finger drag while an editor double-tap's selection is armed extends
+    /// that selection instead of scrolling; otherwise it does the same for the
+    /// preview. Returns `true` when the pan was consumed.
     fn on_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
+        // A drag extends a selection, so the Copy button's "Copied" flash is
+        // no longer about the text that was copied.
+        self.copy_done = false;
+        if self.touch_sel.is_some() {
+            return self.on_editor_touch_pan(dx, dy, host);
+        }
+        self.on_preview_touch_pan(dx, dy, host)
+    }
+
+    /// The editor half of [`App::on_touch_pan`]. The virtual pointer starts
+    /// where the tap landed and rides the pan deltas — a moving finger reports
+    /// `Pan`, never `MouseMove`.
+    fn on_editor_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
         let Some(mut ts) = self.touch_sel.take() else {
             return false;
         };
@@ -1786,6 +1966,39 @@ impl App {
         // Off the editor pane (over the gutter rail, say): keep the gesture
         // armed but do nothing with this delta.
         self.touch_sel = Some(ts);
+        true
+    }
+
+    /// The preview half of [`App::on_touch_pan`]: rows from the tap's anchor
+    /// to the row under the virtual pointer. The same ~1 s recency gate as the
+    /// editor keeps a drag that starts long after the tap a scroll.
+    fn on_preview_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
+        let Some(mut pt) = self.preview_touch.take() else {
+            return false;
+        };
+        if !pt.active {
+            let recent = self
+                .last_click
+                .is_some_and(|(_, t)| self.ticks.wrapping_sub(t) <= 25);
+            if !recent {
+                return false;
+            }
+            pt.active = true;
+        }
+        pt.pointer.0 += dx;
+        pt.pointer.1 += dy;
+        let (px, py) = pt.pointer;
+        if let Some((_, doc_y)) = self.toggle_point(px, py) {
+            if let Some(row) = self.preview.row_at(&self.preview_rows, doc_y) {
+                self.preview_word = None;
+                self.preview_sel = Some((pt.anchor, row));
+                self.preview_touch = Some(pt);
+                host.request_redraw();
+                return true;
+            }
+        }
+        // Off the preview pane: keep the gesture, spend no delta.
+        self.preview_touch = Some(pt);
         true
     }
 
@@ -1859,12 +2072,13 @@ impl App {
                 return;
             };
             self.scroll_direct(dy, host);
-            if let Some((_, doc_y)) = self.toggle_point(mx, my) {
+            if let (Some(anchor), Some((_, doc_y))) =
+                (self.preview_drag_row, self.toggle_point(mx, my))
+            {
                 if let Some(row) = self.preview.row_at(&self.preview_rows, doc_y) {
-                    if let Some((anchor, _)) = self.preview_sel {
-                        self.preview_sel = Some((anchor, row));
-                        host.request_redraw();
-                    }
+                    self.preview_sel = Some((anchor, row));
+                    self.preview_word = None;
+                    host.request_redraw();
                 }
             }
         }
@@ -1874,6 +2088,7 @@ impl App {
         if s.chars().any(char::is_control) {
             return;
         }
+        self.copy_done = false;
         // The find bar owns plain typing while it is open.
         if let Some(f) = self.find.as_mut() {
             f.query.push_str(s);
@@ -2013,15 +2228,11 @@ impl App {
                 host.request_redraw();
                 true
             }
-            // Open in the OS default browser; the status bar keeps the target
-            // visible for links that fail or for keyboard users.
+            // Open in the OS default browser. The address is already on the
+            // bar — hovering is what shows it — so the click has nothing to
+            // report; the status bar is for what the pointer is on, not a
+            // log of what was pressed.
             Some(crate::layout::display_list::HitAction::Link(href)) => {
-                let short: String = href.chars().take(72).collect();
-                self.status_extra = if short.len() < href.len() {
-                    format!("link: {short}…")
-                } else {
-                    format!("link: {short}")
-                };
                 host.open_url(&href);
                 host.request_redraw();
                 true
@@ -2030,14 +2241,21 @@ impl App {
         }
     }
 
-    /// Drop the preview selection (mode/tab changes, Escape).
+    /// Drop the preview selection (mode/tab changes, Escape, a plain click).
     fn clear_preview_sel(&mut self) {
         self.preview_sel = None;
+        self.preview_word = None;
         self.preview_drag = false;
+        self.preview_drag_row = None;
+        self.preview_touch = None;
     }
 
-    /// Text of the preview row selection (anchor..caret, ordered), if any.
+    /// Text of the preview selection, if any: a double-clicked word, or else
+    /// the row range (anchor..caret, ordered).
     fn preview_selection_text(&self) -> Option<String> {
+        if let Some(w) = &self.preview_word {
+            return Some(w.text.clone());
+        }
         let (a, b) = self.preview_sel?;
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
         if self.preview_rows.is_empty() {
@@ -2053,8 +2271,25 @@ impl App {
         )
     }
 
-    /// Paint the preview row-selection bands over a preview pane.
+    /// Paint the preview selection over a preview pane: one word's span, or
+    /// the rows of a drag.
     fn paint_preview_selection(&self, canvas: &mut Canvas, area: Rect, scroll: f32) {
+        if let Some(w) = &self.preview_word {
+            if let Some(row) = self.preview_rows.get(w.row) {
+                canvas.set_clip(Some(area));
+                canvas.fill_rect(
+                    Rect::new(
+                        w.x0 - 1.0,
+                        row.top + area.y - scroll,
+                        (w.x1 - w.x0) + 2.0,
+                        row.bottom - row.top,
+                    ),
+                    self.theme.sel,
+                );
+                canvas.set_clip(None);
+            }
+            return;
+        }
         let Some((a, b)) = self.preview_sel else {
             return;
         };
@@ -2395,32 +2630,72 @@ impl App {
             && self.mode != Mode::Edit;
         let view = self.viewport();
         if virtual_jsonl {
+            // The preview half (or the whole window) paints a fresh band each
+            // frame; Split additionally shows the editor half, exactly as the
+            // full-list path below does.
+            let split = self.mode == Mode::Split;
+            let pane = if split { self.split_panes().0 } else { view };
             let top = self.scroll.offset;
-            let bottom = self.scroll.offset + view.h;
-            let ctx = self.ctx();
-            let band = layout::json_tree::layout_band(layout::json_tree::Band {
-                plan: &self.plan,
-                records: &self.records,
-                buf: &self.buffer,
-                collapsed: &self.collapsed,
-                width: self.size.0 as f32,
-                ctx: &ctx,
-                top,
-                bottom,
-            });
-            // Paint the band like the preview does: reuse PreviewView by
-            // handing it the fresh list for this frame. Hits are from the
-            // band only — matches what's clickable on screen.
-            let painted = PreviewView { list: band };
-            let scroll = self.scroll.offset;
-            painted.paint(
+            let bottom = top + pane.h;
+            // Split's preview pane is narrower than the window; the height
+            // plan was built for the last relayout width, so rebuild it once
+            // per mode switch (shape counting only — no parse, no font work).
+            if self.plan_width != pane.w {
+                let plan = {
+                    let ctx = self.ctx();
+                    layout::json_tree::build_plan(
+                        &self.records,
+                        &self.collapsed,
+                        pane.w,
+                        &ctx,
+                        true,
+                    )
+                };
+                self.plan = plan;
+                self.plan_width = pane.w;
+            }
+            let band = {
+                let ctx = self.ctx();
+                layout::json_tree::layout_band(layout::json_tree::Band {
+                    plan: &self.plan,
+                    records: &self.records,
+                    buf: &self.buffer,
+                    collapsed: &self.collapsed,
+                    width: pane.w,
+                    ctx: &ctx,
+                    top,
+                    bottom,
+                })
+            };
+            // The band is the tab's preview for this frame: storing it makes
+            // toggle clicks and hit tests read the same thing the pane shows
+            // (the band used to stay local here, so in Split the editor half
+            // was never painted and toggle hits missed entirely).
+            self.preview = PreviewView { list: band };
+            self.preview.paint(
                 canvas,
                 &self.fonts,
                 &self.theme,
-                view,
-                PaneScroll::vertical(scroll),
+                pane,
+                PaneScroll::vertical(self.scroll.offset),
                 self.metrics(),
             );
+            if split {
+                let rail = gutter::rail_w(&self.fonts, &self.ctx(), self.buffer.line_count());
+                let right_pane = self.split_panes().1;
+                let editor = self.editor_scroll();
+                self.editor_pane.paint(
+                    canvas,
+                    &self.fonts,
+                    &self.theme,
+                    right_pane,
+                    PaneScroll::editor(editor, self.h_scroll, self.h_max, rail),
+                    self.metrics(),
+                );
+                self.paint_editor_overlay(canvas, right_pane, editor);
+                // The seam between the panes.
+                canvas.fill_rect(self.split_divider(), self.theme.rule);
+            }
             return;
         }
         match self.mode {
@@ -2514,23 +2789,38 @@ impl App {
     }
 
     /// The status bar's Copy button: present only while there is a
-    /// selection to copy (editor selection in Edit/Split, preview rows in
-    /// Preview). Rect is filled in by `statusbar::paint`.
+    /// selection to copy (a preview word or rows, or an editor selection in
+    /// Edit/Split), and reading "Copied" for as long as that same selection is
+    /// what was last copied. Rect is filled in by `statusbar::paint`.
     fn copy_button(&self) -> Option<statusbar::StatusButton> {
         let selected = self.preview_selection_text().is_some() || self.editor.selection().is_some();
         selected.then(|| statusbar::StatusButton {
             id: 8,
-            label: "Copy",
+            label: if self.copy_done { "Copied" } else { "Copy" },
             active: false,
             group_start: false,
             rect: Rect::default(),
         })
     }
 
+    /// The bar's left-hand text: `(info, detail)`.
+    ///
+    /// `info` is the document's own facts and always sits at the far left, in
+    /// every mode — the reader should never have to hunt for the line count
+    /// because a selection moved the bar around. `detail` is contextual and
+    /// follows it: the caret in Edit, a parse error, `reloaded`, a failed
+    /// open. The Copy button and a hovered link come after both.
     fn status_bar_text(&self) -> (String, String) {
-        // The tab already names the file, so the bar leaves it out: caret
-        // position (and selection) in Edit, otherwise nothing on the left.
-        let left = if self.mode == Mode::Edit {
+        let lines = self.buffer.line_count();
+        let info = format!(
+            "{}  ·  {} line{}  ·  {}%",
+            self.kind.label(),
+            lines,
+            if lines == 1 { "" } else { "s" },
+            (self.zoom * 100.0).round() as i32
+        );
+        // The tab already names the file, so the bar leaves it out.
+        let mut detail = if self.mode == Mode::Edit {
             let sel = if self.editor.selection().is_some() {
                 " [sel]"
             } else {
@@ -2544,20 +2834,13 @@ impl App {
         } else {
             String::new()
         };
-        let lines = self.buffer.line_count();
-        let right = format!(
-            "{}  ·  {} line{}  ·  {}%",
-            self.kind.label(),
-            lines,
-            if lines == 1 { "" } else { "s" },
-            (self.zoom * 100.0).round() as i32
-        );
-        let right = if self.status_extra.is_empty() {
-            right
-        } else {
-            format!("{right}  ·  {}", self.status_extra)
-        };
-        (left, right)
+        if !self.status_extra.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str("  ·  ");
+            }
+            detail.push_str(&self.status_extra);
+        }
+        (info, detail)
     }
 }
 
@@ -2612,19 +2895,14 @@ fn log_counts(buf: &Buffer) -> String {
                     .all(|c| c.is_ascii_digit() || "-:,./TZ[]".contains(c))
                     && word.len() >= 4
             })
-            .map(|w| {
-                w.trim_matches(|c: char| !c.is_alphanumeric())
-                    .to_uppercase()
-            })
-            .unwrap_or_else(|| word.to_uppercase());
-        if [
-            "ERROR", "ERR", "FATAL", "CRIT", "CRITICAL", "FAIL", "FAILED",
-        ]
-        .contains(&level.as_str())
-        {
-            errors += 1;
-        } else if ["WARN", "WARNING"].contains(&level.as_str()) {
-            warns += 1;
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+            .unwrap_or(word);
+        // Classification is borrowed and ASCII-case-insensitive: the old
+        // `to_uppercase` was one heap allocation per scanned line.
+        match layout::highlight::level_of(level) {
+            layout::highlight::Level::Error => errors += 1,
+            layout::highlight::Level::Warn => warns += 1,
+            _ => {}
         }
     }
     match (errors, warns) {
@@ -2644,13 +2922,21 @@ impl Handler for App {
                 height,
                 scale,
             } => {
+                // An identical resize is not a reflow. Platforms resend the
+                // current geometry (a window manager can, and the headless
+                // render helper reports it every frame), and re-laying the
+                // document out for it would throw away real work — and the
+                // reader's word selection — to arrive at the same layout.
+                let same_geometry = self.size == (width, height) && self.scale == scale;
                 self.size = (width, height);
                 self.scale = scale;
                 // The grip is a logical width; make it physical for this DPI. A
                 // DPI change arrives as a resize, so it is re-read here rather
                 // than only once at startup.
                 self.edge = platform::edge_grip() * scale;
-                self.layout_dirty = true;
+                if !same_geometry {
+                    self.layout_dirty = true;
+                }
                 host.request_redraw();
             }
             Event::Scroll { dx, dy } => {
@@ -2672,8 +2958,10 @@ impl Handler for App {
             }
             Event::PanEnd { vx, vy } => {
                 // A selection drag is not a flick: it retires the gesture
-                // without a coast.
-                if self.touch_sel.take().is_some() {
+                // without a coast. That goes for a preview selection too.
+                let dragged = self.touch_sel.take().is_some();
+                let preview_dragged = self.preview_touch.take().is_some();
+                if dragged || preview_dragged {
                     host.request_redraw();
                     return;
                 }
@@ -2727,15 +3015,24 @@ impl Handler for App {
             view.w,
             canvas.height as f32 - view.bottom(),
         );
-        let (left, right) = self.status_bar_text();
+        // The address under the pointer is recomputed here rather than trusted
+        // from the last mouse event: scrolling the page under a still pointer
+        // moves the links, and the bar should describe what is under it now.
+        self.hover_link = self.link_under(self.last_mouse.0, self.last_mouse.1);
+        let (info, detail) = self.status_bar_text();
         let mut buttons = self.status_buttons();
         let mut copy = self.copy_button();
+        let bar = statusbar::Bar {
+            info: &info,
+            detail: &detail,
+            link: self.hover_link.as_deref(),
+        };
         statusbar::paint(
             canvas,
             &self.fonts,
             &self.theme,
             sb,
-            (&left, &right),
+            bar,
             &mut buttons,
             &mut copy,
         );
@@ -3007,6 +3304,97 @@ mod tests {
         }
     }
 
+    /// Everything a keymap probe might plausibly change. Text, caret and tab
+    /// count included: a probe that lands in the wrong branch but still edits
+    /// the buffer is a real binding, and should pass rather than be reported
+    /// as dead.
+    #[derive(Debug, PartialEq)]
+    struct KeymapSnapshot {
+        mode: Mode,
+        dark: bool,
+        help: bool,
+        about: bool,
+        find: bool,
+        zoom: u32,
+        active: usize,
+        tabs: usize,
+        text: String,
+        caret: (usize, usize),
+        selection: bool,
+        status: String,
+        offset: u32,
+        quit: bool,
+        clipboard: Option<String>,
+        opened_url: Option<String>,
+    }
+
+    fn keymap_snapshot(app: &App, host: &NullHost) -> KeymapSnapshot {
+        KeymapSnapshot {
+            mode: app.mode,
+            dark: app.dark,
+            help: app.help_open,
+            about: app.about_open,
+            find: app.find.is_some(),
+            zoom: app.zoom.to_bits(),
+            active: app.active,
+            tabs: app.tabs.len(),
+            text: app.buffer.text(),
+            caret: (app.editor.caret.line, app.editor.caret.col),
+            selection: app.editor.selection().is_some(),
+            status: app.status_extra.clone(),
+            offset: app.scroll.offset.to_bits(),
+            quit: host.quit_requested,
+            clipboard: host.clipboard.clone(),
+            opened_url: host.opened_url.clone(),
+        }
+    }
+
+    /// A window that can observe the most chords at once: two tabs (so the tab
+    /// chords move), Edit mode (so the editing chords act), motion reduction
+    /// on (so a scroll chord lands on the frame it is fired in), and a file
+    /// tall enough for the view to have somewhere to scroll to.
+    fn keymap_window(name: &str) -> (App, NullHost) {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("editor_keymap_{name}_a.txt"));
+        let b = dir.join(format!("editor_keymap_{name}_b.txt"));
+        let body = (0..80).map(|i| format!("line {i}\n")).collect::<String>();
+        std::fs::write(&a, &body).unwrap();
+        std::fs::write(&b, &body).unwrap();
+        let mut app = App::new(Some(a)).unwrap();
+        let mut host = NullHost::default();
+        app.open_path(b, &mut host);
+        app.set_mode(Mode::Edit);
+        app.set_reduce_motion(true);
+        (app, host)
+    }
+
+    /// Every row the keymap marks with a probe must do something to a fresh
+    /// window. This is the guard against the legend and `on_key` drifting
+    /// apart — the failure mode this table was introduced to end.
+    #[test]
+    fn every_probed_keymap_chord_changes_something() {
+        let mut probed = 0;
+        for section in crate::ui::keymap::SECTIONS {
+            for item in section.items {
+                let Some((key, mods)) = item.probe else {
+                    continue;
+                };
+                probed += 1;
+                let (mut app, mut host) = keymap_window("probe");
+                let before = keymap_snapshot(&app, &host);
+                app.on_event(Event::KeyDown { key, mods }, &mut host);
+                let after = keymap_snapshot(&app, &host);
+                assert_ne!(
+                    before, after,
+                    "\"{}\" ({}) does nothing: the legend and the dispatcher have drifted",
+                    item.keys, section.title
+                );
+            }
+        }
+        // A table that lost its probes would pass the loop above vacuously.
+        assert!(probed >= 12, "only {probed} probed chords");
+    }
+
     #[test]
     fn find_bar_opens_types_and_selects_the_first_match() {
         let mut app = App::new(None).unwrap();
@@ -3230,7 +3618,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_button_appears_with_a_selection_and_copies() {
+    fn copy_button_follows_the_data_and_says_copied_after_a_press() {
         let mut app = App::new(None).unwrap();
         app.buffer = Buffer::from_text("hello world\n");
         let mut host = NullHost::default();
@@ -3239,8 +3627,17 @@ mod tests {
         app.on_event(ctrl('a'), &mut host);
         let _ = app.render_headless(800, 600, 1.0);
         let cb = app.copy_btn.expect("Copy button with a selection").rect;
-        assert!(cb.x < 60.0, "far left of the bar, at {}", cb.x);
+        // Not the far left any more: the document's own facts are, and the
+        // button sits after them.
+        let (info, _) = app.status_bar_text();
+        let info_w = app.fonts.measure(FontStyle::Regular, &info, 12.5);
+        assert!(
+            cb.x > 14.0 + info_w,
+            "the button follows the data ({info_w} px of text), at {}",
+            cb.x
+        );
         assert_eq!(cb.h, statusbar::HEIGHT, "full bar height for a finger");
+        assert_eq!(app.copy_btn.unwrap().label, "Copy");
         let (cx, cy) = mid(cb);
         app.on_event(
             Event::MouseDown {
@@ -3251,6 +3648,170 @@ mod tests {
             &mut host,
         );
         assert_eq!(host.clipboard.as_deref(), Some("hello world\n"));
+        // The press is acknowledged where the press happened — the button
+        // itself reads "Copied" — not as a message in some other corner.
+        let _ = app.render_headless(800, 600, 1.0);
+        assert_eq!(app.copy_btn.unwrap().label, "Copied");
+        assert!(app.status_extra.is_empty(), "status: {}", app.status_extra);
+        // Any new press can change the selection, so the flash ends with it —
+        // and with the selection gone, the button goes too.
+        app.on_event(
+            Event::MouseDown {
+                x: 200.0,
+                y: 150.0,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        let _ = app.render_headless(800, 600, 1.0);
+        assert!(app.copy_btn.is_none(), "deselecting hides the button");
+    }
+
+    /// A preview click behaves like an editor click: one clears, two take the
+    /// word under the pointer, three the row it is on.
+    #[test]
+    fn preview_clicks_clear_select_a_word_and_select_a_row() {
+        let mut app = open(
+            "editor_test_preview_clicks.txt",
+            "Alpha beta gamma\nsecond line here\nthird line\n",
+        );
+        let mut host = NullHost::default();
+        let _ = app.render_headless(900, 600, 1.0);
+        assert_eq!(app.mode, Mode::Preview);
+        assert!(app.preview_rows.len() >= 3, "want a row per line");
+        let row = app.preview_rows[0].clone();
+        let dy = (row.top + row.bottom) / 2.0;
+        // Find "beta" the way the app does, by asking it where the word is.
+        let mut beta = None;
+        let mut x = row.x0;
+        while x < row.x1 {
+            if let Some(w) = app.preview.word_at(&app.fonts, &app.preview_rows, x, dy) {
+                if w.text == "beta" {
+                    beta = Some(w);
+                    break;
+                }
+            }
+            x += 2.0;
+        }
+        let beta = beta.expect("the word beta in the first row");
+        let (bx, by) = ((beta.x0 + beta.x1) / 2.0, app.viewport().y + dy);
+        fn click(app: &mut App, host: &mut NullHost, x: f32, y: f32) {
+            app.on_event(
+                Event::MouseDown {
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                },
+                host,
+            );
+            app.on_event(
+                Event::MouseUp {
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                },
+                host,
+            );
+        }
+        // Two clicks: the word, not the row.
+        click(&mut app, &mut host, bx, by);
+        click(&mut app, &mut host, bx, by);
+        assert_eq!(
+            app.preview_selection_text().as_deref(),
+            Some("beta"),
+            "double-click takes the word"
+        );
+        let _ = app.render_headless(900, 600, 1.0);
+        let cb = app.copy_btn.expect("Copy button for a word selection");
+        assert_eq!(cb.label, "Copy");
+        let (cx, cy) = mid(cb.rect);
+        app.on_event(
+            Event::MouseDown {
+                x: cx,
+                y: cy,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        assert_eq!(
+            host.clipboard.as_deref(),
+            Some("beta"),
+            "copy takes the word"
+        );
+        let _ = app.render_headless(900, 600, 1.0);
+        assert_eq!(app.copy_btn.unwrap().label, "Copied");
+        // A third click (same spot, fast): the whole row, and the flash is
+        // back to "Copy" because the selection is no longer what was copied.
+        click(&mut app, &mut host, bx, by);
+        assert!(app.preview_word.is_none());
+        assert_eq!(app.preview_sel, Some((0, 0)));
+        assert_eq!(
+            app.preview_selection_text().as_deref(),
+            Some("Alpha beta gamma")
+        );
+        let _ = app.render_headless(900, 600, 1.0);
+        assert_eq!(
+            app.copy_btn.unwrap().label,
+            "Copy",
+            "a new selection resets"
+        );
+        // A fourth click: nothing selected, and the button is gone.
+        click(&mut app, &mut host, bx, by);
+        assert!(app.preview_sel.is_none());
+        assert!(app.preview_word.is_none());
+        assert!(app.preview_selection_text().is_none());
+        let _ = app.render_headless(900, 600, 1.0);
+        assert!(app.copy_btn.is_none(), "no selection, no button");
+    }
+
+    /// The touch counterpart: a double-tap selects, and the finger drag that
+    /// follows extends the selection instead of scrolling the page.
+    #[test]
+    fn a_finger_drag_after_a_preview_double_tap_selects_rows() {
+        let mut app = open(
+            "editor_test_preview_touch.txt",
+            "one\ntwo\nthree\nfour\nfive\nsix\n",
+        );
+        let mut host = NullHost::default();
+        let _ = app.render_headless(900, 600, 1.0);
+        let row = app.preview_rows[0].clone();
+        let (x, y) = (
+            row.x0 + 10.0,
+            app.viewport().y + (row.top + row.bottom) / 2.0,
+        );
+        for _ in 0..2 {
+            app.on_event(
+                Event::MouseDown {
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                },
+                &mut host,
+            );
+            app.on_event(
+                Event::MouseUp {
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                },
+                &mut host,
+            );
+        }
+        assert!(
+            app.preview_selection_text().is_some(),
+            "a double-tap selects something"
+        );
+        let before = app.scroll.offset;
+        // A moving finger reports Pan, never MouseMove.
+        app.on_event(Event::Pan { dx: 0.0, dy: 40.0 }, &mut host);
+        let (a, b) = app.preview_sel.expect("rows selected by the drag");
+        assert!(a < b, "the drag extended past the tapped row ({a}..{b})");
+        assert_eq!(
+            app.scroll.offset, before,
+            "a selection drag does not scroll"
+        );
+        app.on_event(Event::PanEnd { vx: 0.0, vy: -3.0 }, &mut host);
+        assert!(app.preview_touch.is_none(), "the gesture is retired");
     }
 
     #[test]
@@ -3453,14 +4014,14 @@ mod tests {
     }
 
     #[test]
-    fn clicking_link_shows_href_in_status() {
+    fn hovering_a_link_names_it_in_the_status_bar() {
         use crate::layout::display_list::HitAction;
         let mut app = open(
             "editor_test_f.md",
             "See [example](https://example.com/x).\n",
         );
         let _ = app.render_headless(800, 600, 1.0);
-        let link = app
+        let (rect, href) = app
             .preview
             .list
             .hits
@@ -3471,19 +4032,31 @@ mod tests {
             })
             .expect("no link hit region");
         let mut host = NullHost::default();
+        let (lx, ly) = (
+            rect.x + rect.w / 2.0,
+            rect.y + rect.h / 2.0 + app.viewport().y,
+        );
+        app.on_event(Event::MouseMove { x: lx, y: ly }, &mut host);
+        assert_eq!(
+            app.hover_link.as_deref(),
+            Some(href.as_str()),
+            "the bar names the address under the pointer"
+        );
+        // Moving off the link stops naming it: the bar describes what the
+        // pointer is on, it is not a log of links that were visited.
+        app.on_event(Event::MouseMove { x: 20.0, y: ly }, &mut host);
+        assert!(app.hover_link.is_none());
+        // Clicking still opens it, and writes nothing extra to the bar.
         app.on_event(
             Event::MouseDown {
-                x: link.0.x + 1.0,
-                y: link.0.y + 1.0 + app.viewport().y,
+                x: lx,
+                y: ly,
                 button: MouseButton::Left,
             },
             &mut host,
         );
-        assert!(
-            app.status_extra.contains("https://example.com/x"),
-            "status: {}",
-            app.status_extra
-        );
+        assert_eq!(host.opened_url.as_deref(), Some(href.as_str()));
+        assert!(app.status_extra.is_empty(), "status: {}", app.status_extra);
     }
 
     #[test]
@@ -4238,6 +4811,45 @@ mod tests {
             &mut host,
         );
         assert!(app.drag_anchor.is_none());
+    }
+
+    /// The OS accessibility switch has to change the *ride*, not the distance:
+    /// a wheel notch must land where it would have landed, just without the
+    /// frames getting there. Direct manipulation (a finger, a thumb) is direct
+    /// either way and is covered by its own tests.
+    #[test]
+    fn reduced_motion_applies_a_wheel_step_at_once() {
+        let body = "a line of text\n".repeat(400);
+        let mut host = NullHost::default();
+        // Motion on (the default): a notch glides, so nothing moves on the
+        // frame it arrives — that is what `scroll_smooth` is for.
+        let mut gliding = open("editor_test_reduce_a.txt", &body);
+        let _ = gliding.render_headless(800, 600, 1.0);
+        gliding.on_event(
+            Event::Scroll {
+                dx: 0.0,
+                dy: -480.0,
+            },
+            &mut host,
+        );
+        assert_eq!(gliding.scroll.offset, 0.0, "a notch must glide, not jump");
+        // Motion reduced: the same notch is applied immediately, and there is
+        // nothing left for a frame clock to animate.
+        let mut reduced = open("editor_test_reduce_b.txt", &body);
+        let _ = reduced.render_headless(800, 600, 1.0);
+        reduced.set_reduce_motion(true);
+        reduced.on_event(
+            Event::Scroll {
+                dx: 0.0,
+                dy: -480.0,
+            },
+            &mut host,
+        );
+        assert_eq!(
+            reduced.scroll.offset, 480.0,
+            "the step still scrolls the full distance"
+        );
+        assert!(!reduced.scroll.animating(), "and nothing is animating");
     }
 
     #[test]

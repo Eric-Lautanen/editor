@@ -135,6 +135,20 @@ pub fn wrap_ranges(
     rows
 }
 
+/// One buffer line expanded for display: tabs become four spaces.
+///
+/// Borrowed when the line has no tab, which is the overwhelming majority of
+/// them — `str::replace` always allocates, and layout runs this over every
+/// line of the document, so on a 754k-line file that difference is three
+/// quarters of a million allocations per relayout.
+pub fn expand_tabs(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.contains('\t') {
+        std::borrow::Cow::Owned(line.replace('\t', "    "))
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    }
+}
+
 /// Same as [`wrap_ranges`] but rendering each row to a `String`.
 pub fn wrap_line(
     fonts: &FontSystem,
@@ -165,13 +179,13 @@ pub fn layout_plain(buf: &Buffer, viewport_w: f32, ctx: &Ctx, wrap: bool) -> Dis
         let mut ops = Vec::new();
         let mut y = p.pad;
         for i in 0..buf.line_count() {
-            let line = buf.line(i).replace('\t', "    ");
+            let line = expand_tabs(buf.line(i));
             if !line.is_empty() {
                 let baseline = (y + (p.line_h - m.height()) / 2.0 + m.ascent).round();
                 ops.push(DrawOp::Text {
                     x: p.x0,
                     y: baseline,
-                    text: line,
+                    text: line.into_owned(),
                     size: p.size,
                     style: FontStyle::Mono,
                     color: ctx.theme.fg,
@@ -195,7 +209,7 @@ pub fn layout_plain(buf: &Buffer, viewport_w: f32, ctx: &Ctx, wrap: bool) -> Dis
     let mut ops = Vec::new();
     let mut y = p.pad;
     for i in 0..buf.line_count() {
-        let line = buf.line(i).replace('\t', "    ");
+        let line = expand_tabs(buf.line(i));
         for row in wrap_line(ctx.fonts, style, p.size, &line, p.col_w) {
             if !row.is_empty() {
                 let baseline = (y + (p.line_h - m.height()) / 2.0 + m.ascent).round();

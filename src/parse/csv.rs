@@ -98,6 +98,16 @@ pub fn parse(text: &str) -> Sheet {
         if line.trim().is_empty() {
             continue;
         }
+        // Past the cap the line is only *counted*: splitting it would allocate
+        // a String per field for a row nothing ever shows (a 41 MB export
+        // spent most of its open time on four million throwaway Strings).
+        // Field count is still exact — one more than the outside-quote
+        // delimiters, which is what `parse_line` produces.
+        if !first && rows.len() >= MAX_ROWS {
+            total_rows += 1;
+            cols = cols.max(count_outside_quotes(line, delimiter) + 1);
+            continue;
+        }
         let fields = parse_line(line, delimiter);
         cols = cols.max(fields.len());
         if first {
@@ -105,9 +115,7 @@ pub fn parse(text: &str) -> Sheet {
             first = false;
         } else {
             total_rows += 1;
-            if rows.len() < MAX_ROWS {
-                rows.push(fields);
-            }
+            rows.push(fields);
         }
     }
     cols = cols.max(header.len());
@@ -161,6 +169,27 @@ mod tests {
         assert_eq!(s.total_rows, 0);
         assert!(s.rows.is_empty());
         assert_eq!(s.cols, 0);
+    }
+
+    /// Rows past the cap are not split, but the column count they imply is
+    /// still honoured: the sheet's shape must not depend on how long the file
+    /// is, only on what it contains.
+    #[test]
+    fn a_wide_row_past_the_cap_still_widens_the_sheet() {
+        let mut text = String::from("h1,h2\n");
+        for i in 0..MAX_ROWS + 10 {
+            if i == MAX_ROWS + 5 {
+                text.push_str("a,b,c,d\n");
+            } else {
+                text.push_str("a,b\n");
+            }
+        }
+        let s = parse(&text);
+        assert_eq!(s.rows.len(), MAX_ROWS);
+        assert_eq!(s.total_rows, MAX_ROWS + 10);
+        assert_eq!(s.cols, 4);
+        assert_eq!(s.rows[0].len(), 4, "kept rows are padded to the shape");
+        assert!(s.capped);
     }
 
     #[test]

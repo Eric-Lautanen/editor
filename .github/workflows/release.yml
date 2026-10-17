@@ -36,6 +36,38 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
+
+      # ---- signing -------------------------------------------------------
+      # Nothing here runs unless the repository has the credentials, so a
+      # fork builds and publishes exactly what it did before. Which secrets,
+      # and how to make them, is packaging/SIGNING.md's subject. Signed
+      # *before* the MSI is built, or the installer would embed an unsigned
+      # copy of the executable.
+      - name: sign the executable (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          CERT_PFX_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:CERT_PFX_B64) {
+            Write-Host "::notice::WINDOWS_CERT_PFX_B64 is unset: publishing an unsigned Windows build."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_B64))
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signtool = Get-ChildItem $sdk -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\x64\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found in the Windows SDK" }
+          & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd sha256 `
+            /tr http://timestamp.digicert.com /td sha256 target/release/editor.exe
+          if ($LASTEXITCODE -ne 0) { throw "signing editor.exe failed" }
+          & $signtool.FullName verify /pa target/release/editor.exe
+          if ($LASTEXITCODE -ne 0) { throw "editor.exe failed signature verification" }
+          Remove-Item $pfx
+
       # The Linux binary that is about to be packaged and published proves it
       # opens a window here first — the same probe CI runs, on the artifact
       # users download rather than on some other build of the same commit.
@@ -85,6 +117,32 @@ jobs:
             -o $msi `
             packaging/windows/editor.wxs
 
+
+      # The MSI is signed too (SmartScreen judges the installer the user
+      # double-clicks), after WiX has finished writing it.
+      - name: sign the installer (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          CERT_PFX_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:CERT_PFX_B64) { exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_B64))
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signtool = Get-ChildItem $sdk -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\x64\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          Get-ChildItem -Filter '*.msi' | ForEach-Object {
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd sha256 `
+              /tr http://timestamp.digicert.com /td sha256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing $($_.Name) failed" }
+            & $signtool.FullName verify /pa $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed signature verification" }
+          }
+          Remove-Item $pfx
+
       - name: package (linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -100,8 +158,54 @@ jobs:
 
       - name: package (macos)
         if: matrix.os == 'macos-latest'
+        env:
+          CERT_P12_B64: ${{ secrets.MACOS_CERT_P12_B64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           sh packaging/macos/bundle.sh
+          # ---- signing and notarization -----------------------------------
+          # Same rule as Windows: no certificate, no signing, and the release
+          # is exactly the unsigned one it has always been. Gatekeeper's
+          # "unidentified developer" prompt is the price of a fork without
+          # credentials; a repository that has them gets a bundle that just
+          # opens.
+          if [ -z "$CERT_P12_B64" ]; then
+            echo "::notice::MACOS_CERT_P12_B64 is unset: publishing an unsigned bundle."
+          else
+            : "${SIGN_IDENTITY:?MACOS_SIGN_IDENTITY must be set alongside the certificate}"
+            keychain="$RUNNER_TEMP/editor-signing.keychain-db"
+            echo "$CERT_P12_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security create-keychain -p actions "$keychain"
+            security set-keychain-settings -lut 21600 "$keychain"
+            security unlock-keychain -p actions "$keychain"
+            security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -k actions "$keychain" > /dev/null
+            security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+            # Hardened runtime is not optional: notarytool rejects a bundle
+            # built without it, and the timestamp keeps the signature valid
+            # past the certificate's own expiry.
+            codesign --force --deep --timestamp --options runtime -s "$SIGN_IDENTITY" target/Editor.app
+            codesign --verify --deep --strict --verbose=2 target/Editor.app
+            if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
+              : "${APPLE_TEAM_ID:?APPLE_TEAM_ID must be set to notarize}"
+              # Notarize a zip of the *signed* bundle, then staple the ticket
+              # into it — before this step's own `ditto`, so the artifact users
+              # download carries the ticket and opens offline.
+              ditto -c -k --keepParent target/Editor.app "$RUNNER_TEMP/notarize.zip"
+              xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+              xcrun stapler staple target/Editor.app
+              xcrun stapler validate target/Editor.app
+              # The real question, asked the way Gatekeeper asks it.
+              spctl --assess --type execute --verbose=2 target/Editor.app
+            else
+              echo "::notice::signed but not notarized: APPLE_ID/APPLE_APP_PASSWORD unset."
+            fi
+            security delete-keychain "$keychain"
+          fi
           # `--keepParent` is what puts `Editor.app` itself at the root of the
           # zip; without it `ditto -c -k` archives the bundle's *contents*, and
           # the download unzips to a stray `Contents/` folder that cannot be
@@ -162,6 +266,12 @@ jobs:
             release still ships portable/overwrite-friendly binaries, and
             associations keep working across upgrades unless you move the
             executable. Run `editor --version` to check what you have.
+
+            **Signed builds.** When the repository has its signing secrets set,
+            the Windows `.exe`/`.msi` are Authenticode-signed and the macOS
+            bundle is Developer-ID signed and notarized, so neither shows an
+            unknown-publisher prompt. Without them the workflow still publishes
+            — unsigned — and the OS will say so. See `packaging/SIGNING.md`.
 
             Note: the Linux and macOS GUI backends (M8/M9) are usable — the
             release binaries open real windows, and CI starts each one on a

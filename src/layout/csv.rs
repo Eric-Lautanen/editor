@@ -34,10 +34,19 @@ fn truncate_cell(
     if fonts.measure(style, text, size) <= budget {
         return text.to_string();
     }
+    // Accumulate the kept prefix once: popping a char and re-measuring the
+    // whole cell each time is quadratic in the cell length, and every capped
+    // sheet runs this over every cell it paints.
     let ell = fonts.measure(style, "…", size);
-    let mut s = text.to_string();
-    while !s.is_empty() && fonts.measure(style, &s, size) + ell > budget {
-        s.pop();
+    let mut s = String::new();
+    let mut w = 0.0;
+    for ch in text.chars() {
+        let cw = fonts.advance(style, ch, size);
+        if w + cw + ell > budget {
+            break;
+        }
+        w += cw;
+        s.push(ch);
     }
     s.push('…');
     s

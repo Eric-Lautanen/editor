@@ -63,6 +63,12 @@ const COAST_MAX_PX_PER_MS: f32 = 8.0;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ScrollState {
+    /// The user asked the OS to reduce motion (see
+    /// [`crate::platform::prefers_reduced_motion`]). Motion that exists only to
+    /// be pleasant — the wheel glide, the release coast — is switched off; the
+    /// input still moves the view exactly as far, just without the ride getting
+    /// there. Direct manipulation is unaffected: it was never animated.
+    pub reduce_motion: bool,
     /// What the panes paint at.
     pub offset: f32,
     /// Where a glide is heading; equal to `offset` when nothing is animating.
@@ -99,6 +105,13 @@ impl ScrollState {
     /// flight is abandoned — the finger's momentum replaces it.
     pub fn coast_from(&mut self, v: f32) {
         self.target = self.offset;
+        // A flick that keeps travelling after the finger is gone is pure
+        // decoration: with motion reduced the release just stops, exactly as
+        // a release with no velocity always has.
+        if self.reduce_motion {
+            self.coast = 0.0;
+            return;
+        }
         self.coast = v.clamp(-COAST_MAX_PX_PER_MS, COAST_MAX_PX_PER_MS);
         if self.coast.abs() <= COAST_MIN_PX_PER_MS {
             self.coast = 0.0;
@@ -122,8 +135,9 @@ impl ScrollState {
         // A resize (or a shorter document) can leave the offset outside the
         // range the target is clamped to; keep the view inside it too.
         self.offset = self.offset.clamp(0.0, self.max());
-        if (self.target - self.offset).abs() <= GLIDE_SETTLED {
-            // A step too small to see still ends up applied, not dropped.
+        if self.reduce_motion || (self.target - self.offset).abs() <= GLIDE_SETTLED {
+            // A step too small to see still ends up applied, not dropped — and
+            // with motion reduced the step simply *is* the destination.
             self.offset = self.target;
         }
     }
@@ -177,6 +191,7 @@ mod tests {
             coast: 0.0,
             content_height: 10_000.0,
             viewport_height: 800.0,
+            ..ScrollState::default()
         }
     }
 
@@ -399,6 +414,44 @@ mod tests {
             "and travels its little sum: {}",
             s.offset
         );
+    }
+
+    #[test]
+    fn reduced_motion_steps_instead_of_gliding() {
+        // The whole glide is switched off, but the distance is not: a wheel
+        // notch is a scroll, not an animation, and the view must land exactly
+        // where the same notch lands with motion on.
+        let mut s = scroller(0.0);
+        s.reduce_motion = true;
+        s.scroll_smooth(480.0);
+        assert_eq!(s.offset, 480.0, "the notch is applied at once");
+        assert_eq!(s.target, 480.0);
+        assert!(!s.animating(), "nothing left to animate");
+        assert!(!s.step(FAST_FRAME_MS));
+        // Two notches add up like they always did.
+        s.scroll_smooth(480.0);
+        assert_eq!(s.offset, 960.0);
+        // And it still clamps at the ends of the document.
+        s.scroll_smooth(100_000.0);
+        assert_eq!(s.offset, s.max());
+    }
+
+    #[test]
+    fn reduced_motion_drops_the_release_coast() {
+        let mut s = scroller(0.0);
+        s.reduce_motion = true;
+        s.coast_from(3.0);
+        assert_eq!(s.coast, 0.0, "a flick must not keep travelling");
+        assert!(!s.animating());
+        assert!(!s.step(FAST_FRAME_MS));
+        // Direct manipulation is untouched: the finger still moves the view.
+        s.scroll_by(40.0);
+        assert_eq!(s.offset, 40.0);
+        // A wheel notch arriving mid-glide still replaces a coast when motion
+        // is on again (the flag is read per call, not latched).
+        s.reduce_motion = false;
+        s.coast_from(2.0);
+        assert!(s.coast != 0.0);
     }
 
     #[test]

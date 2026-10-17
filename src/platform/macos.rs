@@ -1281,6 +1281,18 @@ pub fn system_prefers_dark() -> bool {
     out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("Dark"))
 }
 
+/// Is Reduce Motion on in System Settings → Accessibility → Display?
+///
+/// `com.apple.universalaccess reduceMotion` is the preference Reduce Motion
+/// writes; the key is absent until the user turns it on, and `defaults` may not
+/// exist on a stripped system, so anything but an explicit `1` means "no".
+pub fn prefers_reduced_motion() -> bool {
+    let out = std::process::Command::new("defaults")
+        .args(["read", "com.apple.universalaccess", "reduceMotion"])
+        .output();
+    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+}
+
 const PROT_READ: c_int = 1;
 const MAP_PRIVATE: c_int = 2;
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
