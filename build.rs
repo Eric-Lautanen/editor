@@ -169,13 +169,15 @@ fn version_info(version: &str) -> Vec<u8> {
 
     // ProductName and ProductVersion are the two a SignPath artifact
     // configuration pins; the rest is what a Windows user expects to find.
+    //
+    // FileDescription is the *name* Windows shows for the app — the taskbar
+    // tooltip, the window grouping in Alt+Tab and Task Manager — not a
+    // description, so it stays the bare product name. A tagline here reads as
+    // "Editor - native viewer for Mark…" clipped to the width of a tooltip.
     let mut strings = Vec::new();
     for (name, value) in [
         ("CompanyName", "Eric Lautanen"),
-        (
-            "FileDescription",
-            "Editor - native viewer for Markdown, JSON, CSV and code",
-        ),
+        ("FileDescription", "Editor"),
         ("FileVersion", version),
         ("InternalName", "editor"),
         ("LegalCopyright", "Copyright (C) 2026 Eric Lautanen"),
