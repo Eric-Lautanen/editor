@@ -381,6 +381,27 @@ impl Md<'_> {
         (top + (self.line_h(size) - m.ascent - m.descent) / 2.0 + m.ascent).round()
     }
 
+    /// Where a strike-through crosses the glyphs: the middle of the *x-height*,
+    /// not the middle of the line box. The box also carries the ascender and
+    /// descender the lowercase letters never reach, so its midpoint sat the
+    /// rule roughly 4 px high — across the tops of `struck text` instead of
+    /// through them. 0.27 of the ascent above the baseline lands mid-x-height
+    /// for the embedded faces (x-height ≈ 0.45 em, ascent ≈ 0.9 em).
+    fn strike_y(&self, baseline: f32, style: FontStyle, size: f32) -> f32 {
+        let m = self.fonts.metrics(style, size);
+        (baseline - m.ascent * 0.27).round()
+    }
+
+    /// Where a link's underline sits: below the glyphs' feet, not on the
+    /// baseline. `Metrics::descent` is negative (it grows downward), so the
+    /// old `baseline + descent * 0.4` put the rule *above* the baseline, on
+    /// the bottom third of `n`, `k` and `a`; most of the descent is air the
+    /// letters leave free.
+    fn underline_y(&self, baseline: f32, style: FontStyle, size: f32) -> f32 {
+        let m = self.fonts.metrics(style, size);
+        (baseline - m.descent * 0.75).round()
+    }
+
     fn rule(&mut self, x: f32, w: f32) {
         let thick = self.scale.max(1.0).round();
         self.ops.push(DrawOp::Line {
@@ -444,7 +465,7 @@ impl Md<'_> {
                 }
                 self.text_op(pen, baseline, piece, sp.style, size, sp.color);
                 if sp.strike {
-                    let mid = (self.y + lh / 2.0).round();
+                    let mid = self.strike_y(baseline, sp.style, size);
                     self.ops.push(DrawOp::Line {
                         x0: pen,
                         y0: mid,
@@ -455,8 +476,7 @@ impl Md<'_> {
                 }
                 if sp.link.is_some() {
                     // Underline affordance: links read as clickable, not just blue.
-                    let m = self.fonts.metrics(sp.style, size);
-                    let uy = (baseline + m.descent * 0.4).round();
+                    let uy = self.underline_y(baseline, sp.style, size);
                     self.ops.push(DrawOp::Line {
                         x0: pen,
                         y0: uy,
@@ -772,8 +792,7 @@ impl Md<'_> {
                     let w = md.fonts.measure(sp.style, &piece, size);
                     md.text_op(ox, baseline, piece, sp.style, size, sp.color);
                     if sp.link.is_some() {
-                        let m = md.fonts.metrics(sp.style, size);
-                        let uy = (baseline + m.descent * 0.4).round();
+                        let uy = md.underline_y(baseline, sp.style, size);
                         md.ops.push(DrawOp::Line {
                             x0: ox,
                             y0: uy,
@@ -1063,6 +1082,60 @@ mod tests {
             _ => false,
         });
         assert!(link_line, "link underline missing");
+    }
+
+    #[test]
+    fn decorations_cross_the_glyphs_not_the_line_box() {
+        // The report, twice: the strike sat across the tops of the letters and
+        // the link underline sat on the baseline, clipping their feet. Both
+        // are measured off the glyphs now, so they land on the text.
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(&doc("~~struck~~ and [link](https://e.com)\n"), 800.0, &c);
+        let (baseline, size, style) = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::Text {
+                    y,
+                    size,
+                    style,
+                    text,
+                    ..
+                } if text.contains("struck") => Some((*y, *size, *style)),
+                _ => None,
+            })
+            .expect("the text was laid out");
+        let m = f.metrics(style, size);
+        let ys: Vec<f32> = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Line { y0, .. } => Some(*y0),
+                _ => None,
+            })
+            .collect();
+        let strike = ys
+            .iter()
+            .copied()
+            .find(|&y| y < baseline)
+            .expect("strike-through missing");
+        let underline = ys
+            .iter()
+            .copied()
+            .find(|&y| y > baseline)
+            .expect("link underline missing");
+        let want_strike = baseline - m.ascent * 0.27;
+        assert!(
+            (strike - want_strike).abs() <= 1.0,
+            "strike at {strike}, want {want_strike} (baseline {baseline})"
+        );
+        let want_underline = baseline - m.descent * 0.75;
+        assert!(
+            (underline - want_underline).abs() <= 1.0,
+            "underline at {underline}, want {want_underline} (baseline {baseline})"
+        );
     }
 
     #[test]

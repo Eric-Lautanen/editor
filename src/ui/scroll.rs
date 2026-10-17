@@ -64,10 +64,13 @@ const COAST_MAX_PX_PER_MS: f32 = 8.0;
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ScrollState {
     /// The user asked the OS to reduce motion (see
-    /// [`crate::platform::prefers_reduced_motion`]). Motion that exists only to
-    /// be pleasant — the wheel glide, the release coast — is switched off; the
-    /// input still moves the view exactly as far, just without the ride getting
-    /// there. Direct manipulation is unaffected: it was never animated.
+    /// [`crate::platform::prefers_reduced_motion`]). The wheel glide — a ride
+    /// the view takes to a destination the input already chose — is switched
+    /// off; the input still moves the view exactly as far, just at once. A
+    /// touch flick's coast stays: it is the tail of a direct manipulation, not
+    /// decoration, and platforms that offer this setting (iOS, Android, macOS)
+    /// keep scroll deceleration too. Switching it off made every flick stop
+    /// dead, which reads as a broken app rather than a calmer one.
     pub reduce_motion: bool,
     /// What the panes paint at.
     pub offset: f32,
@@ -105,13 +108,11 @@ impl ScrollState {
     /// flight is abandoned — the finger's momentum replaces it.
     pub fn coast_from(&mut self, v: f32) {
         self.target = self.offset;
-        // A flick that keeps travelling after the finger is gone is pure
-        // decoration: with motion reduced the release just stops, exactly as
-        // a release with no velocity always has.
-        if self.reduce_motion {
-            self.coast = 0.0;
-            return;
-        }
+        // Deliberately not gated on `reduce_motion`: the coast is the finger's
+        // own momentum carried past the lift, and a flick that stops dead the
+        // instant it is released is the one thing touch scrolling cannot do.
+        // What reduced motion switches off is the *wheel* glide (see
+        // `scroll_smooth`), a ride the input did not ask to watch.
         self.coast = v.clamp(-COAST_MAX_PX_PER_MS, COAST_MAX_PX_PER_MS);
         if self.coast.abs() <= COAST_MIN_PX_PER_MS {
             self.coast = 0.0;
@@ -437,21 +438,24 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_drops_the_release_coast() {
+    fn reduced_motion_keeps_the_flick_but_steps_the_wheel() {
+        // The report: with "Animation effects" off, a fast flick stopped dead
+        // under the finger. The coast is the end of a direct manipulation, so
+        // it survives; only the wheel's animated ride is dropped.
         let mut s = scroller(0.0);
         s.reduce_motion = true;
         s.coast_from(3.0);
-        assert_eq!(s.coast, 0.0, "a flick must not keep travelling");
-        assert!(!s.animating());
-        assert!(!s.step(FAST_FRAME_MS));
-        // Direct manipulation is untouched: the finger still moves the view.
-        s.scroll_by(40.0);
-        assert_eq!(s.offset, 40.0);
-        // A wheel notch arriving mid-glide still replaces a coast when motion
-        // is on again (the flag is read per call, not latched).
-        s.reduce_motion = false;
-        s.coast_from(2.0);
-        assert!(s.coast != 0.0);
+        assert!(s.coast != 0.0, "a flick must still keep travelling");
+        assert!(s.animating());
+        let (seen, ms) = run(&mut s, FAST_FRAME_MS);
+        let moved = seen.last().copied().unwrap_or(0.0);
+        assert!(moved > 300.0, "the flick coasted only {moved} px");
+        assert!(ms > 200.0, "and stopped after {ms} ms");
+        // The wheel, meanwhile, is applied at once: a notch is a scroll, not
+        // an animation.
+        s.scroll_smooth(-240.0);
+        assert!(s.coast == 0.0, "the wheel takes the view from here");
+        assert_eq!(s.target, s.offset);
     }
 
     #[test]

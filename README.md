@@ -237,6 +237,25 @@ zoom controls. Quit from `Ctrl+Q` or the window's ×.
 Your session — theme, view mode, open tabs, window size and position — is
 restored on the next start.
 
+## Code signing policy
+
+Signed Windows builds use [SignPath.io](https://signpath.io), with a
+certificate issued by the [SignPath Foundation](https://signpath.org):
+
+> Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+
+Roles: committers, reviewers and approvers are the repository's owner,
+[Eric Lautanen](https://github.com/Eric-Lautanen). Every release is built by
+this repository's GitHub Actions workflow on GitHub-hosted runners and is
+manually approved before it is signed.
+
+Privacy: this program will not transfer any information to other networked
+systems unless specifically requested by the user or the person installing or
+operating it. The only network request it can make is the update check, which
+asks GitHub for the latest release and can be turned off with `--no-update`
+or `EDITOR_NO_UPDATE_CHECK=1`.
+
 ## License
 
-MIT. The bundled Liberation Sans & Mono fonts are SIL OFL 1.1.
+MIT — see [LICENSE](LICENSE). The bundled Liberation Sans & Mono fonts are
+SIL OFL 1.1.

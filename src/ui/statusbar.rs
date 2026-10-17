@@ -203,10 +203,25 @@ pub fn paint(
 
     // ...and the hovered link last, where it cannot fight the button for
     // space: it is the least important thing on the bar and gets what is left.
+    // It gets its own slot: a hairline rule with air on both sides (painted
+    // straight after the facts it read as one run-on string, "100%https://…"),
+    // and the accent it wears in the document, so an address looks like an
+    // address instead of another fact about the file.
     if let Some(link) = bar.link {
-        let room = limit - x;
+        let air = 12.0 * scale;
+        let lx = x + air + scale.max(1.0) + air;
+        let room = limit - lx;
         if room > 24.0 * scale {
-            draw(canvas, link, theme.muted, x, room);
+            canvas.fill_rect(
+                Rect::new(
+                    (x + air).round(),
+                    area.y + 8.0 * scale,
+                    scale.max(1.0),
+                    area.h - 16.0 * scale,
+                ),
+                theme.rule,
+            );
+            draw(canvas, link, theme.accent, lx, room);
         }
     }
     canvas.set_clip(None);
@@ -331,6 +346,37 @@ mod tests {
             "the left edge must not jump when the label changes"
         );
         assert!(copied.rect.w > copy.rect.w);
+    }
+
+    /// Whether column `x` carries any ink (the bar's own background and its
+    /// top hairline rule are not ink).
+    fn has_ink(c: &Canvas, x: usize) -> bool {
+        let bg = Theme::light().code_bg.pack() & 0xFFFFFF;
+        (1..c.height).any(|y| c.pixels[y * c.width + x] & 0xFFFFFF != bg)
+    }
+
+    #[test]
+    fn a_hovered_link_gets_its_own_slot_after_the_facts() {
+        let fonts = FontSystem::load_embedded();
+        let info_end = 14.0 + fonts.measure(FontStyle::Regular, INFO, 12.5);
+        let (c, _) = paint_bar("", Some("https://example.com/docs"), None);
+        // Air first: the first few pixels after the facts carry nothing, so
+        // the address cannot run into the percentage the way it used to.
+        // (from just past the last glyph's bearing: the advance width stops
+        // short of a '%' whose antialiasing spills under a pixel)
+        let gap_start = info_end.ceil() as usize + 1;
+        let gap_end = (info_end + 8.0) as usize;
+        assert!(
+            !(gap_start..gap_end).any(|x| has_ink(&c, x)),
+            "the link starts immediately after the facts"
+        );
+        // Then the address itself, in the accent links wear in the document.
+        let accent = Theme::light().accent.pack() & 0xFFFFFF;
+        assert!(
+            (info_end as usize..c.width)
+                .any(|x| (1..c.height).any(|y| c.pixels[y * c.width + x] & 0xFFFFFF == accent)),
+            "the hovered address is not accent-tinted"
+        );
     }
 
     #[test]
