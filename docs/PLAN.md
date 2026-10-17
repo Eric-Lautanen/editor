@@ -196,7 +196,7 @@
 - **Centered window**: `CreateWindowExW` now positions the 1100×800 window
   at the center of the primary monitor (`GetSystemMetrics(SM_CX/ CYSCREEN)`)
   instead of `CW_USEDEFAULT`, which parks a `WS_POPUP` window top-left.
-- **M7 phase 2 landed** (buffy): `FontSystem` now parses the embedded
+- **M7 phase 2 landed**: `FontSystem` now parses the embedded
   Liberation TTFs live and rasterizes on demand behind the same API (no
   pre-rendered bitmap atlas); glyph cache shape unchanged. RAM stays flat —
   faces borrow the embedded bytes, glyphs rasterize per (char, size) on
