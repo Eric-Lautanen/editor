@@ -1149,3 +1149,31 @@ Three release blockers fell out of the same `-D warnings` run: a `mut` binding
 in `net::rungs` that only Windows uses, the deprecated `io::Error::new` form
 in the MSI stub, and a null-returning `platform::main_window` stub that
 nothing called once the gating above was honest about who owns the window.
+
+### Repo audit (Oct 2026) — a release can no longer ship a version it isn't, 390 tests green
+
+Prompted by a real bite: a locally built *test* MSI had been installed with a
+fabricated version (0.3.1) above the shipping line (0.2.2). Windows Installer
+treated every later release as a downgrade, refused it with "a newer version
+of Editor is already installed", and the updater's `msiexec … & start …`
+discarded that exit code — so the old build relaunched and the update looked
+like it had simply done nothing.
+
+- `release.yml` now fails before building anything unless the tag and the
+  package version agree, on every OS. The MSI is stamped from the tag and the
+  binary reports `Cargo.toml`; drift between them is invisible until an
+  install outranks the line it came from.
+- `update::parent_dir` replaces two `file.parent().unwrap()` calls in the
+  Linux and macOS install paths: an update reports a malformed staging path
+  instead of aborting the process.
+- `windows.rs`'s doc comment no longer lists comdlg32 dialogs, `WM_DROPFILES`
+  and `AttachConsole` as TODO(M6) — all three are implemented in that file.
+
+Inventory of what the audit turned up but did not change, because each needs a
+decision rather than a tidy-up: `--install` registers the icon and open command
+against the *running* exe (a build tree, if that is where it was run from), so
+`cargo clean` breaks those associations; `build.rs` embeds the icon and version
+resources only for MSVC, so a GNU local build is iconless by construction; the
+`editor_check_*` cross-builds leave `target_os` alone and cannot lint the other
+backends (they were failing that way already); `tools/recover_*.py` and
+`tools/restore_vscode_history.py` still hardcode `C:\github\readitor`.

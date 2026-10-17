@@ -11,9 +11,10 @@
 //! Threading: single thread. `State` lives in a leaked Box whose pointer is stored in
 //! GWLP_USERDATA and freed after the message loop ends.
 //!
-//! TODO(M6): comdlg32 file dialogs, WM_DROPFILES,
-//! parent-console attach so `--help` prints under the GUI subsystem.
-//! GUI subsystem. TODO(M9): macOS parity notes live in docs/PLAN.md.
+//! Everything M6 listed lives here now: `GetOpenFileNameW`/`GetSaveFileNameW`
+//! (comdlg32), `WM_DROPFILES` with `DragAcceptFiles`, and `AttachConsole` so
+//! `--help` reaches a console despite the GUI subsystem. The remaining
+//! cross-platform gaps are per-target, not per-milestone: see `Event`'s gates.
 use super::{Handler, Host};
 use crate::{
     error::{Error, Result},

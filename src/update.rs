@@ -794,12 +794,22 @@ fn windows_hidden_cmd(_script: &str) -> std::io::Result<std::process::Child> {
     ))
 }
 
+/// The directory a staged download lives in. Every caller unpacks *next to*
+/// the archive (that is what makes the final move a same-volume rename), and
+/// an update is not a place to abort the process because a path had no
+/// parent: report it and let the caller's consent/retry path handle it.
+fn parent_dir(file: &std::path::Path) -> Result<std::path::PathBuf> {
+    file.parent().map(|p| p.to_path_buf()).ok_or_else(|| {
+        Error::Platform(format!("the download has no directory: {}", file.display()))
+    })
+}
+
 /// Linux: unpack and rename the fresh binary over the running one. POSIX
 /// `rename` replaces an open executable in place, so this instance finishes
 /// serving files on the old image while the next launch (desktop entry,
 /// terminal) runs the new build.
 fn install_linux(file: &std::path::Path, tag: &str) -> Result<()> {
-    let dir = file.parent().unwrap().to_path_buf();
+    let dir = parent_dir(file)?;
     run_unpack("tar", &["-xzf".into()], file, &dir)?;
     // `release.yml` tarballs the staging dir, so the binary sits at its root.
     let fresh = dir.join("editor");
@@ -841,7 +851,7 @@ fn install_linux(file: &std::path::Path, tag: &str) -> Result<()> {
 /// legal on macOS — the image stays mapped — and the move is what the next
 /// Finder double-click or Dock `instance` launches.
 fn install_macos(file: &std::path::Path, tag: &str) -> Result<()> {
-    let dir = file.parent().unwrap().to_path_buf();
+    let dir = parent_dir(file)?;
     run_unpack("ditto", &["-x".into(), "-k".into()], file, &dir)?;
     let fresh = dir.join("Editor.app");
     let me = std::env::current_exe()
