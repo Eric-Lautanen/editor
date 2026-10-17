@@ -1400,7 +1400,6 @@ mod tests {
             4321,
             std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-install.txt"),
         );
-        std::fs::write(std::env::temp_dir().join("editor-script-dump.bat"), &script).unwrap();
         // The installer must install, then open the app exactly once.
         let install = script.find("msiexec /i \"").expect("installer line");
         let launch = script.find("explorer.exe \"").expect("relaunch line");
