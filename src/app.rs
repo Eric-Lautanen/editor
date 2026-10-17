@@ -121,7 +121,29 @@ pub struct Tab {
     pub h_max: f32,
     /// File modification time as last seen or written (reload detection).
     pub mtime: Option<std::time::SystemTime>,
+    /// Virtual-layout plan for a big JSONL (record tops, heights, id bases).
+    /// Empty for every other kind — small JSONLs take the plain layout.
+    pub plan: layout::json_tree::Plan,
+    /// The parsed JSONL records, for the virtualized path: the plan and the
+    /// band layouts index into this. Restated only when the buffer changes —
+    /// relayouts (scroll, resize, collapse) reuse it instead of re-parsing
+    /// a 33 MB document per frame.
+    pub records: Vec<jsonl::Record>,
+    /// Width the current `records`/`plan` were built at, so a resize rebuilds
+    /// them and a repaint at the same width does not.
+    pub plan_width: f32,
+    /// Collapsed-set generation at which `plan` was built; a toggle changes
+    /// record heights, so the plan is rebuilt against the new set.
+    pub plan_collapsed_gen: u32,
+    /// Bumped on every collapse toggle so the plan knows to rebuild.
+    pub collapsed_gen: u32,
 }
+
+/// JSONL files at or below this many lines take the plain (full) layout; a
+/// bigger one goes virtualized (per-record plan + visible-band paint). The
+/// threshold is generous — a 4000-record display list is milliseconds — and
+/// small files keep the byte-identical single-path behavior.
+pub const VIRTUAL_JSONL_LINES: usize = 4_000;
 
 /// Files above this are refused rather than opened (see [`size_error`]):
 /// everything Editor does — buffer, layout, render — is whole-document, so
@@ -157,6 +179,14 @@ impl Tab {
             h_target: 0.0,
             h_max: 0.0,
             mtime: None,
+            plan: layout::json_tree::Plan {
+                slots: Vec::new(),
+                height: 0.0,
+            },
+            records: Vec::new(),
+            plan_width: 0.0,
+            plan_collapsed_gen: 0,
+            collapsed_gen: 0,
         }
     }
 
@@ -989,8 +1019,49 @@ impl App {
             FileKind::Json => {
                 Self::layout_json(&tab.buffer, &tab.collapsed, &mut tab.status_extra, w, &ctx)
             }
-            FileKind::JsonLines => {
+            FileKind::JsonLines if tab.buffer.line_count() <= VIRTUAL_JSONL_LINES => {
                 Self::layout_jsonl(&tab.buffer, &tab.collapsed, &mut tab.status_extra, w, &ctx)
+            }
+            FileKind::JsonLines => {
+                // Virtualized: parse once into the tab (relayouts reuse it),
+                // plan once per width/zoom, and let paint lay out only the
+                // visible band of records. The display list height comes
+                // from the plan, so scrollbar math is unchanged.
+                if tab.records.is_empty() {
+                    let text = tab.buffer.text();
+                    tab.records = jsonl::parse_parallel(&text);
+                }
+                let errors = tab.records.iter().filter(|r| r.value.is_err()).count();
+                tab.status_extra = if errors == 0 {
+                    format!(
+                        "{} record{}",
+                        tab.records.len(),
+                        if tab.records.len() == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "{} record{}, {} error{}",
+                        tab.records.len(),
+                        if tab.records.len() == 1 { "" } else { "s" },
+                        errors,
+                        if errors == 1 { "" } else { "s" }
+                    )
+                };
+                if tab.plan_width != w
+                    || tab.plan.height == 0.0
+                    || tab.plan.slots.len() != tab.records.len()
+                    || tab.plan_collapsed_gen != tab.collapsed_gen
+                {
+                    tab.plan =
+                        layout::json_tree::build_plan(&tab.records, &tab.collapsed, w, &ctx, true);
+                    tab.plan_width = w;
+                    tab.plan_collapsed_gen = tab.collapsed_gen;
+                }
+                layout::display_list::DisplayList {
+                    ops: Vec::new(), // painted per-frame by paint_panes band path
+                    height: tab.plan.height,
+                    hits: Vec::new(),
+                }
             }
             FileKind::Markdown => {
                 tab.status_extra.clear();
@@ -1938,6 +2009,7 @@ impl App {
                     self.collapsed.remove(&id);
                 }
                 self.layout_dirty = true;
+                self.collapsed_gen += 1;
                 host.request_redraw();
                 true
             }
@@ -2256,7 +2328,7 @@ impl App {
         w: f32,
         ctx: &Ctx,
     ) -> DisplayList {
-        let records = jsonl::parse(&buf.text());
+        let records = jsonl::parse_parallel(&buf.text());
         let errors = records.iter().filter(|r| r.value.is_err()).count();
         *status_extra = if errors == 0 {
             format!(
@@ -2315,7 +2387,42 @@ impl App {
         if self.layout_dirty {
             self.relayout();
         }
+        // A virtualized JSONL tab paints a band of records laid out fresh
+        // each frame (only records at the scroll offset's viewport exist in
+        // ops), so the PreviewView sees a normal display list.
+        let virtual_jsonl = self.kind == FileKind::JsonLines
+            && self.buffer.line_count() > VIRTUAL_JSONL_LINES
+            && self.mode != Mode::Edit;
         let view = self.viewport();
+        if virtual_jsonl {
+            let top = self.scroll.offset;
+            let bottom = self.scroll.offset + view.h;
+            let ctx = self.ctx();
+            let band = layout::json_tree::layout_band(layout::json_tree::Band {
+                plan: &self.plan,
+                records: &self.records,
+                buf: &self.buffer,
+                collapsed: &self.collapsed,
+                width: self.size.0 as f32,
+                ctx: &ctx,
+                top,
+                bottom,
+            });
+            // Paint the band like the preview does: reuse PreviewView by
+            // handing it the fresh list for this frame. Hits are from the
+            // band only — matches what's clickable on screen.
+            let painted = PreviewView { list: band };
+            let scroll = self.scroll.offset;
+            painted.paint(
+                canvas,
+                &self.fonts,
+                &self.theme,
+                view,
+                PaneScroll::vertical(scroll),
+                self.metrics(),
+            );
+            return;
+        }
         match self.mode {
             Mode::Preview => {
                 let scroll = self.preview_scroll();

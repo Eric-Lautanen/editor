@@ -59,6 +59,47 @@ pub fn wrap_ranges(
     if chars.is_empty() {
         return vec![(0, 0)];
     }
+    // Monospace rows (the plain-text, log and tree panes) wrap on one fixed
+    // advance: asking the font per character is the same answer every time,
+    // and at a display list of a few hundred thousand characters that is a
+    // per-char FFI/cache walk dominating the relayout (measured: a 33 MB
+    // JSONL's tree layout drops from seconds to well under half with this).
+    // Only the mono face may take it — the proportional faces have real
+    // per-char advances — and ASCII/control characters fall back to the
+    // general measure below, which is also what handles any odd width.
+    if style == FontStyle::Mono && chars.iter().all(|c| c.is_ascii() && !c.is_control()) {
+        let adv = fonts.advance(style, '0', size).max(1.0);
+        let per_row = ((max_w / adv).max(1.0)) as usize;
+        let mut rows = Vec::new();
+        let n = chars.len();
+        let mut start = 0;
+        while start < n {
+            // A row that fits whole is never wrapped or trimmed, matching the
+            // general path's final row.
+            if n - start <= per_row {
+                rows.push((start, n));
+                break;
+            }
+            let ideal = start + per_row;
+            // Prefer an ASCII space break inside the window; a break after a
+            // space at position 0 is no progress, so hard-break instead (a
+            // window narrower than a word must still advance).
+            let cut = match chars[start..ideal].iter().rposition(|&c| c == ' ') {
+                Some(p) if p > 0 => start + p + 1,
+                _ => ideal,
+            };
+            // Trailing spaces are dropped from the break — the same rule the
+            // general path uses: this row ends before them, and the next one
+            // starts after them, so rejoining with a single space holds.
+            let mut end = cut;
+            while end > start && chars[end - 1] == ' ' {
+                end -= 1;
+            }
+            rows.push((start, end));
+            start = cut;
+        }
+        return rows;
+    }
     let mut rows = Vec::new();
     let mut start = 0;
     while start < chars.len() {
