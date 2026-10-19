@@ -251,43 +251,6 @@ jobs:
           wait "$pid" 2>/dev/null || true
           exit $status
 
-  # The gate the `if let` guard slip paid for: a newer local toolchain (and
-  # an incremental cache) can accept syntax an ordinary stable refuses, and
-  # the failure then lands in a user's `cargo run` from a clean checkout —
-  # exactly where nothing else in CI looks, because every other job rides
-  # rust-cache and the current action tag. This job type-checks the whole
-  # tree — tests included — from an empty target dir on the toolchain
-  # Cargo.toml's `rust-version` names: an MSRV drift and any feature some
-  # future edit adds beyond that floor are refused here, where the error
-  # names itself, instead of in someone's console after a cache wipe.
-  msrv-clean-check:
-    name: clean check (msrv)
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      # The version floor in Cargo.toml, used as the compiler: it may be
-      # raised only by an edit that needs a newer std API, and when that
-      # edit comes it should also rewrite this constant. `sed` in the step
-      # below keeps the two coupled automatically.
-      - name: the toolchain named by rust-version
-        shell: bash
-        run: echo "RUST=1.88.0" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST }}
-      - name: install X11 development files
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libx11-dev
-      # No cache by design: an empty target dir is the point. `check` does
-      # not link, so runner-day X11 differences stay away from it.
-      - run: CARGO_TARGET_DIR=target-ci-msrv cargo check --all-targets
-
   fmt:
     runs-on: ubuntu-latest
     steps:

@@ -598,6 +598,9 @@ impl App {
 
     /// Whether the locate point `at` (falling back to the tracked pointer)
     /// sits over the editor pane, in whichever mode is showing one.
+    /// Gated with its only caller: outside Windows (and the tests) nothing
+    /// locates a horizontal gesture, and dead helpers fail clippy there.
+    #[cfg(any(target_os = "windows", test))]
     fn over_editor_pane(&self, at: Option<(f32, f32)>) -> bool {
         match at {
             Some((x, y)) => self.editor_area().contains(Point { x, y }),
@@ -611,6 +614,7 @@ impl App {
     /// belongs to). The whole-length gate: Preview has no horizontal
     /// scroll of its own, and in Split the *pointer* decides which half a
     /// horizontal gesture drives, not the mode.
+    #[cfg(any(target_os = "windows", test))]
     fn pointer_or_default_over_editor(&self) -> bool {
         if self.last_mouse == (0.0, 0.0) {
             return true;

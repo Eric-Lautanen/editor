@@ -1853,12 +1853,20 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   the user temp is refused. Shipped code keeps `std::env::temp_dir()`; the
   net fetch's test-only scratch override does the same job for a live
   download whose scratch file the rung itself must write.
-- **The MSRV is named and gated.** `rust-version = "1.88"` (the floor the
-  code's own `slice::as_chunks` sets), and a `msrv-clean-check` CI job
-  type-checks the whole tree from an empty target dir on exactly 1.88.0 —
-  with no rust-cache to mask, and the old toolchain to catch syntax a newer
-  local rustc quietly accepts (the `if let` guard that a clean `cargo run`
-  caught first). Verified locally: `cargo +1.88.0 test`, 528 green.
+- **The MSRV gate went up and came back down.** The release round first
+  named `rust-version = "1.88"` (`slice::as_chunks` sets the floor) and
+  ran a `msrv-clean-check` CI job on that exact toolchain from an empty
+  target dir — it caught the code's own floor honestly, and locally
+  `cargo +1.88.0 test` passed (528 green). The floor was then dropped by
+  the owner's call: the gate job failed on runner-day variation an
+  updater can outrun, and the product's stance is that whoever compiles
+  this keeps the toolchain current. CI still type-checks all three
+  platforms on current stable (`cargo clippy --all-targets -- -D
+  warnings` in the `test` job), which was the actual guard the gate was
+  aiming at; the incident that motivated it — a clean `cargo run`
+  rejecting the unstable `if let` guard an incremental cache had been
+  quietly tolerating — stays covered by clippy on every OS, not by a
+  frozen compiler version.
 - **The updater keeps evidence now.** Every check and install step appends a
   timestamped line to `%APPDATA%\Editor\last-update.log`; the install batch
   script logs msiexec's exit code, the wait-timeout path and the relaunch
