@@ -110,6 +110,7 @@ pub fn due_for_check() -> bool {
 
 pub fn run() -> Result<()> {
     print_line("editor self-update:");
+    let _ = log_step("self-update: the console check started");
     // Leftovers from an update that already installed and exited before it
     // could tidy up (Windows: its own msi). The current tag's directory, if it
     // exists, is about to be replaced by `download` anyway.
@@ -120,13 +121,28 @@ pub fn run() -> Result<()> {
             if swept == 1 { "" } else { "s" }
         ));
     }
-    let Some(r) = newest_release()? else {
+    let Some(r) = (match newest_release() {
+        Ok(any) => any,
+        Err(e) => {
+            let _ = log_step(&format!("self-update: the check failed: {e}"));
+            return Err(e);
+        }
+    }) else {
+        let _ = log_step(&format!(
+            "self-update: already on the latest ({})",
+            env!("CARGO_PKG_VERSION")
+        ));
         print_line(&format!(
             "already on the latest version ({})",
             env!("CARGO_PKG_VERSION")
         ));
         return Ok(());
     };
+    let _ = log_step(&format!(
+        "self-update: {} -> {} found",
+        env!("CARGO_PKG_VERSION"),
+        r.tag
+    ));
     print_line(&format!(
         "{} -> {} found; downloading…",
         env!("CARGO_PKG_VERSION"),
@@ -150,13 +166,18 @@ pub fn background_check() {
     std::thread::Builder::new()
         .name("update-check".into())
         .spawn(|| {
+            let _ = log_step("background check started");
             let Ok(Some(r)) = newest_release() else {
+                let _ = log_step("background check: already on the latest");
                 return;
             };
+            let _ = log_step(&format!("background check: {} available", r.tag));
             if !ask_install(&r.tag) {
+                let _ = log_step("background check: the offer was declined");
                 return;
             }
             let _ = install(&r);
+            let _ = log_step("background check: the install sequence ended");
         })
         // A refused spawn skips the check for that one launch; not something
         // a GUI app can surface.
@@ -222,23 +243,33 @@ pub fn check_now(status: Status) {
         .name("update-check-manual".into())
         .spawn(move || {
             note_check_time();
+            let _ = log_step("manual check started");
             match newest_release() {
                 Ok(None) => report(&worker, Check::UpToDate),
                 Ok(Some(r)) => {
                     report(&worker, Check::Available(r.tag.clone()));
+                    let _ = log_step(&format!("manual check: {} available", r.tag));
                     if ask_install(&r.tag) {
                         if let Err(e) = install(&r) {
+                            let _ = log_step(&format!(
+                                "manual check: the offer was declined; install error: {e}"
+                            ));
                             report(
                                 &worker,
                                 Check::Failed(format!("The update could not be installed: {e}")),
                             );
                         }
+                    } else {
+                        let _ = log_step("manual check: the offer was declined");
                     }
                 }
-                Err(e) => report(
-                    &worker,
-                    Check::Failed(format!("Could not check for updates: {e}")),
-                ),
+                Err(e) => {
+                    let _ = log_step(&format!("manual check failed: {e}"));
+                    report(
+                        &worker,
+                        Check::Failed(format!("Could not check for updates: {e}")),
+                    )
+                }
             }
         });
     if spawned.is_err() {
@@ -487,9 +518,29 @@ impl Release {
 // ---------------------------------------------------------------- integrity
 
 fn install(r: &Release) -> Result<()> {
-    let file = r.download()?;
-    verify(&file, r)?;
-    match std::env::consts::OS {
+    rotate_update_log();
+    let _ = log_step(&format!("install requested for {}", r.tag));
+    let file = match r.download() {
+        Ok(f) => {
+            let _ = log_step(&format!("downloaded {}", f.display()));
+            f
+        }
+        Err(e) => {
+            let _ = log_step(&format!("download failed: {e}"));
+            return Err(e);
+        }
+    };
+    match verify(&file, r) {
+        Ok(()) => {
+            let _ = log_step("the checksum matches the release's SHA256SUMS");
+        }
+        Err(e) => {
+            let _ = log_step(&format!("the checksum refused the download: {e}"));
+            return Err(e);
+        }
+    }
+    let _ = log_step("handing over to the platform installer");
+    let outcome = match std::env::consts::OS {
         "windows" => install_windows(&file, &r.tag),
         "linux" => install_linux(&file, &r.tag),
         "macos" => install_macos(&file, &r.tag),
@@ -497,7 +548,11 @@ fn install(r: &Release) -> Result<()> {
             "no automated update for {other}; download from github.com/{REPO}/releases/tag/{}",
             r.tag
         ))),
+    };
+    if let Err(e) = &outcome {
+        let _ = log_step(&format!("install failed: {e}"));
     }
+    outcome
 }
 
 /// Compares the downloaded asset's SHA-256 with the one the release's
@@ -717,6 +772,13 @@ mod sha256 {
 }
 
 // ---------------------------------------------------------------- installing
+//
+// Every step also appends a timestamped line to the config dir's
+// `last-update.log`, one attempt per file with the previous attempt kept as
+// `last-update.1.log`, and the install batch script keeps logging after this
+// process exits (msiexec's exit code, the wait timeout, the relaunch). An
+// update that silently died somewhere between "closed the app" and "editor
+// back on screen" is diagnosable from those files afterwards.
 
 /// Windows: run the per-user MSI. `/passive` shows a progress bar but asks no
 /// questions, and a *newer* version installs over the old via the MSI's
@@ -749,9 +811,20 @@ fn install_windows(file: &std::path::Path, tag: &str) -> Result<()> {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(&result);
-    let script = windows_install_script(file, &installed_exe(), std::process::id(), &result);
+    let log_path = update_log_path(&dir);
+    let script = windows_install_script(
+        file,
+        &installed_exe(),
+        std::process::id(),
+        &result,
+        &log_path,
+    );
     let bat = dir.join("install.bat");
     std::fs::write(&bat, script)?;
+    let _ = log_step(&format!(
+        "install.bat staged in {}; this process exits so the msiexec inside it can replace the exe",
+        dir.display()
+    ));
     print_line(&format!("launching the installer for {tag}…"));
     // The script waits for this process to leave the process table before it
     // runs msiexec, so nothing here holds a handle the upgrade wants.
@@ -780,10 +853,60 @@ pub fn take_install_result() -> Option<u32> {
     let path = crate::settings::config_dir()?.join(INSTALL_RESULT);
     let text = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
+    let _ = log_step(&format!(
+        "the next launch read the install result: {}",
+        text.trim()
+    ));
     text.trim()
         .parse::<u32>()
         .ok()
         .filter(|code| !matches!(code, 0 | 3010 | 1641))
+}
+
+// ---------------------------------------------------------------- evidence
+
+/// What an update the user asked for left behind, after the fact: every step
+/// of the check and the install appends a timestamped line to the config
+/// dir's `last-update.log`. `last-install.txt` is conversational — removed
+/// once its notice shows — while the log is historical: "closed and never
+/// came back" is answered by reading that file, not by guessing which stage
+/// died. Best effort everywhere; a log write never fails an update.
+const UPDATE_LOG: &str = "last-update.log";
+/// One previous attempt sits beside the current one, so a second attempt
+/// cannot destroy the evidence of the first.
+const UPDATE_LOG_OLD: &str = "last-update.1.log";
+
+fn log_step(step: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(dir) = crate::settings::config_dir() else {
+        return Err(std::io::Error::other("no config directory"));
+    };
+    let line = format!("{} {step}\r\n", now_secs());
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(UPDATE_LOG))?
+        .write_all(line.as_bytes())
+}
+
+/// Each batch script line the trail needs lives in the one place the batch
+/// can find it. The script runs after this process has exited, so no
+/// Rust-side logging can see the msiexec outcome — the batch writes it.
+fn update_log_path(payload_dir: &std::path::Path) -> std::path::PathBuf {
+    crate::settings::config_dir()
+        .map(|d| d.join(UPDATE_LOG))
+        .unwrap_or_else(|| payload_dir.join(UPDATE_LOG))
+}
+
+/// A new attempt owns the current log; the previous one moves aside.
+fn rotate_update_log() {
+    let Some(dir) = crate::settings::config_dir() else {
+        return;
+    };
+    let path = dir.join(UPDATE_LOG);
+    let keep = dir.join(UPDATE_LOG_OLD);
+    let _ = std::fs::remove_file(&keep);
+    let _ = std::fs::rename(&path, &keep);
 }
 
 /// Put a failed update in front of the user, in the About box's status line —
@@ -837,6 +960,7 @@ fn windows_install_script(
     exe: &std::path::Path,
     pid: u32,
     result: &std::path::Path,
+    log: &std::path::Path,
 ) -> String {
     let mut s = String::new();
     s.push_str("@echo off\r\n");
@@ -846,6 +970,12 @@ fn windows_install_script(
         "tasklist /FI \"PID eq {pid}\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" \"{pid}\" >nul\r\n"
     ));
     s.push_str("if errorlevel 1 goto install\r\n");
+    // The timeout install-anyway is worth knowing about later: it is how a
+    // wait race becomes a 1603 with no window (see the comment above).
+    s.push_str(&format!(
+        "if %waited% geq {WAIT_TICKS} >>\"{}\" echo the app was still running after {WAIT_TICKS}s, installing anyway\r\n",
+        log.display()
+    ));
     s.push_str(&format!("if %waited% geq {WAIT_TICKS} goto install\r\n"));
     s.push_str("set /a waited+=1\r\n");
     s.push_str("ping -n 2 127.0.0.1 >nul\r\n");
@@ -859,7 +989,18 @@ fn windows_install_script(
     // `echo 1603>file`, and cmd reads the digit before `>` as a stream number,
     // so a `0` exit wrote the code nowhere at all.
     s.push_str(&format!(">\"{}\" echo %errorlevel%\r\n", result.display()));
+    // Same code into the log: last-install.txt is removed when its notice
+    // shows; the log is the historical copy.
+    s.push_str(&format!(
+        ">>\"{}\" echo msiexec exit %errorlevel%\r\n",
+        log.display()
+    ));
     s.push_str(&format!("explorer.exe \"{}\"\r\n", exe.display()));
+    s.push_str(&format!(
+        ">>\"{}\" echo relaunch: explorer {}\r\n",
+        log.display(),
+        exe.display()
+    ));
     s
 }
 
@@ -1402,6 +1543,7 @@ mod tests {
             std::path::Path::new(r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe"),
             4321,
             std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-install.txt"),
+            std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-update.log"),
         );
         // The installer must install, then open the app exactly once.
         let install = script.find("msiexec /i \"").expect("installer line");
@@ -1428,6 +1570,30 @@ mod tests {
         assert!(
             script.contains(r#""%SystemRoot%\System32\find.exe""#),
             "the Windows find is named by full path"
+        );
+        // A timed-out wait says so instead of installing silently: that is
+        // how a wait race becomes a no-window 1603, and the log is the only
+        // way to see it after the fact.
+        assert!(
+            script.contains("still running after 120s, installing anyway"),
+            "the timeout is logged, not just tolerated"
+        );
+        // The batch outlives this process, so it writes the trail itself:
+        // the msiexec outcome and the relaunch attempt land in the log.
+        let outcome_into_log = script
+            .find(r#">"C:\Users\me\AppData\Roaming\Editor\last-update.log" echo msiexec exit"#)
+            .expect("the batch logs msiexec's exit");
+        assert!(outcome_into_log > install, "after the installer runs");
+        assert_eq!(
+            script.matches("last-update.log").count(),
+            3,
+            "timeout, msiexec outcome and relaunch all reach the log"
+        );
+        let relaunch_log = script.find("echo relaunch:").expect("logs the relaunch");
+        let explorer_line = script.find("explorer.exe \"").expect("relaunch line");
+        assert!(
+            explorer_line < relaunch_log,
+            "the relaunch is logged after it is attempted"
         );
         // Bounded, so a reused PID cannot spin here for ever.
         let cap = script.find("if %waited% geq").expect("a bound on the wait");
@@ -1468,6 +1634,39 @@ mod tests {
             assert_eq!(take_install_result(), None, "{ok} is success");
             assert!(!path.exists());
         }
+    }
+
+    /// The trail an update leaves: one attempt's lines stay behind it, and a
+    /// new attempt moves the previous one aside rather than destroying it.
+    #[test]
+    fn the_update_log_rotates_and_keeps_the_previous_attempt() {
+        let dir = crate::settings::config_dir().expect("test config dir");
+        let path = dir.join(UPDATE_LOG);
+        let older = dir.join(UPDATE_LOG_OLD);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&older);
+
+        log_step("attempt one, step one").unwrap();
+        log_step("attempt one, step two").unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.contains("attempt one, step one"));
+        assert!(current.contains("attempt one, step two"));
+
+        rotate_update_log();
+        assert!(!path.exists(), "a new attempt starts with a fresh log");
+        let first = std::fs::read_to_string(&older).unwrap();
+        assert!(first.contains("attempt one, step one"));
+
+        log_step("attempt two").unwrap();
+        let again = std::fs::read_to_string(&path).unwrap();
+        assert!(again.contains("attempt two"));
+        assert!(
+            !again.contains("attempt one"),
+            "the old attempt moved aside"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&older);
     }
 
     #[test]

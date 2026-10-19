@@ -1859,6 +1859,15 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   with no rust-cache to mask, and the old toolchain to catch syntax a newer
   local rustc quietly accepts (the `if let` guard that a clean `cargo run`
   caught first). Verified locally: `cargo +1.88.0 test`, 528 green.
+- **The updater keeps evidence now.** Every check and install step appends a
+  timestamped line to `%APPDATA%\Editor\last-update.log`; the install batch
+  script logs msiexec's exit code, the wait-timeout path and the relaunch
+  attempt itself — that batch runs after the Rust process has exited, so no
+  Rust-side logging can see those steps. A new attempt rotates the previous
+  one to `last-update.1.log`, so a reproduction cannot destroy the evidence
+  it reproduces. Built for the update this round could only reconstruct:
+  the user's in-app update closed the app, never relaunched, left no
+  report — and nothing in the config dir said what msiexec had done.
 
 
 ## Remaining responsiveness work
