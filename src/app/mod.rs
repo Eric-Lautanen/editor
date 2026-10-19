@@ -628,6 +628,14 @@ impl App {
     /// Start (or refresh) the animation clock: the glide or coast needs
     /// frames, and on a host without one the 40 ms heartbeat steps it.
     fn start_glide_clock(&mut self, host: &mut dyn Host) {
+        if crate::platform::touch_trace_on() {
+            crate::platform::touch_log(format!(
+                "[touch] start_glide_clock: animating={} h_moving={} scrolling={}",
+                self.scroll.animating(),
+                self.h_scroll != self.h_target,
+                self.scrolling
+            ));
+        }
         if (self.scroll.animating() || self.h_scroll != self.h_target) && !self.scrolling {
             // A zero-velocity release leaves nothing to animate; don't start
             // the host's frame clock for it.
@@ -668,6 +676,13 @@ impl App {
         // the vertical scroller, preview panes have nothing to pan sideways,
         // and a flick is vertical by nature. Only the vertical ride continues.
         self.scroll.coast_from(-vy);
+        if crate::platform::touch_trace_on() {
+            crate::platform::touch_log(format!(
+                "[touch] coast_from: coast={:.3} animating={}",
+                self.scroll.coast,
+                self.scroll.animating()
+            ));
+        }
         self.start_glide_clock(host);
         host.request_redraw();
     }
@@ -716,6 +731,15 @@ impl App {
         let dt_ms = ((now - self.last_frame).as_secs_f32() * 1000.0).clamp(1.0, 100.0);
         self.last_frame = now;
         self.scroll.step(dt_ms);
+        if crate::platform::touch_trace_on() {
+            crate::platform::touch_log(format!(
+                "[touch] frame: dt={:.2} coast={:.3} offset={:.1} animating={}",
+                dt_ms,
+                self.scroll.coast,
+                self.scroll.offset,
+                self.scroll.animating()
+            ));
+        }
         // The horizontal glide rides the same clock with the same easing.
         self.h_target = self.h_target.clamp(0.0, self.h_max);
         if self.h_scroll != self.h_target {
@@ -3407,11 +3431,23 @@ impl Handler for App {
             }
             #[cfg(any(target_os = "windows", test))]
             Event::PanEnd { vx, vy } => {
+                if crate::platform::touch_trace_on() {
+                    crate::platform::touch_log(format!(
+                        "[touch] PanEnd: app got vx={vx:.3} vy={vy:.3}",
+                        vx = vx,
+                        vy = vy
+                    ));
+                }
                 // A selection drag is not a flick: it retires the gesture
                 // without a coast. That goes for a preview selection too.
                 let dragged = self.touch_sel.take().is_some();
                 let preview_dragged = self.preview_touch.take().is_some();
                 if dragged || preview_dragged {
+                    if crate::platform::touch_trace_on() {
+                        crate::platform::touch_log(format!(
+                            "[touch] PanEnd: RETIRED dragged={dragged} preview={preview_dragged}"
+                        ));
+                    }
                     host.request_redraw();
                     return;
                 }

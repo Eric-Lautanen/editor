@@ -47,6 +47,16 @@ mod macos;
 #[cfg(any(target_os = "windows", editor_check_win))]
 mod windows;
 
+// TEMPORARY DIAGNOSTIC — remove after the touch-inertia hunt.
+#[cfg(any(target_os = "windows", editor_check_win))]
+pub use self::windows::{touch_log, touch_trace_on};
+#[cfg(not(any(target_os = "windows", editor_check_win)))]
+pub fn touch_trace_on() -> bool {
+    false
+}
+#[cfg(not(any(target_os = "windows", editor_check_win)))]
+pub fn touch_log(_line: String) {}
+
 /// The main window's handle, or null if there is not one yet.
 ///
 /// Exists for one caller: `update::win_dialog` owns the update prompt to this

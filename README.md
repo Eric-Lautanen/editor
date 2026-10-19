@@ -352,7 +352,12 @@ which `cli.rs` keeps next to its argument parser):
 Dev-only flags (`--render OUT.ppm --size WxH --scale S --dark/--light
 --mode preview|edit|split --scroll PX`, and `--mem-report` in `mem-census`
 builds) draw the screenshots for this README and measure allocations; they
-are documented in `--help` and used by the tests, not by people.
+are documented in `--help` and used by the tests, not by people. One
+diagnostic reads an environment variable rather than a flag: start with
+`EDITOR_TOUCH_TRACE=1` and every touch phase — contact, move, the velocity
+estimate at lift, `PanEnd`, the coast it starts, and the frames that advance
+it — is appended to `%TEMP%\editor_touch_trace.log` (cost-free when off); a
+reported "no touch inertia" is diagnosed from that log.
 
 ## Code signing policy
 

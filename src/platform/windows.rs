@@ -838,6 +838,53 @@ const TAP_SLOP: f32 = 8.0;
 /// *last* ~100 ms rather than its whole history.
 const VELOCITY_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Touch diagnostics, all behind `EDITOR_TOUCH_TRACE=1`.
+///
+/// The touch path is the one input lane with no on-device observability: a
+/// WM_TOUCH stream cannot be synthesized (its handles are kernel objects), so
+/// a reported "no inertia" can only be read where a real finger lives. This
+/// switch writes each phase — contact start/ move/ lift, the velocity
+/// estimate it carries, `PanEnd` and the coast it starts, and the frame
+/// cadence that advances it — to `%TEMP%\editor_touch_trace.log`, cost-free
+/// when off (one env read, cached).
+fn touch_trace() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EDITOR_TOUCH_TRACE").is_some())
+}
+
+/// Whether touch diagnostic logging is on (see [`touch_trace`]). Shared with
+/// the app's coast/frame sites, which live outside this module.
+pub fn touch_trace_on() -> bool {
+    touch_trace()
+}
+
+/// Append one diagnostic line to `%TEMP%\editor_touch_trace.log`.
+pub fn touch_log(line: String) {
+    use std::io::Write;
+    let mut path = std::env::temp_dir();
+    path.push("editor_touch_trace.log");
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = writeln!(f, "{now} {line}");
+}
+macro_rules! ttrace {
+    ($($arg:tt)*) => {
+        if touch_trace() {
+            touch_log(format!($($arg)*));
+        }
+    };
+}
+
 /// One past touch position, kept while a contact is live so its release
 /// velocity can be estimated: `(when, x, y)`.
 struct TouchSample {
@@ -879,10 +926,12 @@ fn velocity(samples: &[TouchSample]) -> (f32, f32) {
     }
     let denom = n * stt - st * st;
     if denom <= f32::EPSILON * f32::EPSILON || n < 2.0 {
+        ttrace!("[touch] velocity: degenerate (n={n}, denom={denom}) -> (0,0)");
         return (0.0, 0.0);
     }
     let vx = (n * stx - st * sx) / denom;
     let vy = (n * sty - st * sy) / denom;
+    ttrace!("[touch] velocity: n={} span_ms={:.1} -> vx={vx:.3} vy={vy:.3}", n, samples.last().map(|s| s.t.duration_since(t0).as_secs_f32() * 1000.0).unwrap_or(0.0));
     (vx, vy)
 }
 
@@ -1827,6 +1876,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                     screen_to_client(hwnd, &mut pt);
                     let (x, y) = (pt.x as f32, pt.y as f32);
                     let now = Instant::now();
+                    if touch_trace() { touch_log(format!("[touch] WM_TOUCH contact action={:?} at=({x},{y})", touch_action(t.flags), x = x, y = y)); }
                     if touch_action(t.flags) == TouchAction::Down && st.touch.is_none() {
                         st.touch = Some((x, y));
                         st.touch_travel = 0.0;
@@ -1836,6 +1886,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                         if let Some((lx, ly)) = st.touch {
                             let (dx, dy) = (x - lx, y - ly);
                             st.touch_travel += dx.abs() + dy.abs();
+                            ttrace!("[touch] move dx={dx:.1} dy={dy:.1} hist={}", st.touch_history.len());
                             if dx != 0.0 || dy != 0.0 {
                                 // A finger is direct manipulation: `Pan`, not a
                                 // wheel-like step the app may glide to.
@@ -1854,6 +1905,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                         // nothing. Clear the history too, so a stray second
                         // `Up` cannot report a stale gesture.
                         let (vx, vy) = velocity(&st.touch_history);
+                        ttrace!("[touch] LIFT: vx={vx:.3} vy={vy:.3} travel={:.0} promoted={} hist={}", st.touch_travel, st.touch_promoted, st.touch_history.len());
                         st.touch_history.clear();
                         dispatch(st, hwnd, Event::PanEnd { vx, vy });
                         // A tap's promoted click was swallowed above, so issue
@@ -1910,9 +1962,11 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                 // A live clock re-arms only: stopping and recreating the timer
                 // on every gliding wheel notch would drop a beat.
                 if st.frame_timer.is_none() {
+                    ttrace!("[touch] WM_APP_ANIMATION start: creating frame timer");
                     st.frame_timer = create_frame_timer();
                 }
             } else if let Some(t) = st.frame_timer.take() {
+                ttrace!("[touch] WM_APP_ANIMATION stop: closing frame timer");
                 close_handle(t);
             }
             0
