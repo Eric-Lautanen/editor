@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use super::ast::*;
+use super::decode_entities;
 use super::inline::parse_inlines_with;
 
 /// Leading tabs count as 4 columns for indent measurement; the tab itself is
@@ -46,24 +47,42 @@ fn is_blank(line: &str) -> bool {
 }
 
 /// Strip YAML/TOML frontmatter: a leading `---`/`+++` line closed by the same
-/// marker. Only at the very top; a lone `---` still parses as rule/setext.
-fn strip_frontmatter(lines: &mut Vec<String>) {
-    if lines.is_empty() {
-        return;
+/// marker. Only at the very top, and only when the block actually looks like
+/// frontmatter — otherwise a document that happens to *start* with a
+/// horizontal rule and has another rule within the next fifty lines would
+/// silently lose everything between them.
+fn strip_frontmatter(lines: &mut Vec<String>) -> usize {
+    let Some(first) = lines.first() else {
+        return 0;
+    };
+    let marker = first.trim();
+    if marker != "---" && marker != "+++" {
+        return 0;
     }
-    let first = lines[0].trim();
-    if first != "---" && first != "+++" {
-        return;
-    }
-    let marker = first.to_string();
+    let marker = marker.to_string();
     // Bound the search so a 10k-line doc with no closing marker stays fast.
     let limit = lines.len().min(51);
-    for i in 1..limit {
-        if lines[i].trim() == marker {
-            lines.drain(0..=i);
-            return;
-        }
+    let Some(close) = (2..limit).find(|&i| lines[i].trim() == marker) else {
+        return 0;
+    };
+    // Frontmatter opens with a key/value line (`title: …`, `port = 8080`), not
+    // prose or a blank line. No such line means the `---` was a rule.
+    let opens_like_mapping = lines[1..close]
+        .iter()
+        .map(|l| l.trim())
+        .find(|t| !t.is_empty() && !t.starts_with('#'))
+        .is_some_and(|t| {
+            t.split_once([':', '=']).is_some_and(|(key, _)| {
+                let key = key.trim();
+                !key.is_empty() && !key.chars().any(char::is_whitespace)
+            })
+        });
+    if !opens_like_mapping {
+        return 0;
     }
+    let lead = close + 1;
+    lines.drain(0..=close);
+    lead
 }
 
 /// Normalize a reference label: trim, collapse inner whitespace, lowercase.
@@ -107,7 +126,7 @@ fn parse_ref_def(line: &str) -> Option<(String, String)> {
     if href.is_empty() || href.chars().any(|c| c.is_control()) {
         return None;
     }
-    Some((norm_label(label), href))
+    Some((norm_label(label), decode_entities(&href).into_owned()))
 }
 
 /// True when the line is a reference definition (used to break paragraphs).
@@ -116,9 +135,36 @@ fn is_ref_def(line: &str) -> bool {
 }
 
 /// Collect all reference definitions in the document.
+///
+/// Definitions are block-level constructs: a `[x]: url` line inside a fenced
+/// or indented code block is code, not a link target, and an HTML block is
+/// skipped as a whole. Scanning every line blindly let a code sample define
+/// links for the rest of the file.
 fn collect_ref_defs(lines: &[String]) -> HashMap<String, String> {
     let mut defs = HashMap::new();
+    let mut fence: Option<Fence> = None;
+    let mut html = false;
     for line in lines {
+        if let Some(open) = &fence {
+            if is_close_fence(line, open) {
+                fence = None;
+            }
+            continue;
+        }
+        if html {
+            if is_blank(line) {
+                html = false;
+            }
+            continue;
+        }
+        if let Some(open) = open_fence(line) {
+            fence = Some(open);
+            continue;
+        }
+        if is_html_block_start(line) || indent_of(line) >= 4 {
+            html = is_html_block_start(line);
+            continue;
+        }
         if let Some((label, href)) = parse_ref_def(line) {
             defs.entry(label).or_insert(href);
         }
@@ -332,20 +378,21 @@ fn is_html_block_start(line: &str) -> bool {
 fn split_row(line: &str) -> Vec<String> {
     let mut cells = Vec::new();
     let mut cur = String::new();
-    let mut chars = line.trim().chars().peekable();
     // Strip one leading/trailing pipe (they only frame the row).
-    let mut body: String = chars.collect();
-    if body.starts_with('|') {
-        body = body[1..].to_string();
-    }
-    if body.ends_with('|') {
-        body.pop();
-    }
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let body = body.strip_suffix('|').unwrap_or(body);
     let mut it = body.chars();
     while let Some(c) = it.next() {
         if c == '\\' {
             match it.next() {
+                // An escaped pipe is cell content, not a cell boundary.
+                Some('|') => cur.push('|'),
+                // Every other escape belongs to the inline parser, which
+                // knows which punctuation a backslash actually escapes. Eating
+                // it here made `\*\*` bold and `\n` lose its backslash.
                 Some(n) => {
+                    cur.push('\\');
                     cur.push(n);
                 }
                 None => cur.push('\\'),
@@ -358,8 +405,6 @@ fn split_row(line: &str) -> Vec<String> {
         }
     }
     cells.push(cur.trim().to_string());
-    chars = body.chars().peekable();
-    let _ = chars;
     cells
 }
 
@@ -436,8 +481,9 @@ impl Parser {
         false
     }
 
-    fn parse_top(&mut self) -> Vec<Block> {
+    fn parse_top(&mut self) -> (Vec<Block>, Vec<(u32, u32)>) {
         let mut blocks = Vec::new();
+        let mut spans: Vec<(u32, u32)> = Vec::new();
         while self.pos < self.lines.len() {
             if is_blank(self.peek().unwrap_or("")) {
                 self.pos += 1;
@@ -448,6 +494,13 @@ impl Parser {
                 self.pos += 1;
                 continue;
             }
+            // T2 · Record where each block sits in source lines: the run an
+            // edit lands in is found through these, so it can be re-parsed
+            // alone. A branch that pushes several blocks shares the range
+            // (the paragraph/table pair reads the same lines); blank lines,
+            // ref defs and skipped HTML blocks belong to no block.
+            let start = self.pos as u32;
+            let before = blocks.len();
             if let Some(b) = self.parse_fence() {
                 blocks.push(b);
             } else if let Some(b) = self.parse_atx() {
@@ -463,8 +516,15 @@ impl Parser {
             } else {
                 blocks.extend(self.parse_paragraph_or_table());
             }
+            let pushed = blocks.len() - before;
+            if pushed > 0 {
+                let end = self.pos as u32;
+                spans.extend(std::iter::repeat_n((start, end), pushed));
+            }
         }
-        blocks
+        blocks.shrink_to_fit();
+        spans.shrink_to_fit();
+        (blocks, spans)
     }
 
     /// Indented code: consecutive lines indented 4+. Blank lines ride along
@@ -722,11 +782,43 @@ impl Parser {
     }
 }
 
+#[cfg(test)]
 pub fn parse_blocks(src: &str) -> Document {
-    let mut lines: Vec<String> = src.lines().map(expand_leading_tabs).collect();
-    strip_frontmatter(&mut lines);
+    // A Windows editor may leave a UTF-8 BOM on the first line; it is not
+    // content, and without this a document that opens with a heading or fence
+    // parsed it as a paragraph ("\u{FEFF}# Title").
+    let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
+    let lines: Vec<String> = src.lines().map(expand_leading_tabs).collect();
+    let (doc, lead) = parse_lines(lines);
+    Document { lead, ..doc }
+}
+
+/// Parse a buffer without joining it into one string first. The renderer
+/// already has the lines; [`Buffer::text`] would copy the whole document just
+/// for the parser to split it again.
+pub fn parse_buffer(buf: &crate::core::buffer::Buffer) -> Document {
+    let mut lines: Vec<String> = Vec::with_capacity(buf.line_count());
+    for i in 0..buf.line_count() {
+        lines.push(expand_leading_tabs(buf.line(i)));
+    }
+    let (doc, lead) = parse_lines(lines);
+    Document { lead, ..doc }
+}
+
+fn parse_lines(mut lines: Vec<String>) -> (Document, u32) {
+    // A buffer can carry the BOM inside its first line.
+    if let Some(first) = lines.first_mut() {
+        if let Some(rest) = first.strip_prefix('\u{FEFF}') {
+            *first = rest.to_string();
+        }
+    }
+    let lead = strip_frontmatter(&mut lines);
     let defs = collect_ref_defs(&lines);
-    parse_blocks_with_defs(&lines.join("\n"), &defs)
+    // The lines are already split and tab-expanded; joining them only to split
+    // them again (and rescanning for definitions) was two full copies of the
+    // document on every parse.
+    let lead = u32::try_from(lead).unwrap_or(u32::MAX);
+    (parse_top_lines(lines, defs), lead)
 }
 
 fn parse_blocks_with_defs(src: &str, outer: &HashMap<String, String>) -> Document {
@@ -737,13 +829,341 @@ fn parse_blocks_with_defs(src: &str, outer: &HashMap<String, String>) -> Documen
     for (label, href) in collect_ref_defs(&lines) {
         defs.entry(label).or_insert(href);
     }
+    parse_top_lines(lines, defs)
+}
+
+fn parse_top_lines(lines: Vec<String>, defs: HashMap<String, String>) -> Document {
     let mut p = Parser {
         lines,
         pos: 0,
         defs,
     };
+    let (blocks, spans) = p.parse_top();
     Document {
-        blocks: p.parse_top(),
+        blocks,
+        spans,
+        lead: 0,
+        defs: p.defs,
+    }
+}
+
+/// T2 · The edited-block splice. `old` is the document the pane was planned
+/// from; `buf` is the text after the edits, and `edits` is the buffer's edit
+/// log in the coordinates of that text (see [`EditSpan`] for the exact
+/// shape). Returns the document a whole re-parse would produce, assembled
+/// from the old blocks wherever the edit left them verbatim — or `None`
+/// when the edit cannot be localized safely, which the caller answers with
+/// a full re-parse.
+///
+/// Only the bookkeeping needs the block list: the line ranges in
+/// [`Document::spans`] name the run the edit landed in, the run is widened
+/// to blank-line boundaries (the one rule that lets a slice re-parse stand
+/// in for a whole-document one — every block association the parser makes
+/// across a non-blank line is inside the widened run), the slice is
+/// re-parsed with the full document's reference definitions so inline links
+/// resolve exactly as a whole parse would resolve them, and blocks and
+/// spans are spliced back. An unclosed fence, a list, a table: each is one
+/// block with one span, so the run widens through/around them without
+/// special cases.
+///
+/// Divergence from a whole re-parse is possible in one corner: an edit that
+/// removes lines which carried reference definitions used by links in the
+/// *kept* blocks. The guard below sends such edits (any removal with a
+/// kept-region definition or a resolved link in play) to the full parse
+/// rather than splice stale inline content — the honesty the JSON patch
+/// already has.
+/// T2 · The block-run a splice replaced: (blocks kept above, old run
+/// length, new run length). The plan patch uses it to skip re-deriving the
+/// run by comparing whole documents block by block.
+pub type MdSpliceRun = (usize, usize, usize);
+
+pub fn patch_document(
+    mut old: Document,
+    buf: &crate::core::buffer::Buffer,
+    edits: &[crate::core::buffer::EditSpan],
+) -> (Document, Option<MdSpliceRun>) {
+    let n = buf.line_count();
+    // The affected lines, with one merged-boundary row either side of each
+    // edit — the same ±1 rule `touched_extent` prices: a deletion joins two
+    // lines at `e.start`, and that joined line is a line that changed.
+    let lo_b = edits
+        .iter()
+        .map(|e| e.start.saturating_sub(1))
+        .min()
+        .unwrap_or(0);
+    let hi_b = edits
+        .iter()
+        .map(|e| e.start.saturating_add(e.inserted).saturating_add(1))
+        .max()
+        .unwrap_or(0)
+        .min(n);
+    if lo_b >= hi_b {
+        return (old, None);
+    }
+    let lead = old.lead as usize;
+    // Frontmatter lines belong to the lead and no block does; an edit
+    // touching them does not localize.
+    if lo_b < lead {
+        return (old, None);
+    }
+    // Rebase every block's span into the current text's coordinates: the
+    // splice decides kept / re-parsed on these, so a deletion that pulled
+    // `para two` up beside `para one` is seen where it now sits. The spans
+    // vec is the caller's document's own, so this is an in-place pass and
+    // the document always comes back, whatever the splice decided.
+    // Each edit replaces old lines `[start, start+removed)` (in the text as
+    // the edits before it left it) with `inserted` lines; a boundary landing
+    // inside a removed run clamps to the replacement's edge.
+    let mut cur = std::mem::take(&mut old.spans);
+    for e in edits {
+        let st = (e.start.saturating_sub(lead)) as i64;
+        let r_end = st + e.removed as i64;
+        let r_ins = st + e.inserted as i64;
+        for span in cur.iter_mut() {
+            let b0 = span.0 as i64;
+            let b1 = span.1 as i64;
+            let n0 = if b0 > r_end {
+                (r_ins + (b0 - r_end)) as u32
+            } else if b0 > st {
+                st as u32
+            } else {
+                b0 as u32
+            };
+            let n1 = if b1 >= r_end {
+                (r_ins + (b1 - r_end)) as u32
+            } else if b1 > st {
+                r_ins as u32
+            } else {
+                b1 as u32
+            };
+            *span = (n0, n1);
+        }
+    }
+    let lo_d = lo_b - lead;
+    let hi_d = hi_b - lead;
+    // The neighborhood: the affected lines widened across non-blank lines
+    // until a blank or the document's edge. Every block association the
+    // parser makes across a non-blank line (a paragraph's continuation, a
+    // list item's lazy line) lies inside it, and the lines just outside are
+    // blank - the one rule that lets a slice re-parse stand in for a whole
+    // parse of the same middle. Document coordinates throughout; the buffer
+    // lines are one `lead` below the doc line index.
+    let mut b_lo = lo_d;
+    while b_lo > 0 && !is_blank(buf.line(b_lo + lead - 1)) {
+        b_lo -= 1;
+    }
+    let mut b_hi = hi_d;
+    while b_hi < n - lead && !is_blank(buf.line(b_hi + lead)) {
+        b_hi += 1;
+    }
+    // The run: every block whose span meets the neighborhood. An unclosed
+    // fence's giant block and a list's span have whole-parse ends that reach
+    // past the blank the neighborhood stops at, so meeting it puts their
+    // whole extent in the run.
+    let mut first = None;
+    let mut last = 0usize;
+    for (i, &(s0, s1)) in cur.iter().enumerate() {
+        if (s1 as usize) > b_lo && (s0 as usize) < b_hi {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = i;
+        }
+    }
+    // The slice sits between `s_lo` and `s_hi`, in document coordinates.
+    // With a run, its bounds are the neighborhood's widened to the first /
+    // last run block's own span edges - a block's span may cross blank
+    // lines (a fenced or indented code block's interior), so a run block
+    // that reaches outside the neighborhood pulls the slice with it. With
+    // no run, the neighborhood itself: the splice resamples the blank gap,
+    // where blocks may now appear that no span ever numbered.
+    let s_lo = match first {
+        Some(_) => b_lo.min(cur[first.unwrap_or(0)].0 as usize),
+        None => b_lo,
+    };
+    let s_hi = match first {
+        Some(_) => b_hi.max(cur[last].1 as usize),
+        None => b_hi,
+    };
+    // A fence standing open at the slice's lower boundary runs the whole
+    // parse's block past the blank behind it: stretch the slice on to its
+    // close line (or to the text's end when it never closes), then look
+    // again. The close is found within one pass, so this bound never trips.
+    let mut s_hi = s_hi;
+    for _ in 0..4 {
+        let mut open: Option<Fence> = None;
+        for i in 0..(s_hi + lead).min(n) {
+            let line = expand_leading_tabs(buf.line(i));
+            match &open {
+                Some(f) => {
+                    if is_close_fence(&line, f) {
+                        open = None;
+                    }
+                }
+                None => {
+                    if let Some(f) = open_fence(&line) {
+                        open = Some(f);
+                    }
+                }
+            }
+        }
+        let Some(carried) = open else {
+            break;
+        };
+        let mut i = (s_hi + lead).min(n);
+        while i < n && !is_close_fence(&expand_leading_tabs(buf.line(i)), &carried) {
+            i += 1;
+        }
+        // The close line is the block's own: a whole parse consumes it, so
+        // the slice ends one line past it.
+        s_hi = (i + 1).min(n) - lead;
+    }
+    // Which old blocks the splice keeps: everything above the slice, and
+    // everything that starts at or after its end. With a run these are the
+    // head and the tail; with none, they split at the first block that was
+    // numbered below the blank gap.
+    let below_start = cur
+        .iter()
+        .position(|&(s0, _)| (s0 as usize) >= s_hi)
+        .unwrap_or(cur.len());
+    let above_end = first.unwrap_or(below_start);
+    // A definition line inside the affected range: the splice would re-parse
+    // it in isolation and the kept blocks' labels may resolve differently.
+    for i in lo_b..hi_b {
+        if is_ref_def(&expand_leading_tabs(buf.line(i))) {
+            old.spans = cur;
+            return (old, None);
+        }
+    }
+    // Whether the edit could change the reference map at all. Line-structural
+    // edits (a removal shuffles def lines and blank gaps) can, and so can a
+    // byte deletion (its removed bytes may have been the head of a def). A
+    // pure insertion inside an unrewritten line count cannot: the pre-edit
+    // line is the current one with the inserted run spliced out (`at` is the
+    // same offset before and after), and only a def line being rewritten
+    // matters — the current shape was refused in range above, the pre-edit
+    // shape here.
+    let mut map_can_change = edits
+        .iter()
+        .any(|e| e.removed != e.inserted || e.removed_bytes() > 0);
+    if !map_can_change {
+        for e in edits.iter() {
+            if e.inserted_bytes() == 0 {
+                continue;
+            }
+            let i = e.start;
+            if i >= buf.line_count() {
+                map_can_change = true;
+                break;
+            }
+            let line = buf.line(i);
+            let cut = e.at.saturating_sub(buf.line_start_byte(i));
+            if cut > line.len() {
+                map_can_change = true;
+                break;
+            }
+            let mut old_line = String::with_capacity(line.len());
+            old_line.push_str(&line[..cut]);
+            if cut + e.inserted_bytes() <= line.len() {
+                old_line.push_str(&line[cut + e.inserted_bytes()..]);
+            }
+            if is_ref_def(&expand_leading_tabs(&old_line)) {
+                map_can_change = true;
+                break;
+            }
+        }
+    }
+    // A removal next to kept definitions or kept resolved links: the removed
+    // lines are inside the slice, so a re-parse of it sees the same text -
+    // but the kept blocks were resolved against the old map, and a label the
+    // removed lines defined (or changed) would now render differently in a
+    // whole parse. Ref defs live in blank gaps, so either kept-region
+    // definitions or a resolved link in a kept block is enough to go whole.
+    if map_can_change {
+        let kept_defs = (0..s_lo + lead)
+            .any(|i| i < n && is_ref_def(&expand_leading_tabs(buf.line(i))))
+            || ((s_hi + lead)..n).any(|i| is_ref_def(&expand_leading_tabs(buf.line(i))));
+        let kept_links = old
+            .blocks
+            .iter()
+            .enumerate()
+            .any(|(i, b)| (i < above_end || i >= below_start) && block_carries_link(b));
+        if kept_defs || kept_links {
+            old.spans = cur;
+            return (old, None);
+        }
+    }
+    // The slice, from the current text, tab-expanded like every parse path.
+    let slice: Vec<String> = (s_lo + lead..(s_hi + lead).min(n))
+        .map(|i| expand_leading_tabs(buf.line(i)))
+        .collect();
+    // Full-document definitions: collected over the whole current text, in
+    // order, so a slice label resolves to the same href a whole parse gives
+    // it (first one wins there and here alike). The scan is a whole pass
+    // over the text, so an edit that provably kept the map reuses the old
+    // parse's instead: a keystroke prices no document walk.
+    let defs = if !map_can_change {
+        old.defs.clone()
+    } else {
+        let mut all_lines: Vec<String> = (0..n).map(|i| expand_leading_tabs(buf.line(i))).collect();
+        if let Some(first_line) = all_lines.first_mut() {
+            if let Some(rest) = first_line.strip_prefix('\u{FEFF}') {
+                *first_line = rest.to_string();
+            }
+        }
+        collect_ref_defs(&all_lines)
+    };
+    let mut p = Parser {
+        lines: slice,
+        pos: 0,
+        defs,
+    };
+    let (blocks, spans) = p.parse_top();
+    // Splice in place: kept head, re-parsed middle, kept tail. No copy of
+    // the document's blocks on either side — the splices move the kept ones
+    // inside their own `Vec`s, and the tail's spans arrive rebased already.
+    old.blocks.splice(above_end..below_start, blocks);
+    cur.splice(
+        above_end..below_start,
+        spans
+            .iter()
+            .map(|&(s0, s1)| (s0 + s_lo as u32, s1 + s_lo as u32)),
+    );
+    old.spans = cur;
+    if map_can_change {
+        old.defs = p.defs;
+    }
+    (old, Some((above_end, below_start - above_end, spans.len())))
+}
+
+/// T2 · Whether a block's inline content carries any resolved link or
+/// image — the shape the guard above keys on. Only asked when a removal is
+/// in play.
+fn block_carries_link(b: &Block) -> bool {
+    match b {
+        Block::Heading { content, .. } | Block::Paragraph(content) => {
+            content.iter().any(inline_carries_link)
+        }
+        Block::Code { .. } | Block::Rule => false,
+        Block::Quote(blocks) => blocks.iter().any(block_carries_link),
+        Block::List { items, .. } => items
+            .iter()
+            .any(|item| item.blocks.iter().any(block_carries_link)),
+        Block::Table { head, rows, .. } => head
+            .iter()
+            .chain(rows.iter().flatten())
+            .flatten()
+            .any(inline_carries_link),
+    }
+}
+
+fn inline_carries_link(i: &Inline) -> bool {
+    match i {
+        Inline::Link { .. } | Inline::Image { .. } => true,
+        Inline::Text(_) | Inline::Code(_) | Inline::SoftBreak | Inline::HardBreak => false,
+        Inline::Emph(v) | Inline::Strong(v) | Inline::Strike(v) => {
+            v.iter().any(inline_carries_link)
+        }
     }
 }
 
@@ -768,6 +1188,27 @@ mod tests {
         let d = parse_blocks("Title\n=====\n\nSub\n---");
         assert!(matches!(d.blocks[0], Block::Heading { level: 1, .. }));
         assert!(matches!(d.blocks[1], Block::Heading { level: 2, .. }));
+    }
+
+    #[test]
+    fn a_bom_does_not_hide_the_first_block() {
+        let d = parse_blocks("\u{FEFF}# Title\n\n```rust\nlet x = 1;\n```");
+        assert!(
+            matches!(d.blocks[0], Block::Heading { level: 1, .. }),
+            "BOM broke the heading: {d:?}"
+        );
+        assert!(
+            matches!(d.blocks[1], Block::Code { .. }),
+            "BOM broke the fence: {d:?}"
+        );
+    }
+
+    #[test]
+    fn parsing_a_buffer_matches_parsing_its_text() {
+        let src =
+            "\u{FEFF}# Title\n\nA **para** with `code`.\n\n- [x] task\n\n```rs\nfn f() {}\n```";
+        let buf = crate::core::buffer::Buffer::from_text(src);
+        assert_eq!(parse_blocks(src), parse_buffer(&buf));
     }
 
     #[test]
@@ -826,6 +1267,20 @@ mod tests {
     }
 
     #[test]
+    fn table_escapes_reach_the_inline_parser_intact() {
+        // `\|` is cell content; every other escape is the inline parser's job.
+        // Eating the backslash here used to turn `\*\*x\*\*` into bold text.
+        let d = parse_blocks("| a \\*\\*x\\*\\* | b \\| c |\n|---|---|");
+        match &d.blocks[0] {
+            Block::Table { head, .. } => {
+                assert_eq!(head[0], vec![Inline::Text("a **x**".into())]);
+                assert_eq!(head[1], vec![Inline::Text("b | c".into())]);
+            }
+            other => panic!("expected table, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn html_ignored() {
         let d = parse_blocks("<div>\nskipped\n</div>\n\nkept");
         assert_eq!(d.blocks.len(), 1);
@@ -837,9 +1292,28 @@ mod tests {
         let d = parse_blocks("---\ntitle: hi\n---\n\n# Real\n");
         assert_eq!(d.blocks.len(), 1, "frontmatter must not render: {d:?}");
         assert!(matches!(d.blocks[0], Block::Heading { level: 1, .. }));
+        // TOML frontmatter too.
+        let d = parse_blocks("+++\ntitle = \"hi\"\n+++\n\n# Real\n");
+        assert_eq!(d.blocks.len(), 1, "frontmatter must not render: {d:?}");
+        // A leading comment inside the block does not stop it from looking
+        // like frontmatter.
+        let d = parse_blocks("---\n# a comment\ntitle: hi\n---\n\n# Real\n");
+        assert_eq!(d.blocks.len(), 1, "frontmatter must not render: {d:?}");
         // No closing marker: a lone --- still parses as a rule.
         let d = parse_blocks("---\n\ntext");
         assert!(matches!(d.blocks[0], Block::Rule));
+    }
+
+    #[test]
+    fn a_document_that_starts_with_a_rule_keeps_its_content() {
+        // `---` … `---` with prose between them is two thematic breaks, not
+        // frontmatter. Stripping it would silently delete the paragraph.
+        let d = parse_blocks("---\n\nA paragraph.\n\n---\n\nAfter");
+        assert_eq!(d.blocks.len(), 4, "content lost: {d:?}");
+        assert!(matches!(d.blocks[0], Block::Rule));
+        assert!(matches!(&d.blocks[1], Block::Paragraph(v) if !v.is_empty()));
+        assert!(matches!(d.blocks[2], Block::Rule));
+        assert!(matches!(&d.blocks[3], Block::Paragraph(v) if !v.is_empty()));
     }
 
     #[test]
@@ -890,5 +1364,146 @@ mod tests {
             ),
             other => panic!("expected paragraph, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_definition_inside_code_or_html_does_not_resolve() {
+        // The code sample must stay code, and `[x]` after it must stay text.
+        let d = parse_blocks("```\n[x]: https://example.com\n```\n\n[x]\n");
+        assert!(matches!(d.blocks[0], Block::Code { .. }));
+        match &d.blocks[1] {
+            Block::Paragraph(v) => assert!(
+                v.iter().all(|n| !matches!(n, Inline::Link { .. })),
+                "a code sample defined a link: {v:?}"
+            ),
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+        let d = parse_blocks("<div>\n[y]: https://example.com\n</div>\n\n[y]\n");
+        assert!(
+            d.blocks.iter().all(|b| match b {
+                Block::Paragraph(v) => v.iter().all(|n| !matches!(n, Inline::Link { .. })),
+                _ => true,
+            }),
+            "an HTML block defined a link: {d:?}"
+        );
+    }
+
+    // ---- T2 · The edited-block splice -----------------------------------
+
+    use crate::core::buffer::{Buffer, Pos};
+
+    /// The splice must equal a whole re-parse — blocks *and* the span
+    /// bookkeeping, since `Document`'s equality compares both.
+    fn assert_splice_equals_whole(before: &str, edit: impl FnOnce(&mut Buffer)) {
+        let mut buf = Buffer::from_text(before);
+        let old = parse_buffer(&buf);
+        edit(&mut buf);
+        let edits = buf.take_edits().expect("the edit logged itself");
+        let whole = parse_buffer(&buf);
+        let (spliced, splice) = patch_document(old, &buf, &edits);
+        assert!(splice.is_some(), "the edit must localize: {before:?}");
+        assert_eq!(spliced, whole, "splice diverged from a whole re-parse");
+    }
+
+    fn edit_line(buf: &mut Buffer, line: usize, suffix: &str) {
+        let len = buf.line(line).len();
+        buf.insert(Pos { line, col: len }, suffix);
+    }
+
+    #[test]
+    fn t2_an_edit_inside_a_paragraph_splices_to_the_whole_parse() {
+        assert_splice_equals_whole(
+            "# Title\n\nfirst paragraph line\nsecond paragraph line\n\n## Next\n\nother words\n",
+            |buf| edit_line(buf, 2, " plus a tail"),
+        );
+    }
+
+    #[test]
+    fn t2_a_fence_opened_to_eof_localizes_through_its_end() {
+        // The whole-parse gives the unclosed fence one block that swallows
+        // the rest of the document; the splice must reproduce it.
+        assert_splice_equals_whole("para one\n\npara two\n\ntail body\n", |buf| {
+            buf.insert(Pos { line: 4, col: 0 }, "```rs\nfn f() {}\n");
+        });
+    }
+
+    #[test]
+    fn t2_deleting_the_blank_line_between_two_paragraphs_merges_exactly() {
+        assert_splice_equals_whole("para one\n\npara two\n\nlast\n", |buf| {
+            buf.delete(Pos { line: 1, col: 0 }, Pos { line: 2, col: 0 });
+        });
+    }
+
+    #[test]
+    fn t2_a_table_row_edit_stays_whole() {
+        assert_splice_equals_whole(
+            "heading\n\n| a | b |\n| --- | ---: |\n| 1 | 2 |\n| 3 | 4 |\n\ntail\n",
+            |buf| edit_line(buf, 4, " | 5"),
+        );
+    }
+
+    #[test]
+    fn t2_a_nested_list_item_edit_stays_whole() {
+        assert_splice_equals_whole(
+            "intro\n\n- one\n- two\n  - deeper\n- three\n\nover\n",
+            |buf| edit_line(buf, 4, " words"),
+        );
+    }
+
+    #[test]
+    fn t2_a_lazy_quote_continuation_stays_whole() {
+        assert_splice_equals_whole(" > quoted\ncontinuation\n\nafter\n", |buf| {
+            edit_line(buf, 1, " more")
+        });
+    }
+
+    #[test]
+    fn t2_the_run_widens_across_a_non_blank_boundary() {
+        // Two adjacent paragraphs (no blank between) that a heading
+        // interrupts? A paragraph continues until structure: editing inside
+        // the created run must widen past the paragraph close, which the
+        // ATX heading above provides. Adjacent blocks of different kinds.
+        assert_splice_equals_whole("# Head\npara directly under it\n\nnext para\n", |buf| {
+            edit_line(buf, 1, " tail")
+        });
+    }
+
+    #[test]
+    fn t2_an_edit_on_the_first_and_last_line_stays_whole() {
+        assert_splice_equals_whole("first\n\nlast", |buf| {
+            edit_line(buf, 0, " start");
+            let n = buf.line_count() - 1;
+            let len = buf.line(n).len();
+            buf.insert(Pos { line: n, col: len }, " end");
+        });
+    }
+
+    #[test]
+    fn t2_a_blank_gap_edit_localizes_as_a_no_op() {
+        // Pure blank-line edits never change which blocks exist in the text
+        // around them; the splice re-numbers everything below and equals a
+        // whole re-parse.
+        assert_splice_equals_whole("para\n\n\nother\n", |buf| {
+            buf.insert(Pos { line: 1, col: 0 }, "\n");
+        });
+    }
+
+    #[test]
+    fn t2_edits_a_splice_must_not_claim() {
+        // A reference definition inside the affected range.
+        let mut buf = Buffer::from_text("para\n\nother\n");
+        let old = parse_buffer(&buf);
+        buf.insert(Pos { line: 2, col: 0 }, "[x]: https://example.com\n");
+        let edits = buf.take_edits().unwrap();
+        let (_, spliced) = patch_document(old, &buf, &edits);
+        assert!(!spliced.is_some(), "a ref-def edit must not splice");
+        // Frontmatter is outside every block and inside the lead.
+        let mut buf2 = Buffer::from_text("---\ntitle: x\n---\n\nbody\n");
+        let old2 = parse_buffer(&buf2);
+        assert_eq!(old2.lead, 3, "frontmatter lifts the block lines");
+        edit_line(&mut buf2, 0, "y");
+        let edits2 = buf2.take_edits().unwrap();
+        let (_, spliced2) = patch_document(old2, &buf2, &edits2);
+        assert!(!spliced2.is_some(), "a frontmatter edit must not splice");
     }
 }

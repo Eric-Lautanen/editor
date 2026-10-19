@@ -87,8 +87,29 @@ pub fn parse_line(line: &str, delim: char) -> Vec<String> {
     fields
 }
 
-pub fn parse(text: &str) -> Sheet {
-    let delimiter = sniff(text);
+/// The delimiter the file's own extension names, if one does.
+///
+/// Only `.tsv`/`.tab` are unambiguous enough to pin; `.csv` names a comma in
+/// most locales but some tools write semicolons there (the Excel dialect),
+/// so the sniffer keeps the deciding vote for it.
+/// The delimiter the file's own extension names, if one does.
+///
+/// A `.tsv`/`.tab` file is tab-delimited by name, and sniffing can disagree:
+/// one prose row (a note pasted in) carries commas that outrank the tab
+/// count, and the sheet then widens with a ragged no-delimiter row — every
+/// later data cell slides one field over. When the extension names the
+/// delimiter, it wins. `.csv` is *not* pinned: some locales write it with
+/// semicolons, so the sniffer keeps the deciding vote there.
+pub fn hint_delimiter(ext: Option<&str>) -> Option<char> {
+    match ext.unwrap_or("") {
+        "tsv" | "tab" => Some('\t'),
+        _ => None,
+    }
+}
+/// Parse a sheet from `text`, with the file's extension when the caller
+/// knows it (`.tsv`/`.tab` pins the tab; anything else is sniffed).
+pub fn parse_with_ext(text: &str, ext: Option<&str>) -> Sheet {
+    let delimiter = hint_delimiter(ext).unwrap_or_else(|| sniff(text));
     let mut header = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut total_rows = 0usize;
@@ -154,7 +175,7 @@ mod tests {
 
     #[test]
     fn header_plus_ragged_rows_pad() {
-        let s = parse("a,b,c\n1,2\n3,4,5,6\n");
+        let s = parse_with_ext("a,b,c\n1,2\n3,4,5,6\n", None);
         assert_eq!(s.header, vec!["a", "b", "c", ""]);
         assert_eq!(s.rows.len(), 2);
         assert_eq!(s.rows[0], vec!["1", "2", "", ""]);
@@ -165,10 +186,40 @@ mod tests {
 
     #[test]
     fn blanks_are_skipped_and_empty_is_empty() {
-        let s = parse("\n  \n");
+        let s = parse_with_ext("\n  \n", None);
         assert_eq!(s.total_rows, 0);
         assert!(s.rows.is_empty());
         assert_eq!(s.cols, 0);
+    }
+
+    #[test]
+    fn a_tsv_extension_pins_the_tab_even_when_prose_says_comma() {
+        // The reproduction of the real report: a tab-delimited sheet where one
+        // row was typed with spaces, and a later comma in a note field. The
+        // sniffer counts commas; the extension must still win.
+        let text = "Step\tAction\tResult\n1\topen\ta tab appears\n6 hello yuppers\n";
+        let s = parse_with_ext(text, Some("tsv"));
+        assert_eq!(s.header, vec!["Step", "Action", "Result"]);
+        assert_eq!(s.rows[0], vec!["1", "open", "a tab appears"]);
+        // The space row is one field, padded to the sheet's shape — its own
+        // widened row, not a delimiter shift.
+        assert_eq!(s.rows[1], vec!["6 hello yuppers", "", ""]);
+    }
+
+    #[test]
+    fn a_csv_extension_keeps_the_sniffer_in_charge() {
+        // Semicolon dialect: a pin must not land here — the sniffer decides,
+        // and for semicolon text it reads ';' (a false tab pin would split on
+        // the comma and turn that row into one wide cell).
+        let s = parse_with_ext("a;b\n1;2\n", Some("csv"));
+        assert_eq!(s.header, vec!["a", "b"]);
+    }
+    #[test]
+    fn a_plain_sniff_without_a_kind_still_reads_tabs() {
+        // No extension given: the sniffer reads the tabs because the tab count
+        // over the first lines is the highest.
+        let s = parse_with_ext("a\tb\n1\t2\n", None);
+        assert_eq!(s.header, vec!["a", "b"]);
     }
 
     /// Rows past the cap are not split, but the column count they imply is
@@ -184,7 +235,7 @@ mod tests {
                 text.push_str("a,b\n");
             }
         }
-        let s = parse(&text);
+        let s = parse_with_ext(&text, None);
         assert_eq!(s.rows.len(), MAX_ROWS);
         assert_eq!(s.total_rows, MAX_ROWS + 10);
         assert_eq!(s.cols, 4);
@@ -198,7 +249,7 @@ mod tests {
         for i in 0..MAX_ROWS + 50 {
             text.push_str(&format!("{i},x\n"));
         }
-        let s = parse(&text);
+        let s = parse_with_ext(&text, None);
         assert_eq!(s.rows.len(), MAX_ROWS);
         assert_eq!(s.total_rows, MAX_ROWS + 50);
         assert!(s.capped);

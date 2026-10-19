@@ -29,6 +29,10 @@ const TAB_PAD_R: f32 = 4.0;
 const LABEL_GAP: f32 = 8.0;
 const TAB_BTN: f32 = 20.0;
 const TAB_BTN_GAP: f32 = 2.0;
+/// Square footprint of the "new tab" + (browser-style, after the last tab)
+/// and the air between it and that tab. Both scale with `scale`.
+const PLUS_BTN: f32 = 24.0;
+const PLUS_GAP: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitleHit {
@@ -39,6 +43,9 @@ pub enum TitleHit {
     Tab(usize),
     TabSave(usize),
     TabClose(usize),
+    /// The + after the last tab: opens the file dialog, exactly what the
+    /// status bar's Open button does.
+    NewTab,
     Minimize,
     Maximize,
     Close,
@@ -51,6 +58,8 @@ pub struct Layout {
     /// Save button per tab: `Some` only while that tab has unsaved edits.
     pub saves: Vec<Option<Rect>>,
     pub closes: Vec<Rect>,
+    /// The + that opens a file in a new tab.
+    pub plus: Rect,
     pub min: Rect,
     pub max: Rect,
     pub close: Rect,
@@ -60,7 +69,11 @@ pub struct Layout {
 pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f32) -> Layout {
     let bar_h = HEIGHT * scale;
     let size = 12.0 * scale;
-    let avail = (width - TABS_X * scale - 3.0 * BTN_W * scale).max(0.0);
+    // The new-tab + keeps its own pocket before the window buttons: the tabs
+    // spend everything else, but the + is the one affordance that must stay
+    // one click away no matter how many tabs squeeze for it.
+    let plus_w = (PLUS_BTN + PLUS_GAP) * scale;
+    let avail = (width - TABS_X * scale - plus_w - 3.0 * BTN_W * scale).max(0.0);
     let ideal: Vec<f32> = names
         .iter()
         .map(|(n, dirty)| {
@@ -80,6 +93,9 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
         1.0
     };
     let tab_y = ((bar_h - TAB_H * scale) / 2.0).round();
+    // The right edge the tabs must stay left of: the + pocket and the
+    // window buttons.
+    let tabs_limit = TABS_X * scale + avail;
     let mut tabs = Vec::with_capacity(names.len());
     let mut saves = Vec::with_capacity(names.len());
     let mut closes = Vec::with_capacity(names.len());
@@ -87,12 +103,21 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
     for (i, w) in ideal.into_iter().enumerate() {
         // When tabs overflow, shrink proportionally down to a small floor so
         // they always fit before the window buttons.
-        let w = if shrink < 1.0 {
+        let mut w = if shrink < 1.0 {
             // Floor so the FP sum can never spill past the window buttons.
             (w * shrink).floor().max(24.0 * scale)
         } else {
             w.clamp(TAB_MIN_W * scale, TAB_MAX_W * scale)
         };
+        if x + w > tabs_limit + 0.5 {
+            // A bar too narrow for every tab's floor: the tabs that fit stay,
+            // the rest yield their click. An invisible tab is still open and
+            // still switchable (Ctrl+Tab), a tab painted over the window
+            // buttons is a paint-and-drag trap. Chrome scrolls; this
+            // truncates — with an already-chrome + at the end of the row.
+            break;
+        }
+        w = w.min(tabs_limit - x);
         tabs.push(Rect::new(x, tab_y, w, TAB_H * scale));
         // Close/save squares: one button wide and the tab's full height, so a
         // finger that lands high or low still hits them (the painted mark
@@ -113,11 +138,21 @@ pub fn layout(fonts: &FontSystem, names: &[(String, bool)], width: f32, scale: f
         closes.push(close);
         x += w;
     }
+    // The + parks just right of the last tab's own rect — not its close
+    // button, which a 24-px squeezed tab puts flush left — browser-style;
+    // when tabs are squeezed, that still lands it against the window
+    // buttons' pocket. With no tabs at all it hugs the left edge.
+    let plus_x = tabs
+        .last()
+        .map_or(TABS_X * scale, |r| r.right() + PLUS_GAP * scale)
+        .round();
+    let plus = Rect::new(plus_x, tab_y, PLUS_BTN * scale, TAB_H * scale);
     Layout {
         bar: Rect::new(0.0, 0.0, width, bar_h),
         tabs,
         saves,
         closes,
+        plus,
         min: Rect::new(width - 3.0 * BTN_W * scale, 0.0, BTN_W * scale, bar_h),
         max: Rect::new(width - 2.0 * BTN_W * scale, 0.0, BTN_W * scale, bar_h),
         close: Rect::new(width - BTN_W * scale, 0.0, BTN_W * scale, bar_h),
@@ -163,7 +198,10 @@ pub fn paint(
     // bar_baseline).
     let bar_baseline = |r: Rect| (r.y + (r.h - m.height()) / 2.0 + m.ascent).round();
 
-    for (i, (name, _)) in names.iter().enumerate() {
+    // A bar too narrow for every tab's floor truncates the layout (see
+    // `layout`), so paint only the tabs it emitted — a narrowed window must
+    // hide the overflow, not panic over a rect that was never built.
+    for (i, (name, _)) in names.iter().enumerate().take(lay.tabs.len()) {
         let r = lay.tabs[i];
         let is_active = i == active;
         let hovered = matches!(hover, Some(TitleHit::Tab(j)) if j == i);
@@ -226,6 +264,37 @@ pub fn paint(
             8.0 * scale,
             scale.max(1.0).round(),
             if close_hover { theme.fg } else { theme.muted },
+        );
+    }
+
+    // The new-tab +: two rect-drawn bars, the same font-independent chrome
+    // grammar as the window buttons it shares the row with.
+    let plus_hover = hover == Some(TitleHit::NewTab);
+    if plus_hover {
+        button_wash(canvas, lay.plus, theme);
+    }
+    {
+        let color = if plus_hover { theme.fg } else { theme.muted };
+        let t = scale.max(1.0).round();
+        let (cx, cy) = (lay.plus.x + lay.plus.w / 2.0, lay.plus.y + lay.plus.h / 2.0);
+        // Horizontal arm first, then the vertical one through the middle.
+        canvas.fill_rect(
+            Rect::new(
+                (cx - 6.0 * scale).round(),
+                (cy - t / 2.0).round(),
+                12.0 * scale,
+                t,
+            ),
+            color,
+        );
+        canvas.fill_rect(
+            Rect::new(
+                (cx - t / 2.0).round(),
+                (cy - 6.0 * scale).round(),
+                t,
+                12.0 * scale,
+            ),
+            color,
         );
     }
 
@@ -351,6 +420,11 @@ pub fn hit_test(lay: &Layout, x: f32, y: f32) -> TitleHit {
     if lay.min.contains(p) {
         return TitleHit::Minimize;
     }
+    // The + answers before the tabs: it parks after the last tab, so it can
+    // never overlap one, but asserting the order keeps it that way.
+    if lay.plus.contains(p) {
+        return TitleHit::NewTab;
+    }
     for (i, r) in lay.closes.iter().enumerate().rev() {
         if r.contains(p) {
             return TitleHit::TabClose(i);
@@ -439,6 +513,64 @@ mod tests {
             lay.tabs[0].w,
             lay.tabs[1].w
         );
+    }
+
+    #[test]
+    fn the_plus_opens_from_the_row_of_tabs() {
+        let fonts = FontSystem::load_embedded();
+        let names = vec![("a.md".to_string(), false), ("b.json".to_string(), true)];
+        let lay = layout(&fonts, &names, 800.0, 1.0);
+        // Browser-style: one pocket of air right of the last tab. The +
+        // rounds to the pixel and the tab's right edge is fractional, so the
+        // pocket holds to half a pixel either way.
+        assert!(
+            (lay.plus.x - (lay.tabs.last().unwrap().right() + PLUS_GAP)).abs() <= 0.5,
+            "the + sits just right of the last tab: {} vs {}",
+            lay.plus.x,
+            lay.tabs.last().unwrap().right()
+        );
+        assert!(
+            lay.plus.right() <= lay.min.x + 0.5,
+            "the + stays off the window buttons"
+        );
+        assert_eq!(
+            hit_test(&lay, lay.plus.x + 3.0, lay.plus.y + 3.0),
+            TitleHit::NewTab
+        );
+        // No tabs at all: the + hugs the left edge and still hits.
+        let lay = layout(&fonts, &[], 800.0, 1.0);
+        assert_eq!(lay.plus.x, TABS_X);
+        assert_eq!(
+            hit_test(&lay, lay.plus.x + 3.0, lay.plus.y + 3.0),
+            TitleHit::NewTab
+        );
+    }
+
+    #[test]
+    fn a_narrow_bar_truncates_tabs_rather_than_painting_over_buttons() {
+        // Small window, maximally many tabs: even the 24-px floor cannot fit
+        // all of them, so the tabs that fit stay and the rest yield their
+        // click — nothing spills onto the + or the window buttons.
+        let fonts = FontSystem::load_embedded();
+        let names: Vec<(String, bool)> = (0..12)
+            .map(|i| (format!("file-{i}-with-a-long-name.md"), i % 2 == 0))
+            .collect();
+        let lay = layout(&fonts, &names, 300.0, 1.0);
+        assert!(
+            lay.tabs.len() < names.len(),
+            "this bar is too narrow for all 12 floors"
+        );
+        // Every rect the layout emits sits inside the bar and left of the
+        // window buttons, and the per-tab button vecs follow the truncation.
+        assert!(
+            lay.plus.right() <= lay.min.x + 0.5,
+            "the + reaches the buttons"
+        );
+        for (i, r) in lay.tabs.iter().enumerate() {
+            assert!(r.right() <= lay.plus.x + 0.5, "tab {i} reaches the +");
+            assert!(lay.closes[i] == *r || lay.closes[i].right() <= r.right() + 0.5);
+        }
+        assert_eq!(lay.closes.len(), lay.tabs.len());
     }
 
     #[test]

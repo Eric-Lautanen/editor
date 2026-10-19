@@ -193,7 +193,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("editor_test_crash_{name}"));
+        let dir = crate::testing::temp_dir().join(format!("editor_test_crash_{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

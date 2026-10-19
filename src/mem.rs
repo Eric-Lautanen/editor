@@ -75,7 +75,6 @@ pub enum Component {
     Buffer,
     DisplayList,
     Canvas,
-    GlyphCache,
 }
 
 const NAMES: [&str; MAX_COMPONENTS] = [
@@ -83,7 +82,7 @@ const NAMES: [&str; MAX_COMPONENTS] = [
     "buffer",
     "display-list",
     "canvas",
-    "glyph-cache",
+    "",
     "",
     "",
     "",
@@ -363,23 +362,5 @@ mod tests {
         assert!(buf2.1 <= buf2.2, "live <= total");
         // report() must build without panicking.
         assert!(report().contains("alloc:"));
-    }
-
-    #[test]
-    fn component_covers_glyph_cache() {
-        let before;
-        {
-            begin(Component::GlyphCache);
-            let m: Vec<u32> = vec![0; 1024];
-            let s = snapshot();
-            let row = s.rows.iter().find(|r| r.0 == "glyph-cache").expect("row");
-            assert!(row.2 >= 4096);
-            before = row.1;
-            drop(m); // free inside the window
-        }
-        end();
-        let s = snapshot();
-        let row = s.rows.iter().find(|r| r.0 == "glyph-cache").expect("row");
-        assert!(row.1 < before);
     }
 }

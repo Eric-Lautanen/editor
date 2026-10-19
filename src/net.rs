@@ -365,12 +365,29 @@ pub fn get_file(url: &str, path: &Path, timeout: u32) -> Result<()> {
 fn scratch_path() -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
-    std::env::temp_dir().join(format!(
+    scratch_dir().join(format!(
         "editor-fetch-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ))
 }
+
+/// Where a rung writes before the caller reads: the OS temp dir. The test
+/// hook lets the live-download tests redirect it — on a machine whose OS
+/// temp dir rejects a fresh process's writes, the rung's own write would
+/// fail for an environmental reason dressed as a download failure. Runtime
+/// code never sets the override and the static is cfg(test), so a release
+/// build keeps the plain temp dir.
+fn scratch_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = SCRATCH_OVERRIDE.get() {
+        return dir.clone();
+    }
+    std::env::temp_dir()
+}
+
+#[cfg(test)]
+static SCRATCH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 // ---------------------------------------------------------------- tests
 
@@ -438,25 +455,30 @@ mod tests {
         assert!(e.contains("refusing to download"), "{e}");
     }
 
-    /// Serves `body` over up to `n` sequential HTTP connections. The thread is
-    /// detached on purpose: a rung that never connects (blocked helper) would
-    /// otherwise leave a `join` waiting on an `accept` that never comes. It
-    /// dies with the test binary like any other stray thread.
-    fn serve(body: &'static str, n: usize) -> String {
+    /// Serves `body` over an unbounded number of sequential HTTP
+    /// connections. The thread is detached on purpose: a rung that never
+    /// connects (blocked helper) would otherwise leave a `join` waiting on
+    /// an `accept` that never comes. It dies with the test binary like any
+    /// other stray thread.
+    ///
+    /// The bound used to be one connection — until the first accepted one
+    /// started being burnable by a *failed* rung: urlmon connects, refuses
+    /// to write, and curl (the next rung in the chain) finds the listener
+    /// thread already gone. The chain may try several rungs for one fetch,
+    /// so the listener outlives them all.
+    fn serve(body: &'static str) -> String {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for _ in 0..n {
-                let Ok((mut s, _)) = l.accept() else { break };
-                let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = s.write_all(head.as_bytes());
-                let _ = s.write_all(body.as_bytes());
-            }
+        std::thread::spawn(move || loop {
+            let Ok((mut s, _)) = l.accept() else { break };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body.as_bytes());
         });
         format!("http://{addr}/asset")
     }
@@ -466,7 +488,10 @@ mod tests {
     /// the chain is only as good as its first working link.
     #[test]
     fn an_available_rung_actually_downloads() {
-        let url = serve("hello from loopback\n", 1);
+        // The scratch file this test's fetch writes must land somewhere the
+        // harness process can write (see `scratch_dir`).
+        let _ = SCRATCH_OVERRIDE.set(crate::testing::temp_dir());
+        let url = serve("hello from loopback\n");
         let got = get_text(&url, 10);
         assert_eq!(got.unwrap(), "hello from loopback\n");
     }
@@ -479,7 +504,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_rungs_reach_github() {
-        let out = std::env::temp_dir().join("editor_fetch_live_test");
+        let out = crate::testing::temp_dir().join("editor_fetch_live_test");
         for rung in rungs("https://api.github.com/", &out, 15) {
             let got = run(&rung, "https://api.github.com/", &out);
             eprintln!(
@@ -515,12 +540,8 @@ mod tests {
     /// fails on this machine — is skipped, not failed; at least one must work.
     #[test]
     fn every_available_rung_works_on_its_own() {
-        let out = std::env::temp_dir().join("editor_fetch_rung_test");
-        let names: Vec<&str> = rungs("http://127.0.0.1:1/asset", &out, 5)
-            .iter()
-            .map(|r| r.name())
-            .collect();
-        let url = serve("rung ok", names.len());
+        let out = crate::testing::temp_dir().join("editor_fetch_rung_test");
+        let url = serve("rung ok");
         let mut worked = 0;
         for rung in rungs(&url, &out, 5) {
             let outcome = run(&rung, &url, &out);

@@ -5,6 +5,7 @@
 //! but keep their physical numbers on the records around them.
 
 use super::json::Value;
+use crate::core::buffer::Buffer;
 use crate::error::Result;
 
 pub struct Record {
@@ -13,18 +14,36 @@ pub struct Record {
     pub value: Result<Value>,
 }
 
-pub fn parse(src: &str) -> Vec<Record> {
-    let mut records = Vec::new();
-    for (i, raw) in src.lines().enumerate() {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        records.push(Record {
-            line: i + 1,
-            value: super::json::parser::parse(raw),
-        });
+/// One record from the physical line at `index` (0-based): `None` for a blank
+/// line, which the format skips. That rule lives here so the whole-file and
+/// incremental paths cannot disagree about which lines are records.
+fn record_of(index: usize, raw: &str) -> Option<Record> {
+    if raw.trim().is_empty() {
+        return None;
     }
-    records
+    Some(Record {
+        line: index + 1,
+        value: super::json::parser::parse(raw),
+    })
+}
+
+pub fn parse(src: &str) -> Vec<Record> {
+    src.lines()
+        .enumerate()
+        .filter_map(|(i, raw)| record_of(i, raw))
+        .collect()
+}
+
+/// Parse the buffer lines `[start, end)` as records, physically numbered.
+///
+/// This is what an edit replays: a record is one line, so the lines a span
+/// replaced are the only ones whose parse can have changed. Same blank-line
+/// rule and same numbering as [`parse`] — for any buffer, the concatenation of
+/// `parse_lines` over a line partition is exactly `parse` of the text.
+pub fn parse_lines(buf: &Buffer, start: usize, end: usize) -> Vec<Record> {
+    (start..end.min(buf.line_count()))
+        .filter_map(|i| record_of(i, buf.line(i)))
+        .collect()
 }
 
 /// Below this many records the thread split costs more than it saves.
@@ -35,54 +54,44 @@ const PARALLEL_MIN_LINES: usize = 4_000;
 /// Threads are only spent when there are enough lines to pay for it, capped at
 /// the machine's parallelism.
 ///
-/// The text is leaked so workers can hold `&'static` line slices — the same
-/// trade `fallback::Chain::load` makes for font bytes. The leak is one
-/// document-sized buffer per loaded JSONL; acceptable for a big-file path
-/// where parse dominates. Blank lines keep their physical numbers exactly as
-/// in [`parse`].
+/// The workers borrow the source through [`std::thread::scope`], so no buffer
+/// is leaked and no per-chunk line vector is copied. Blank lines keep their
+/// physical numbers exactly as in [`parse`].
 pub fn parse_parallel(src: &str) -> Vec<Record> {
-    let line_count = src.lines().count();
-    if line_count < PARALLEL_MIN_LINES {
+    let lines: Vec<&str> = src.lines().collect();
+    if lines.len() < PARALLEL_MIN_LINES {
         return parse(src);
     }
+    let line_count = lines.len();
     let threads = std::thread::available_parallelism()
         .map_or(2, |n| n.get())
         .min(line_count / 500)
         .clamp(2, 16);
-    let static_src: &'static str =
-        // The source is the buffer's text, which outlives this call. The
-        // transmute is only a borrow-extender; nothing is mutated through it.
-        unsafe { std::mem::transmute::<&str, &'static str>(src) };
-    let lines: Vec<&'static str> = static_src.lines().collect();
     let chunk = line_count.div_ceil(threads);
-    let mut handles = Vec::with_capacity(threads);
-    for t in 0..threads {
-        let a = (t * chunk).min(line_count);
-        let b = ((t + 1) * chunk).min(line_count);
-        if a == b {
-            continue;
-        }
-        let slice: Vec<&'static str> = lines[a..b].to_vec();
-        let base = a; // physical start index of this chunk
-        handles.push(std::thread::spawn(move || {
-            let mut out = Vec::new();
-            for (k, l) in slice.iter().enumerate() {
-                if l.trim().is_empty() {
-                    continue;
-                }
-                out.push(Record {
-                    line: base + k + 1,
-                    value: super::json::parser::parse(l),
-                });
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for t in 0..threads {
+            let a = (t * chunk).min(line_count);
+            let b = ((t + 1) * chunk).min(line_count);
+            if a == b {
+                continue;
             }
-            out
-        }));
-    }
-    let mut records = Vec::new();
-    for h in handles {
-        records.extend(h.join().expect("jsonl worker"));
-    }
-    records
+            let slice = &lines[a..b];
+            let base = a; // physical start index of this chunk
+            handles.push(scope.spawn(move || {
+                slice
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, l)| record_of(base + k, l))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut records = Vec::new();
+        for h in handles {
+            records.extend(h.join().expect("jsonl worker"));
+        }
+        records
+    })
 }
 
 #[cfg(test)]
@@ -132,6 +141,26 @@ mod tests {
                 }
                 (Err(_), Err(_)) => {}
                 _ => panic!("diverged at line {}", a.line),
+            }
+        }
+    }
+
+    /// The incremental path parses a line range exactly as the whole-file path
+    /// parses it: the same records, at the same physical lines, with the same
+    /// errors. A plan patch depends on that — it parses the edited lines this
+    /// way and keeps the rest.
+    #[test]
+    fn a_line_range_parses_like_the_whole_file() {
+        let text = "{\"a\": 1}\n\nbroken\n[1, 2]\n  \n{\"b\": {\"c\": [3]}}\n";
+        let buf = Buffer::from_text(text);
+        let whole = parse(text);
+        for split in [1usize, 3, 4, 5, buf.line_count()] {
+            let mut parts = parse_lines(&buf, 0, split);
+            parts.extend(parse_lines(&buf, split, buf.line_count()));
+            assert_eq!(parts.len(), whole.len(), "split at {split}");
+            for (a, b) in parts.iter().zip(whole.iter()) {
+                assert_eq!(a.line, b.line, "split at {split}");
+                assert_eq!(a.value.is_ok(), b.value.is_ok(), "split at {split}");
             }
         }
     }

@@ -8,7 +8,7 @@
 //! row containing the current occurrence.
 
 use crate::{
-    core::buffer::{Buffer, Pos},
+    core::buffer::{Buffer, EditSpan, Pos},
     gfx::{
         canvas::{Canvas, TextSpec},
         font::{FontStyle, FontSystem},
@@ -30,6 +30,10 @@ pub struct Find {
     /// where a match of the shorter one did — so the common case narrows the
     /// old list instead of rescanning the buffer (see [`Find::refresh`]).
     matched: usize,
+    /// Buffer revision the match list belongs to. A resize/zoom does not
+    /// change text, so relayout can reuse the list instead of rescanning the
+    /// whole document.
+    buf_rev: u64,
 }
 
 impl Find {
@@ -38,7 +42,67 @@ impl Find {
     pub fn rescan(&mut self, buf: &Buffer, from: Pos) {
         self.matches = search(buf, &self.query);
         self.matched = self.query.len();
+        self.buf_rev = buf.revision();
         self.land(from);
+    }
+
+    /// True when the list already describes this buffer's text.
+    pub fn is_current_for(&self, revision: u64) -> bool {
+        self.buf_rev == revision
+    }
+
+    /// Re-land on the match under the caret without touching the match list
+    /// (a resize, zoom or mode switch keeps the text unchanged).
+    pub fn reland(&mut self, from: Pos) {
+        self.land(from);
+    }
+
+    /// T5 · Re-base the match list on one edited span instead of rescanning
+    /// the document. Matches strictly above the edit keep their text and
+    /// their positions. Matches strictly below the changed run keep their
+    /// text too: they shift by the edit's line delta (a multiline edit
+    /// shifts by more than one). Only the run itself is new text, so those
+    /// matches are searched again there — a keystroke with the bar open
+    /// prices its own lines, not the document. A wider batch (a doc-wide
+    /// replace) or an edit that runs past the buffer's lines falls back to
+    /// [`Self::rescan`].
+    pub fn patch(&mut self, buf: &Buffer, edits: &[EditSpan], from: Pos) -> bool {
+        if edits.len() != 1 {
+            return false;
+        }
+        let e = edits[0];
+        if e.start > buf.line_count() || e.start + e.inserted > buf.line_count() {
+            return false;
+        }
+        let run_end = e.start + e.removed;
+        let delta = e.inserted as isize - e.removed as isize;
+        let mut above: Vec<(Pos, Pos)> = Vec::with_capacity(self.matches.len());
+        let mut below: Vec<(Pos, Pos)> = Vec::new();
+        for &(a, b) in &self.matches {
+            if b.line < e.start {
+                above.push((a, b));
+            } else if a.line >= run_end {
+                let mut m = (a, b);
+                if delta != 0 {
+                    let shift = |l: &mut usize| *l = (*l as isize + delta).max(0) as usize;
+                    shift(&mut m.0.line);
+                    shift(&mut m.1.line);
+                }
+                below.push(m);
+            }
+            // Inside the run: the text is new, so the search below finds it.
+        }
+        above.extend(search_between(
+            buf,
+            &self.query,
+            e.start,
+            e.start + e.inserted,
+        ));
+        above.extend(below);
+        self.matches = above;
+        self.buf_rev = buf.revision();
+        self.land(from);
+        true
     }
 
     /// Live update from typing. When the query only grew, the new matches
@@ -46,7 +110,8 @@ impl Find {
     /// appended chars — O(matches), not O(buffer). Anything else (a fresh
     /// query, a backspace) falls back to [`Self::rescan`].
     pub fn refresh(&mut self, buf: &Buffer, from: Pos) {
-        if self.matched > 0
+        if self.buf_rev == buf.revision()
+            && self.matched > 0
             && self.query.len() > self.matched
             && self.query.is_char_boundary(self.matched)
         {
@@ -59,6 +124,7 @@ impl Find {
             }
             self.matches = narrowed;
             self.matched = self.query.len();
+            self.buf_rev = buf.revision();
             self.land(from);
         } else {
             self.rescan(buf, from);
@@ -133,16 +199,29 @@ fn extend_match(buf: &Buffer, a: Pos, b: Pos, ext: &[char]) -> Option<Pos> {
 /// Case-insensitive substring matches of `query` in `buf`, in reading order.
 /// A match never spans a newline: find is line-oriented for v1.
 pub fn search(buf: &Buffer, query: &str) -> Vec<(Pos, Pos)> {
+    search_between(buf, query, 0, buf.line_count())
+}
+
+/// Matches of `query` in the half-open run of lines `[from, to)`, in
+/// reading order. The T5 edit patch uses it to re-search only the edited
+/// run — an edit's lines, not the document.
+pub fn search_between(
+    buf: &Buffer,
+    query: &str,
+    from_line: usize,
+    to_line: usize,
+) -> Vec<(Pos, Pos)> {
     let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
     if needle.is_empty() {
         return Vec::new();
     }
+    let to_line = to_line.min(buf.line_count());
     let mut out = Vec::new();
-    // One scratch buffer for every line: the scan is whole-buffer, so
-    // per-line allocation is the difference between churning the heap for
-    // every line of a big file and not.
+    // One scratch buffer for every line: the scan is whole-buffer in the
+    // full case, so per-line allocation is the difference between churning
+    // the heap for every line of a big file and not.
     let mut hay = Vec::with_capacity(64);
-    for line in 0..buf.line_count() {
+    for line in from_line..to_line {
         for (start, end) in search_line(buf.line(line), &needle, &mut hay) {
             out.push((Pos { line, col: start }, Pos { line, col: end }));
         }
@@ -454,5 +533,136 @@ mod tests {
         // The count never runs under the ×.
         let sw = fonts.measure(FontStyle::Regular, "2/7", TEXT_SIZE);
         assert!(close.x - 8.0 - sw > r.x, "status overlaps the label");
+    }
+
+    #[test]
+    fn matches_are_current_for_the_buffer_that_produced_them() {
+        let mut buf = Buffer::from_text("alpha beta");
+        let mut f = Find {
+            query: "a".into(),
+            ..Find::default()
+        };
+        f.rescan(&buf, Pos::default());
+        let rev = buf.revision();
+        assert!(f.is_current_for(rev));
+        buf.insert(Pos { line: 0, col: 0 }, "x");
+        assert!(!f.is_current_for(buf.revision()));
+    }
+
+    /// T5 · The edit patch agrees with a full rescan on every edit shape:
+    /// a key below the caret, a line inserted above it, a deletion, and one
+    /// edit crossing a line break (a two-line span collapsing into one).
+    #[test]
+    fn patch_onto_edits_agrees_with_a_full_rescan() {
+        let mut f = Find {
+            query: "one".into(),
+            ..Find::default()
+        };
+        let mut buf = Buffer::from_text("one two\nthree one\n\none\nzz");
+        f.rescan(&buf, Pos::default());
+        assert_eq!(f.matches.len(), 3, "rescan baseline");
+
+        // A key typed below every match: the columns untouched, the list
+        // the oracle's.
+        buf.insert(Pos { line: 4, col: 1 }, "x");
+        let edits = buf.take_edits().expect("the edit");
+        assert!(f.patch(&buf, &edits, Pos::default()));
+        assert_eq!(f.matches, search(&buf, "one"));
+        assert!(f.is_current_for(buf.revision()));
+
+        // A line inserted above the caret carries one above it: every
+        // match shifts by the delta, and the inserted line is searched too.
+        buf.insert(Pos { line: 0, col: 0 }, "inserted one\n");
+        let edits = buf.take_edits().expect("the edit");
+        assert!(f.patch(&buf, &edits, Pos::default()));
+        assert_eq!(f.matches, search(&buf, "one"));
+        assert_eq!(
+            f.matches[0],
+            (Pos { line: 0, col: 9 }, Pos { line: 0, col: 12 }),
+            "the inserted line's match is found"
+        );
+        assert_eq!(
+            f.matches.last().unwrap().0.line,
+            4,
+            "matches below the edit shifted by one"
+        );
+
+        // Deleting across a line break is one span, two lines into one.
+        buf.delete(Pos { line: 2, col: 0 }, Pos { line: 3, col: 3 });
+        let edits = buf.take_edits().expect("the edit");
+        assert!(f.patch(&buf, &edits, Pos::default()));
+        assert_eq!(f.matches, search(&buf, "one"));
+        assert_eq!(f.matches.len(), 3, "the deleted line's match went with it");
+
+        // A match below the edit shifts by the delta, above the caret
+        // keeps its position — check both endpoints by hand, not only the
+        // oracle, so the patches really are the incremental shapes.
+        let mut f = Find {
+            query: "one".into(),
+            ..Find::default()
+        };
+        let mut buf = Buffer::from_text("one\nzz\nnone\none");
+        f.rescan(&buf, Pos::default());
+        assert_eq!(f.matches.len(), 3, "baseline");
+        buf.insert(Pos { line: 1, col: 0 }, "more one\n");
+        let edits = buf.take_edits().expect("the edit");
+        assert!(f.patch(&buf, &edits, Pos::default()));
+        assert_eq!(f.matches, search(&buf, "one"));
+        assert_eq!(
+            f.matches[0],
+            (Pos { line: 0, col: 0 }, Pos { line: 0, col: 3 }),
+            "above the edit: untouched"
+        );
+        assert_eq!(
+            f.matches.last().unwrap().0.line,
+            4,
+            "below the edit: shifted by the line delta"
+        );
+
+        // A match on the edited line itself survives patching: it is
+        // re-searched, not shifted, and comes out where the oracle put it.
+        let mut f = Find {
+            query: "one".into(),
+            ..Find::default()
+        };
+        let mut buf = Buffer::from_text("one\none\nzz");
+        f.rescan(&buf, Pos::default());
+        buf.insert(Pos { line: 1, col: 0 }, "x");
+        let edits = buf.take_edits().expect("the edit");
+        assert!(f.patch(&buf, &edits, Pos::default()));
+        assert_eq!(f.matches, search(&buf, "one"));
+    }
+
+    /// Batches a keystroke round cannot produce — a wholesale replace
+    /// (no span), a doc-wide run (past the log cap), or an edit that runs
+    /// past the buffer — fall back to the full rescan instead of shifting
+    /// on a partial story.
+    #[test]
+    fn patch_falls_back_when_the_batch_cannot_be_localized() {
+        let mut f = Find {
+            query: "a".into(),
+            ..Find::default()
+        };
+        let buf = Buffer::from_text("alpha 2 beta");
+        f.rescan(&buf, Pos::default());
+        assert!(!f.patch(&buf, &[], Pos::default()), "no span ");
+        let wide: Vec<EditSpan> = (0..2)
+            .map(|_| EditSpan {
+                start: 0,
+                removed: 1,
+                inserted: 1,
+                at: 0,
+                delta: 0,
+            })
+            .collect();
+        assert!(!f.patch(&buf, &wide, Pos::default()), "past the log cap ");
+        let past = vec![EditSpan {
+            start: 99_999,
+            removed: 0,
+            inserted: 0,
+            at: 0,
+            delta: 0,
+        }];
+        assert!(!f.patch(&buf, &past, Pos::default()), "past the buffer ");
     }
 }

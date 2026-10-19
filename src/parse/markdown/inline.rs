@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use super::ast::Inline;
+use super::decode_entities;
 
 /// Normalize a reference label: trim, collapse whitespace, lowercase.
 fn norm_label(s: &str) -> String {
@@ -241,7 +242,7 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
                     let node = if img {
                         Inline::Image {
                             src: href,
-                            alt: inner,
+                            alt: decode_entities(&inner).into_owned(),
                         }
                     } else {
                         Inline::Link { href, content }
@@ -255,7 +256,7 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
             i += 1;
             continue;
         }
-        // Autolink / inline HTML / literal `<`.
+        // Autolink / email autolink / inline HTML / literal `<`.
         if c == '<' {
             if let Some(end) = chars[i..].iter().position(|&x| x == '>') {
                 let inner: String = chars[i + 1..i + end].iter().collect();
@@ -264,6 +265,14 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
                     out.push(Out::Node(Inline::Link {
                         href: href.clone(),
                         content: vec![Inline::Text(href)],
+                    }));
+                    i += end + 1;
+                    continue;
+                }
+                if is_email_autolink(&inner) {
+                    out.push(Out::Node(Inline::Link {
+                        href: format!("mailto:{inner}"),
+                        content: vec![Inline::Text(inner)],
                     }));
                     i += end + 1;
                     continue;
@@ -358,12 +367,14 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
             i += 1;
             continue;
         }
-        // Plain text until the next special char.
+        // Plain text until the next special char. Character references are
+        // decoded here (and only here) so an escaped `\&amp;` stays literal.
         let mut j = i;
         while j < chars.len() && !"\\[<*~_\n`".contains(chars[j]) {
             j += 1;
         }
-        push_text(&mut out, &chars[i..j].iter().collect::<String>());
+        let raw: String = chars[i..j].iter().collect();
+        push_text(&mut out, &decode_entities(&raw));
         i = j;
     }
 
@@ -475,7 +486,7 @@ fn scan_link_target(chars: &[char], open: usize) -> Option<(String, usize)> {
     if chars.get(j) != Some(&')') {
         return None;
     }
-    Some((href, j + 1))
+    Some((decode_entities(&href).into_owned(), j + 1))
 }
 
 fn is_autolink(s: &str) -> bool {
@@ -496,16 +507,54 @@ fn is_autolink(s: &str) -> bool {
     }
 }
 
+/// `<user@example.com>` renders as a mail link. CommonMark's email autolink is
+/// a deliberately narrow shape: one `@`, a local part of URL-safe characters,
+/// and a dotted domain. Anything wider is an inline HTML tag instead.
+fn is_email_autolink(s: &str) -> bool {
+    if s.contains([' ', '<', '>', '\n']) {
+        return false;
+    }
+    let Some((local, domain)) = s.split_once('@') else {
+        return false;
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return false;
+    }
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || ".!#$%&'*+/=?^_`{|}~-".contains(c))
+    {
+        return false;
+    }
+    domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+}
+
 fn is_html_tag(s: &str) -> bool {
     let s = s.trim();
     let s = s.strip_prefix('/').unwrap_or(s);
     if s.starts_with('!') || s.starts_with('?') {
         return true;
     }
-    match s.chars().next() {
-        Some(c) if c.is_ascii_alphabetic() => !s.contains(['<', '>']),
-        _ => false,
+    let Some(first) = s.chars().next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
     }
+    let name_len = s
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .count();
+    let rest = &s[name_len..];
+    // A tag name is followed by the end of the tag, a self-closing slash, or
+    // attributes. Without that shape it is prose in angle brackets (an email
+    // that failed the autolink rules, a `<not@an>`), not markup to drop.
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with(char::is_whitespace)
 }
 
 pub fn parse_inlines_with(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
@@ -618,5 +667,37 @@ mod tests {
             ]
         );
         assert_eq!(pi("\\*x\\*"), vec![Inline::Text("*x*".into())]);
+    }
+
+    #[test]
+    fn entities_decode_in_text_and_link_targets() {
+        assert_eq!(
+            pi("a &amp; b &mdash; &#65;"),
+            vec![Inline::Text("a & b — A".into())]
+        );
+        // An escaped ampersand is literal text, not the start of a reference.
+        assert_eq!(pi("\\&amp;"), vec![Inline::Text("&amp;".into())]);
+        assert_eq!(
+            pi("[x](https://e.com/?a=1&amp;b=2)"),
+            vec![Inline::Link {
+                href: "https://e.com/?a=1&b=2".into(),
+                content: vec![Inline::Text("x".into())],
+            }]
+        );
+        // Code spans are opaque: references inside them never decode.
+        assert_eq!(pi("`&amp;`"), vec![Inline::Code("&amp;".into())]);
+    }
+
+    #[test]
+    fn email_autolinks_become_mail_links() {
+        assert_eq!(
+            pi("<a.b+c@example.com>"),
+            vec![Inline::Link {
+                href: "mailto:a.b+c@example.com".into(),
+                content: vec![Inline::Text("a.b+c@example.com".into())],
+            }]
+        );
+        // Not an email shape: stays literal text between angle brackets.
+        assert_eq!(pi("<not@an>"), vec![Inline::Text("<not@an>".into())]);
     }
 }

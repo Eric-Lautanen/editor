@@ -1055,14 +1055,16 @@ impl Host for WinHost {
             ofn.lpstr_file = file.as_mut_ptr();
             ofn.n_max_file = file.len() as u32;
             ofn.flags = OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-            if get_open_file_name_w(&mut ofn) != 0 {
+            let result = if get_open_file_name_w(&mut ofn) != 0 {
                 let len = file.iter().position(|&c| c == 0).unwrap_or(0);
                 Some(std::path::PathBuf::from(String::from_utf16_lossy(
                     &file[..len],
                 )))
             } else {
                 None
-            }
+            };
+            trim_working_set();
+            result
         }
     }
     fn save_file_dialog(&mut self, default_name: &str) -> Option<std::path::PathBuf> {
@@ -1111,17 +1113,20 @@ impl Host for WinHost {
                 ofn.lpstr_initial_dir = d.as_ptr();
             }
             ofn.flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
-            if get_save_file_name_w(&mut ofn) != 0 {
+            let result = if get_save_file_name_w(&mut ofn) != 0 {
                 let len = file.iter().position(|&c| c == 0).unwrap_or(0);
                 if len == 0 {
-                    return None;
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+                        &file[..len],
+                    )))
                 }
-                Some(std::path::PathBuf::from(String::from_utf16_lossy(
-                    &file[..len],
-                )))
             } else {
                 None
-            }
+            };
+            trim_working_set();
+            result
         }
     }
     fn minimize(&mut self) {
@@ -1189,6 +1194,25 @@ impl WinHost {
             global_free(mem);
         }
     }
+}
+
+/// Trim the process working set after a modal common dialog closes.
+///
+/// `GetOpenFileNameW`/`GetSaveFileNameW` map the shell's whole file-picker
+/// stack (comdlg32's UI, the storage/shell DLLs) into our process the first
+/// time a dialog opens; those file-backed pages stay resident until the OS
+/// needs the room — measured at ~31 MB of working set (and 5 MB of private
+/// commit) on a cancelled open, which read as the process "doubling" in
+/// Task Manager. Trimming afterwards is cheap: the pages are file-backed and
+/// re-fault on demand, at the cost of a brief refault on the next paint.
+fn trim_working_set() {
+    use std::ffi::c_void;
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn EmptyWorkingSet(process: *mut c_void) -> i32;
+    }
+    // Pseudo-handle for "this process".
+    unsafe { EmptyWorkingSet(-1isize as usize as *mut c_void) };
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -1815,7 +1839,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                             if dx != 0.0 || dy != 0.0 {
                                 // A finger is direct manipulation: `Pan`, not a
                                 // wheel-like step the app may glide to.
-                                dispatch(st, hwnd, Event::Pan { dx, dy });
+                                dispatch(st, hwnd, Event::Pan { dx, dy, x, y });
                             }
                             // One instant stamps the new sample and prunes the
                             // old: two `now()`s would compare different clocks.
@@ -2653,5 +2677,162 @@ mod tests {
         assert_eq!(std::mem::size_of::<TouchInput>(), size);
         // `flags` must be dwFlags — i.e. sit after hSource *and* dwID.
         assert_eq!(std::mem::offset_of!(TouchInput, flags), flags_off);
+    }
+
+    /// Probe for the reported "open → cancel doubles RAM": asks the *real*
+    /// common dialog to open, cancels it from the hook, and reports the
+    /// process's working set / private commit at three points. An #[ignore]
+    /// test (it flashes a dialog): `cargo test ram_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "pops a real file dialog and cancels it from a hook"]
+    fn ram_probe_open_dialog_cancel() {
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const WM_INITDIALOG: u32 = 0x0110;
+        const WM_COMMAND: u32 = 0x0111;
+        const IDCANCEL: usize = 2;
+        const OFN_ENABLEHOOK: u32 = 0x0000_0020;
+        const OFN_EXPLORER: u32 = 0x0008_0000;
+
+        #[repr(C)]
+        struct ProcMemEx {
+            cb: u32,
+            page_faults: u32,
+            peak_ws: usize,
+            ws: usize,
+            peak_paged: usize,
+            paged: usize,
+            peak_np: usize,
+            np: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+            private: isize,
+        }
+
+        #[link(name = "psapi")]
+        unsafe extern "system" {
+            fn GetProcessMemoryInfo(process: *mut c_void, counters: *mut ProcMemEx, cb: u32)
+                -> i32;
+            fn EmptyWorkingSet(process: *mut c_void) -> i32;
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetParent(hwnd: *mut c_void) -> *mut c_void;
+            fn PostMessageW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> i32;
+            fn CommDlgExtendedError() -> u32;
+        }
+
+        fn mem(tag: &str) {
+            let mut pmc = ProcMemEx {
+                cb: std::mem::size_of::<ProcMemEx>() as u32,
+                page_faults: 0,
+                peak_ws: 0,
+                ws: 0,
+                peak_paged: 0,
+                paged: 0,
+                peak_np: 0,
+                np: 0,
+                pagefile: 0,
+                peak_pagefile: 0,
+                private: 0,
+            };
+            let pseudo = -1isize as usize as *mut c_void;
+            unsafe {
+                GetProcessMemoryInfo(pseudo, &mut pmc, pmc.cb);
+            }
+            println!(
+                "{tag:14} ws={:>8.1} MB  private={:>8.1} MB",
+                pmc.ws as f64 / 1048576.0,
+                pmc.private as f64 / 1048576.0,
+            );
+        }
+
+        // Cancelled from init: the dialog opens for one frame, subjects the
+        // process to the same shell/COM loads as one the user closes.
+        static CANCELLED: AtomicBool = AtomicBool::new(false);
+        unsafe extern "system" fn cancel_hook(
+            hdlg: *mut c_void,
+            msg: u32,
+            _wp: usize,
+            _lp: isize,
+        ) -> isize {
+            if msg == WM_INITDIALOG && !CANCELLED.swap(true, Ordering::Relaxed) {
+                PostMessageW(GetParent(hdlg), WM_COMMAND, IDCANCEL, 0);
+            }
+            0
+        }
+
+        let pattern = crate::core::file_kind::globs(";");
+        let label = format!("Documents ({pattern})");
+        let mut filter: Vec<u16> = Vec::new();
+        for s in [&label, &pattern, "All files (*.*)", "*.*"] {
+            filter.extend(s.encode_utf16());
+            filter.push(0);
+        }
+        filter.push(0);
+        let mut file = vec![0u16; 8192];
+        let mut ofn = OpenFileNameW {
+            l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+            hwnd_owner: null_mut(),
+            h_instance: null_mut(),
+            lpstr_filter: filter.as_ptr(),
+            lpstr_custom_filter: null_mut(),
+            n_max_cust_filter: 0,
+            n_filter_index: 1,
+            lpstr_file: file.as_mut_ptr(),
+            n_max_file: file.len() as u32,
+            lpstr_file_title: null_mut(),
+            n_max_file_title: 0,
+            lpstr_initial_dir: null_mut(),
+            lpstr_title: null_mut(),
+            flags: super::OFN_HIDEREADONLY
+                | super::OFN_NOCHANGEDIR
+                | super::OFN_PATHMUSTEXIST
+                | super::OFN_FILEMUSTEXIST
+                | OFN_ENABLEHOOK
+                | OFN_EXPLORER,
+            n_file_offset: 0,
+            n_file_extension: 0,
+            lpstr_def_ext: null_mut(),
+            l_cust_data: 0,
+            lpfn_hook: cancel_hook as *const c_void,
+            lp_template_name: null_mut(),
+            pv_reserved: null_mut(),
+            dw_reserved: 0,
+            flags_ex: 0,
+        };
+
+        mem("baseline");
+        let rc = unsafe { get_open_file_name_w(&mut ofn) };
+        let err = unsafe { CommDlgExtendedError() };
+        assert_eq!(rc, 0, "the hook must have cancelled");
+        assert_eq!(err, 0, "cancel must be clean (0), got {err}");
+        assert!(CANCELLED.load(Ordering::Relaxed), "hook ran");
+        mem("after cancel");
+        let before_trim = unsafe {
+            let mut pmc = ProcMemEx {
+                cb: std::mem::size_of::<ProcMemEx>() as u32,
+                page_faults: 0,
+                peak_ws: 0,
+                ws: 0,
+                peak_paged: 0,
+                paged: 0,
+                peak_np: 0,
+                np: 0,
+                pagefile: 0,
+                peak_pagefile: 0,
+                private: 0,
+            };
+            GetProcessMemoryInfo(-1isize as usize as *mut c_void, &mut pmc, pmc.cb);
+            pmc.ws
+        };
+        unsafe { EmptyWorkingSet(-1isize as usize as *mut c_void) };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        mem("after trim");
+        println!(
+            "trim validity: after-cancel ws = {} MB",
+            before_trim / 1048576
+        );
     }
 }

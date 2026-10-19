@@ -1177,3 +1177,695 @@ resources only for MSVC, so a GNU local build is iconless by construction; the
 `editor_check_*` cross-builds leave `target_os` alone and cannot lint the other
 backends (they were failing that way already); `tools/recover_*.py` and
 `tools/restore_vscode_history.py` still hardcode `C:\github\readitor`.
+
+### Preview-polish + syntax-highlighting round (Oct 2026) — 425 tests green
+
+A presentation pass over every viewer, no new dependencies and no new runtime
+work per frame. The rendering stays a display list over the system fonts; the
+new work is parser and layout quality, plus a real code highlighter.
+
+- **Markdown rendering** (`layout/markdown.rs`): task items draw real `☑`/`☐`
+  boxes (the procedural symbol family) instead of the source's `[x]`; list
+  items replace their trailing block gap with a small inter-item gap, so a list
+  reads as one group rather than one paragraph per bullet; tables band alternate
+  body rows; a fenced block with an info string gets a small language label over
+  a hairline rule; image placeholders are framed cards naming the alt text and
+  source (truncated to the card) instead of one bare line in a half-empty box;
+  a quote's bar now ends at the last block's real gap.
+- **Markdown parsing**: a UTF-8 BOM no longer hides the first heading or fence;
+  text and link destinations decode the common HTML character references
+  (`&amp;`, `&mdash;`, `&#65;`, `&#x2014;`); `<user@example.com>` becomes a
+  `mailto:` link; inline HTML detection is restricted to an actual tag shape
+  (`<not@an>` stays text); table cells keep non-pipe backslash escapes for the
+  inline parser (`\*\*` is literal, not bold); frontmatter is stripped only when
+  the block opens like a mapping, so a document that starts with a rule and has
+  another one within 50 lines no longer loses everything between them.
+- **JSON tree** (`layout/json_tree.rs`): fields and items carry the commas JSON
+  has; containers use conventional `▼` open / `▶` collapsed expanders and a
+  `{…}  N items` summary; segments are placed by their measured prefix width,
+  so a wide CJK or emoji key no longer shifts the following `: ` and value. The
+  JSONL virtual plan now measures the record's head row on error records and
+  subtracts the body indent from the banner width — two places where the plan
+  disagreed with a full layout (one line per error record, plus wrapped banner
+  text), which showed up as scroll drift in long JSONL files. A parity test
+  pins `Plan.height` and a full-band layout against `layout_records`.
+- **CSV** (`layout/csv.rs`): a table narrower than the reading column grows into
+  it (extra width shared by natural column width); numeric columns are detected
+  in one scan and right-aligned; body rows alternate a faint tint.
+- **Syntax highlighting** (`layout/syntax.rs`, new): the ad-hoc scanner became a
+  line-oriented highlighter with a tiny cross-line state. Language hints and
+  extensions map onto Rust, Python, shell, Ruby, C-like/Go/PHP, JS/TS, SQL,
+  Lua, JSON, HTML/XML, CSS, TOML/YAML/INI or a generic fallback, each with its own comment
+  forms, quote forms, keywords and types. It handles `//`/`#`/`--`/`;` line
+  comments, `/* */` (nested for Rust), HTML comments, Lua `--[[ ]]`, Python
+  triple quotes and Rust raw strings, JS template literals, Rust lifetimes vs
+  char literals, preprocessor directives, decorators/attributes, shell
+  `$var`/`${…}`/`$(…)`, SQL's case-insensitive keywords, HTML tags/attributes,
+  CSS properties/custom properties/hex colors, and JSON keys vs string values.
+  Function names are accented, types/literals use the literal color, and the
+  state is threaded through both the code-file pane and a markdown code panel so
+  a block comment or docstring that crosses lines keeps its color. A wrapped
+  line is tinted once and sliced across rows rather than re-tinted per row.
+- **Validation**: `cargo test` 424 passed; `cargo clippy --all-targets --
+  -D warnings`, `cargo fmt --check`, and `cargo build` clean. Release cost gate
+  (`PERF_REPORT_ONLY=1 cargo test --release -- --ignored perf_code
+  perf_markdown`): code load 377 ms / first frame 509 ms / frame 1.96 ms, and
+  markdown 36.8 ms / 375 ms / 3.14 ms — all well inside budget and unchanged in
+  order from the pre-highlighter build. README screenshots were regenerated
+  from the app (`tools/readme_shots.py`), so the pictures match the renderer.
+### Virtualized JSON tree round (Oct 2026) — a million-node document is a plan, not a display list, 451 tests green
+
+The round before this one taught a paint to skip the chunks of a display list
+that are off screen (the band index; on its own it took a 3.8 M-op tree's frame
+from 17.0 ms to 0.95 ms) and gave a big JSONL file a per-record plan. A single
+JSON document was still laid out whole: parse, build every op, build the row
+index, then paint one screenful of it. It now gets the treatment JSONL has.
+
+- **A per-node plan** (`layout/json_tree.rs`, `ValuePlan`/`NodeSlot`): one
+  24-byte slot per node in pre-order, each holding the y of the node's first
+  row, the height of its whole block, its parent, its next sibling, its index
+  within the parent and the toggle id a full layout would give it. Painting
+  binary-searches the slot under the scroll offset, walks the ancestor chain
+  down to it (which is how a container with a million children above the
+  viewport is skipped in one step), and lays out only the blocks that overlap
+  the viewport — every row placed at the y the plan decided, nothing
+  accumulated from the top of the document.
+- **The plan is shape counting, not a second layout.** A row that fits its
+  column is counted (`cells × advance`, the same test `emit_row`'s fitting-row
+  fast path makes) and never written out; only a row that overflows pays for
+  being built and wrapped. A row holding a glyph the grid cannot size is
+  measured for real through the same `wrap_ranges` the painter calls, so a plan
+  cannot disagree with the paint it drives — an approximation there is scroll
+  drift, which is exactly what a document full of wide glyphs used to produce.
+- **Which documents take it**: over `VIRTUAL_JSON_NODES` (20 000) nodes, a
+  count and not a line count — a minified 5 MB document is one line and a
+  million nodes. Below it the pane lays out whole, as it always has, which is
+  what keeps every existing layout test and the everyday file on one path.
+- **The app side** (`app.rs`): the parsed tree is kept on the tab beside the
+  buffer revision it came from, so a resize, zoom, pane switch or toggle
+  re-plans without re-parsing, and a stale tree can never outlive an edit, a
+  streamed seal or a reload. A big JSON rides the existing worker job
+  (`PreviewLayout::Json`), and `paint_panes` bands it like a JSONL pane — in
+  Preview, Split and against the live `collapsed` set, whose ids the plan
+  assigns exactly as a full walk does (collapsing a node therefore paints the
+  summary row the full layout would, at the y the plan resized everything below
+  it to).
+- **Fixed on the way**: the JSONL records cache is keyed on the buffer revision
+  too. It was only ever invalidated by a worker pass, so a big JSONL file
+  reloaded from disk could keep painting the records of the previous revision.
+- **Numbers**, 8 MB pretty-printed JSON (558 702 nodes), 1440×900, release,
+  same machine: first frame 1205 → 266 ms of which 192 ms is the parse this
+  design cannot avoid; the pane holds 139 ops instead of 2 492 669; live heap
+  299 → 98 MB; a scroll frame 0.36 ms; the plan itself 61 ms, and a band 0.1 ms.
+  Perf gate at its then-2 MB (single-threaded A/B on one build, the threshold
+  raised
+  to disable the plan for the "before" run): first frame 407.9 → 90.6 ms, live
+  83.3 → 33.0 MB, frame 0.55 → 0.34 ms. JSON's first-frame budget in the gate
+  comes down from 4000 ms to 600 ms with it — 5-6x the measured path, which is
+  a wall-clock guard for CI rather than a precise one: the *structural* half of
+  this guarantee is a test that pins a 21k-node tree's pane
+  under a thousand ops, and that holds on a runner of any speed.
+- **Tests**: `the_virtual_tree_plan_matches_a_full_layout` (heights and the ink
+  of a whole-document band against `layout_value`, at four widths);
+  `a_tree_band_paints_exactly_the_rows_it_covers` (a scroll sweep, claiming
+  nothing off the full layout and missing nothing the viewport covers);
+  `a_collapsed_node_moves_the_tree_the_way_a_full_layout_does` (every node in a
+  small document: height, rows, and that the toggle's hit rect did not move);
+  `a_tree_below_the_threshold_lays_out_whole`; and in `app.rs`,
+  `a_big_json_paints_a_band_and_toggles_inside_it` (bounded ops, the band
+  follows the offset to the right rows, a click collapses inside it).
+- **Validation**: `cargo test` 451 passed (debug and release), `cargo clippy
+  --all-targets` and `cargo fmt --check` clean, release cost gate green for all
+  six kinds.
+
+## Banded panes for every reader kind
+
+- **The gap**: plan-and-band was a JSONL/JSON feature, not a property of the
+  pipeline. At 8 MB — an eighth of the open limit — a code pane held 1 607 100
+  ops, 181.6 MB live and a 1125 ms first frame; a log 326 556 ops and 390 ms; a
+  Markdown document 787 846 ops and 2579 ms. The cost gate was fixed at 2 MB
+  precisely because those kinds could not go bigger, which is how the gap
+  survived a green build.
+- **One index for every kind** (`layout/plan.rs`, new): `Rows` keeps one `f32`
+  per unit — the y a unit starts at — plus the document height, and answers
+  which units a `[top, bottom)` band covers by binary search. The units are a
+  line for text, code, logs and configs; a top-level block for Markdown. The
+  painters stay kind-specific; the addressing rule is shared, so a new reader
+  kind plugs in by building a plan.
+- **The line family** (`layout/highlight.rs`, `layout/text.rs`): plain text,
+  code, logs, YAML, TOML and INI are one family — `Kind::Plain` is the no-tint
+  member, so they share one plan and one band painter. Rows are counted with
+  the same fit test `layout` makes (cell arithmetic, `wrap_ranges` only for a
+  line that overflows), so the plan costs a pass over the text and keeps no
+  ops. Code tint is cross-line, so the plan carries `syntax::State` checkpoints
+  every 256 lines; a band that starts inside a block comment scans from the
+  nearest checkpoint and keeps the comment colour. `emit_line` is now the one
+  emitter for both the full layout and a band, so the two cannot disagree.
+- **Markdown** (`layout/markdown.rs`): a block's height is whatever its spans
+  wrap to, so the plan measures each top-level block once at y=0 and drops its
+  ops. Blocks are independent given their start gap, so a band re-renders only
+  the blocks it covers, at the y the plan carries. This buys memory (787 846
+  ops → 141) and frame cost, not a cheaper first measure: Markdown's plan is
+  still one full pass, and at 8 MB that is 1.7 s on a worker thread while the
+  plain band paints.
+- **App** (`app.rs`): `PanePlan` — `Text`, `Lines`, `Markdown` — sits on the tab
+  beside the buffer revision it was built from, and `PreviewLayout::Planned`
+  carries it out of `preview_layout`. The threshold is `VIRTUAL_UNITS` (20 000
+  lines or blocks), the same order as the worker threshold, so a small file
+  keeps its full list *and* its row index. Line panes are planned inline (the
+  plan is cheap, so they never wait on a worker or show plain text first);
+  Markdown plans on the worker like JSON. `paint_panes` has one banded branch
+  that dispatches to the plan, re-plans on a width change from the buffer or
+  the kept document, and refuses to paint a plan from an earlier revision.
+- **Universality is a test**: `every_file_kind_plans_or_is_bounded_by_its_parser`
+  walks every `FileKind` and fails unless it maps into a planned family. CSV is
+  the one exception, and the test proves it is bounded by the parser's row cap
+  (17 011 ops at 8 MB, no matter the file size); if that cap is lifted the test
+  is the reminder that the table needs a plan.
+- **Tests**: per family, a whole-document band equals the full layout op for op
+  (`text`, `highlight`, `markdown`), a mid-document band claims nothing and
+  misses nothing visible, and a band 600 lines into a comment keeps its colour;
+  in `app.rs`, planned panes for plain text, logs and Markdown (bounded ops, the
+  band follows the offset to the right rows), the worker path a big Markdown
+  document takes (plain band while the plan is measured, the plan and its parsed
+  document installed on landing, then bands), the sealed 60k-line code stream
+  now planned instead of worker-laid-out, and a small pane keeping its list and
+  row index.
+- **Numbers** (8 MB, release, 1440x900): code 1125 → 16.6 ms first frame,
+  181.6 → 38.8 MB live, 1 607 100 → 219 ops; log 390 → 18.2 ms, 77.2 → 29.3 MB,
+  326 556 → 109 ops; Markdown 2579 → 1706 ms (the measure pass), 106.2 → 88.4
+  MB, 787 846 → 141 ops. The gate now runs at 8 MB for all six kinds and adds a
+  `pane ops` budget (2 000 for every planned kind, 40 000 for the capped CSV),
+  so an op per line can no longer pass as a green build.
+- **Validation**: `cargo test` 467 passed, `cargo clippy --all-targets -- -D
+  warnings` and `cargo fmt --check` clean, release cost gate green for all six
+  kinds at 8 MB.
+
+## Plans patch themselves on edit
+
+- **The gap**: a plan made opening cheap, not editing. Every keystroke in Split
+  set `layout_dirty`, and the relayout re-counted every line's wrapped rows for
+  the reader pane. At 8 MB (134 546 lines) a keystroke cost 183 ms, and only
+  8 ms of that was the plan: the editor half walked every op and measured each
+  line's text for `h_max` — a glyph shaping call per line, 100 ms a keystroke,
+  to answer "how wide is the longest line".
+- **The buffer logs its edits** (`core/buffer.rs`): every mutation records an
+  `EditSpan { start, removed, inserted }` in the coordinates of the text *after*
+  it, capped at 64 spans (a streamed load coalesces its thousands of appends
+  into one). `take_edits` hands them out and clears the log; an overflow, a
+  cleared log or a plan of the wrong width makes the caller rebuild instead.
+- **Rebasing happens at the edit, not at the paint** (`app.rs`,
+  `patch_plan_for_edit`): a span names lines in the text that edit produced, so
+  it is replayed while that text is current. The next paint finds the plan's
+  revision current and only installs it (editor half, height, scroll) —
+  `relayout` no longer has a path that re-measures a current plan. Multiple
+  keystrokes before a frame each patch one line, not one document.
+- **`Rows::splice`** (`layout/plan.rs`): replace a unit range with freshly
+  measured heights and shift the tops below by the difference. The index keeps
+  only tops plus a tail pad, so the old span's height is priced from the tops
+  themselves.
+- **Line panes** (`layout/text.rs`, `layout/highlight.rs`): `patch_lines` and
+  `LinePlan::patch` count the inserted lines with the *same* function a fresh
+  plan uses, so a patched index cannot drift. A code edit also drops the tint
+  checkpoints from the edit onward; a band there rescans from the text instead
+  of painting the old comment colour.
+- **Markdown** (`layout/markdown.rs`): blocks are the parser's output, so an
+  edit re-parses; the plan then diffs the block lists and measures only the
+  changed run between the common prefix and suffix, keeping the rest of the
+  heights and re-seating the gap after the run. Skipping the measure is the
+  win: at 8 MB the measure is 967 ms of the 1.4 s relayout.
+- **Universality**: `PanePlan` is the extension point and the patch match in
+  `app.rs` is exhaustive over it, so a new planned family must answer there.
+  Markdown's answer is the parse-bound one; a JSONL's records are patched the
+  round after this one (see "JSONL records patch themselves on edit"); JSON's
+  own tree had no per-unit plan to patch (a minified document is one line) until
+  "A JSON tree patches itself on edit", which indexes it by source byte instead;
+  and CSV stays capped. The rule is a test: the cost gate types one character into
+  every planned pane and fails unless the plan was *patched* — a correct
+  rebuild would pass every pixel test.
+- **Numbers** (8 MB, release, 1440x900, Split): a code keystroke 183 → 74 ms
+  (plan 8.2 ms → the one edited line; the 100 ms `h_max` walk → one widest-line
+  scan and a single measure; the remaining cost is the editor half's own
+  31 ms whole-buffer list and the paint). Markdown's real path is unchanged in
+  kind and better in degree: the edit still re-plans on the worker, the pane
+  stays responsive (9 ms first frame, 7 ms per keystroke while the job runs),
+  and an inline plan patches in 0.98 s instead of 1.4 s, of which 0.6 s is the
+  re-parse.
+- **Tests**: buffer spans (insert, delete, stream coalescing, overflow);
+  `Rows::splice` against a fresh index; line-plan patch parity after growth,
+  deletion and a split, with a whole-document band equal to the full layout op
+  for op; a code edit's band deep below it equal to a fresh plan's, tint
+  included; a deletion shifting the pane up by the rows removed; Markdown
+  patch parity with a fresh plan (tops, gaps, height) and a whole-document band
+  equal to the full layout; in `app.rs`, typing in Split on a 24 000-line code
+  file and on a planned Markdown document patching the plan (counted) and
+  landing on a fresh plan's height.
+- **Validation**: `cargo test` 484 passed, `cargo clippy --all-targets -- -D
+  warnings` and `cargo fmt --check` clean, release cost gate green for all six
+  kinds at 8 MB with the new `type` column.
+- **Limitations, stated plainly**: Markdown still re-parses per edit (0.6 s at
+  8 MB inline), and for a document over the worker threshold the edit takes
+  the existing worker path rather than a synchronous patch; a keystroke still
+  lays out the editor half's whole display list in Split (31 ms at 8 MB); the
+  plan is rebuilt whole on a resize or zoom; and JSON's own tree has no
+  incremental plan because its parse is the dominant cost. JSONL's records are
+  patched as of the round below; JSON's tree as of the round after that.
+
+## JSONL records patch themselves on edit
+
+- **The gap**: the round above left the parse-bound kinds rebuilding from their
+  parse on every keystroke, and for JSONL that was the worst of both worlds — an
+  edit in Split minted a revision the records did not match, so they were
+  dropped and the worker re-parsed the whole file, seconds on a 33 MB log. A
+  JSONL record is one physical line and the lines are independent, so the work
+  one keystroke owes is one line's parse and one record's measure: the plan was
+  treating a property of the format as a property of the pipeline.
+- **A line range parses like the whole file** (`parse/jsonl.rs`): a blank line
+  still carries no record, and a record still carries its physical line number,
+  through one shared `record_of` that `parse`, `parse_parallel` and the new
+  `parse_lines(buf, start, end)` all use. A test splits a document at every
+  boundary and checks that concatenating the parts is exactly `parse` of the
+  whole text.
+- **`Plan::patch`** (`layout/json_tree.rs`): the edit spans name the lines that
+  replaced others, so the records on those lines are parsed again, measured with
+  `measure_record` — the same probe a fresh plan uses, so a patched height
+  cannot drift from a rebuilt one — and spliced into the index, with the tops
+  below shifted by the height difference and the node ids renumbered. A slot now
+  also keeps the number of nodes its record assigned, which is what lets an edit
+  above a record renumber it without re-measuring it. The layout rule is the
+  one `build_plan` lays slots down by (a separator line between records), and a
+  patch that cannot describe the buffer — a non-virtual plan, a slot/record
+  mismatch, an edit past the end of the text, a splice that would empty the list
+  — says so instead of half-updating an index that then paints.
+- **The app stops re-parsing** (`app.rs`): a virtual JSONL's records and index
+  live on the tab, and both the edit-time pass (`patch_plan_for_edit`) and the
+  paint-time fallback (`patch_jsonl_plan`) patch them from the buffer's edit
+  log. Freshness has one home (`jsonl_plan_active`): the width the index was
+  measured at, the collapse generation, the line threshold, and the slot/record
+  pair, so a resize, a fold or a shrink below the virtual threshold takes the
+  full path instead of a patch. `current_plan_height` is the one place that
+  decides "this plan is current, install it" for both families — line/Markdown
+  panes and a JSONL's records — which is what keeps a paint from re-measuring
+  anything.
+- **A fold is not a patch**: collapsing a record's node changes the height of
+  every record below it while the records themselves stay valid, so the
+  collapsed generation is part of the freshness rule: the index is rebuilt from
+  the records already in hand (no re-parse), which the band test pins by
+  clicking a toggle and checking both the shorter pane and the new generation.
+- **The cost gate types into a JSONL too** (`perf.rs`): a pane with a virtual
+  record index now counts as planned, so the `type` column asserts that a
+  keystroke *patched* it — after a bounded wait for the records to land
+  off-thread, since that is where an 8 MB file's first parse goes.
+- **Tests**: `parse_lines` against the whole-file parse through every split
+  point; `Plan::patch` against a full rebuild — records (their lines and their
+  ok/error shape), slots (ids, tops, heights) and total height — through one
+  character, a split record, an inserted blank line, a pasted run, a deleted
+  record, two joined records, an appended record and a deleted middle run; and
+  the four refusals above. In `app.rs`, typing on a 6 000-record file in Split
+  patches the index with **no worker job started** and lands slot for slot on a
+  fresh build of its own records, and a click on a toggle inside the band
+  rebuilds the index at the new collapse generation.
+- **Numbers** (8 MB, 89 359 records, release, 1440x900): the work one keystroke
+  used to repeat — `parse_parallel` 145.1 ms plus `build_plan` 370.8 ms, 515.9 ms
+  of whole-document work, on the UI thread for a file under the worker
+  threshold — is now one `Plan::patch` of 0.62 ms. What the gate measures end to
+  end is the paint the keystroke costs in Split: the `type` column reports it
+  now that a JSONL counts as planned, and it reads 44-81 ms across runs on a
+  developer box — the editor half's own whole-buffer list and the `h_max` scan,
+  which is where the remaining keystroke cost sits, not the records.
+- **Validation**: `cargo test` 488 passed, `cargo clippy --all-targets -- -D
+  warnings` and `cargo fmt --check` clean, release cost gate green for all six
+  kinds at 8 MB.
+- **Limitations**: JSON's tree still rebuilt from its parse (a minified
+  document is one line, so a line-span patch has nothing to hang on — the next
+  round localizes an edit by byte instead); a JSONL
+  edited outside Split, or more times than the buffer's 64-span log holds, still
+  falls back to a whole re-parse; and a resize, a fold or a width change
+  re-measures every record — a pure-arithmetic probe, but still O(records).
+
+
+## A JSON tree patches itself on edit
+
+- **The gap**: JSONL's records had been patchable for a round, but a JSON
+  *document* still rebuilt from its parse. An edit in Split minted a revision
+  the tree did not match, so the tree was dropped and the whole document was
+  parsed again and re-planned — 300-400 ms of parse and 85-200 ms of plan at
+  8 MB, run to run, before a single band could paint. A JSONL is one record per line, so an edit
+  can be localized by line; JSON is one value, so there are no lines to hang
+  that on. There is, however, a *byte*: the one the buffer says it edited.
+- **Tokens know where they are** (`parse/json/lexer.rs`): `Lexeme` now carries
+  `at`/`end` byte offsets beside its line/column, and the lexer walks a byte
+  cursor instead of copying the document into a `Vec<char>` first — the offsets
+  are free where the columns already were, and a UTF-8 document no longer pays
+  a 4-bytes-per-char copy before the parse starts. A test round-trips tokens
+  through their own byte ranges.
+- **`parse_spanned`** (`parse/json/parser.rs`): the parser records every node's
+  source range as it enters and leaves it, so the spans come out pre-order —
+  the order a `ValuePlan` assigns slots — and `spans[i]` is exactly the text of
+  the node slot `i` measures. `parse` is `parse_spanned` minus the list, so the
+  two cannot disagree; a test checks that every node's slice parses back to that
+  same node.
+- **Byte queries on the buffer** (`core/buffer.rs`): `byte_len`,
+  `line_start_byte` and `byte_slice` give an edit's byte offset and cut a node's
+  text back out of the document; every `EditSpan` now also records `at` and
+  `delta` where the mutation happens, which is the only place they are exact.
+  A test replays every logged span against the text before it and requires the
+  splice to reproduce the text after it, for typing, splitting, deleting across
+  lines, wide glyphs and streamed appends.
+- **`ValuePlan::patch_node`** (`layout/json_tree.rs`): replace one node's slot
+  block with a plan of that node as it now parses, shifting the tops and
+  renumbering the node ids below by the difference. `NodeSlot::first_id` is what
+  lets ids be renumbered without re-walking; a patched plan equals a rebuild
+  field for field, which the parity test pins across eight replacement shapes.
+  The region a keystroke re-walks is that node, not the document.
+- **`Doc`** (`layout/json_tree.rs`): the tree, its spans and its plan in one
+  place, with `patch` — the localization rule. A span's byte range is a
+  pre-order list sorted by start, so the innermost node holding an edit is one
+  binary search away, and when that node ends before the edit the only nodes
+  that can still contain it are its ancestors, which the plan's parent links
+  give without touching the rest of the document. A token typed at the end of a
+  scalar extends the scalar (`1` → `12`), which is why typing a digit into a
+  huge flat object is a one-node patch; whitespace between tokens renders
+  nothing, so it shifts offsets and patches no plan at all. A node is re-parsed
+  from its own bytes, spliced into the tree by child ordinal, its ranges
+  spliced in beside it and every offset below it shifted. An edit that leaves
+  the document unparseable (a half-typed key, `1.`) had no node to describe and
+  was refused, so the caller re-parsed — the round after next turns that
+  refusal into one error row (see "A broken keystroke keeps the tree").
+- **The app stops re-parsing** (`app.rs`): the tab holds
+  `json_doc: Option<(revision, Doc)>` in place of the tree and the plan, and
+  both passes patch it — at the edit (`patch_plan_for_edit`) and at the paint
+  (`patch_json_plan`). Freshness has one home (`json_doc_active`: width,
+  collapse generation, virtual threshold, and spans that still match slots), and
+  `current_plan_height` decides "this plan is current, just install it" for
+  JSON beside the JSONL and line/Markdown families. A resize or a fold
+  re-plans from the tree already in hand, never from a re-parse; a relayout that
+  finds the tree stale takes the worker path exactly as before.
+- **The cost gate types into a JSON too** (`perf.rs`): a virtual JSON tree
+  counts as planned, so `type` asserts a keystroke *patched* it — with the
+  caret placed inside a string first, because at byte zero a keystroke really
+  does make the document unparseable. It also asserts no worker job was started,
+  so a re-parse cannot pass as a patch.
+- **Tests**: `Doc::patch` against a full parse-and-plan — tree equality, ranges
+  exactly equal to `parse_spanned`'s, plan equality slot for slot, and the band
+  a patched plan paints equal op for op to a full layout — through a character
+  in a string, a digit extending a number, a blank line, an item appended to an
+  array, a member's line deleted and a member appended at the end; the refusal
+  of an edit that breaks the document, and a key rename that stays valid. In
+  `app.rs`, typing in Split on a 21k-node document patches the tree with no
+  worker job started, lands on a fresh build of the same tree, and paints the
+  edited row.
+- **Fixed on the way**: `Buffer::byte_len` summed every line, and `append_line`
+  called it once per line, which made a streamed load quadratic — 8 MB JSON
+  loaded in 34.4 s, a log in 5.1 s, a source file in 23.6 s. The length is a
+  field now, maintained by the four mutations: 103.5 ms, 75.8 ms and 961.6 ms
+  for the same files. `byte_slice` also stops walking once it is past its range.
+- **Numbers** (8 MB, 545 208 nodes, release, 1440x900): `Doc::patch` for one
+  keystroke is 3.6 ms, of which the node's own parse and measure is a fraction —
+  the rest is finding its bytes in a 450 000-line document. What the gate
+  measures end to end is the paint the keystroke costs in Split, and JSON's
+  `type` column now reports 138-228 ms across runs instead of `—`: the editor
+  half's own whole-buffer list and its `h_max` scan (84-144 ms, measured
+  separately) is where that sits, exactly as the JSONL round found for its
+  44-81 ms.
+- **Validation**: `cargo test` 497 passed, `cargo clippy --all-targets -- -D
+  warnings` and `cargo fmt --check` clean, release cost gate green for all six
+  kinds at 8 MB.
+- **Limitations**: an edit that made the document temporarily invalid (a
+  half-typed key, `1.`, a `,` waiting for its value) was re-parsed whole — a
+  document being typed into is invalid far more often than valid, and the next
+  round makes that state patchable. A structural edit (a key, a comma, a
+  delimiter) belongs to the container around it, so it re-walks that container's
+  children rather than one value. A tree edited past the buffer's 64-span log,
+  or edited in Edit mode and then shown in Split, still falls back to a re-parse;
+  and a resize, a fold or a width change re-measures every node — a
+  pure-arithmetic pass, but still O(nodes).
+
+## A broken keystroke keeps the tree
+
+- **The gap**: the previous round made a valid keystroke patch the tree, but a
+  keystroke that left the document unparseable still dropped it and re-parsed.
+  That is most of the time a document spends being typed into: `{` before its
+  value, `1.` before its digits, a comma before the member it separates, `"` in
+  a key that is not finished. So the fastest path was the one a typist hits
+  least, and the slow one was hit per keystroke until the thought was finished —
+  a worker pass and a fresh plan for every character while a member was added.
+- **`Value::Broken(msg)`** (`parse/json/value.rs`): a leaf that stands for text
+  the parser could not describe, carrying what it said about it. Only the patch
+  path builds one: a file's first parse either succeeds or reports its error as
+  before, so a tree that was never edited cannot contain one. The layout paints
+  it as one row — the node's key or index, then `! <message>` in the error
+  colour — through the same `scalar_segs` the painter and the full layout share,
+  so a patched plan and a rebuilt one put the row in the same place.
+- **The patch keeps the node it cannot parse** (`layout/json_tree.rs`): when the
+  located node's own bytes fail to parse, the node becomes one `Broken` leaf
+  spanning exactly that text, its slot block is replaced the same way a parsed
+  value's would be, and every other node — above, beside and below — keeps its
+  ranges and its measurement. The row is therefore as large as the region the
+  parser lost and no larger: a half-written number breaks one row, a dangling
+  comma breaks the array it dangles in. `Doc::broken` reports the first broken
+  node in pre-order; it is read back from the tree after a patch only while the
+  tree has an error to report, so the healthy path never walks the document.
+- **A repair is a patch too**: the fixing keystroke lands inside the broken
+  leaf's range, which is exactly the text that has to parse again, so the node
+  is spliced back as a real value and the document is whole again — equal, tree
+  and ranges, to a parse of its own text (the test checks both).
+- **The pane does not demote itself** (`app.rs`): a tree the tab holds stays the
+  pane's tree whatever its node count falls to, so `banded`,
+  `json_doc_active` and `current_plan_height` no longer ask whether it is still
+  big enough to virtualize — only a *fresh* parse decides whether a document is
+  worth keeping. Without that, breaking the root of a 21k-node document dropped
+  the tree below the threshold, the pane laid it out whole, and the next
+  keystroke re-parsed. The status line says what the tree says: `error: <msg>`
+  while some node is broken, empty once none is — including after a resize or a
+  fold, which re-plan the held tree rather than reading its status off a parse.
+- **The cost gate types a break too** (`perf.rs`): after its keystroke inside a
+  string it puts the caret inside a nested array and types a comma, then asserts
+  the tree was *patched* and no worker job was started. A re-parse cannot pass
+  as a patch, and the assertion is the same one that guards the valid path.
+- **Tests**: in `json_tree.rs`, a dangling comma (the array becomes one row, the
+  object around it keeps its members, the band paints `! …`), a half-written
+  number repaired from `1.` to `1.5` (leaf for leaf, then equal to a full parse),
+  two breaks in two places with the first still reported after the other is
+  fixed, a key rename that stays valid, and the one refusal left: an edit
+  outside every node (trailing content past the root) has nothing to hang on.
+  In `app.rs`, a comma typed at the top of a 3 600-line JSON's array patches the
+  tree with no worker job, the status line says `error: …`, the band paints the
+  row, and backspacing the comma restores the tree a full parse gives and clears
+  the status.
+- **Validation**: `cargo test` 500 passed, `cargo clippy --all-targets -- -D
+  warnings` and `cargo fmt --check` clean, release cost gate green for all six
+  kinds at 8 MB.
+- **Limitations**: the row is as big as the node the parser lost, so a
+  structural break in a big container shows that container as one error row
+  until it parses again — honest, and no worse than the whole-pane banner it
+  replaced, but it does not keep the container's children on screen. An edit
+  outside every node (trailing content past the root) is still refused and
+  re-parsed. A broken node is only re-derived by an edit inside its own range,
+  which is also the only edit that can repair it. And in Split the two panes
+  share one scroll offset, so a tree that collapses under a caret far down the
+  document can leave the pane scrolled past its new end — the same is true of
+  the error banner this replaces.
+
+## The status line's error is a way to the node
+
+The bar has said `error: <msg>` since an unparseable keystroke stopped costing the
+tree, but that only tells a reader *that* something below is broken. The words
+are now the way there.
+
+- **The detail is a target only while it names the node** (`app.rs`):
+  `status_names_broken_json` asks three cheap questions per paint — a JSON tree
+  is on screen, the mode has a reader pane, and the bar's `status_extra` is the
+  tree's own message (`error: <msg>`, compared without allocating). A transient
+  that has taken the message's place (`reloaded`, `save failed`, `file changed
+  on disk`) is a fact again: a word that does not name the node must not offer to
+  lead to it. Edit has no reader pane to move, so the same words are a fact
+  there too.
+- **One walk, on the press**: `Doc::first_broken_slot` numbers the nodes in
+  pre-order, which is the plan's slot order, so the first `Broken` leaf's
+  position is its slot. Only the press pays for it.
+- **The jump centres the row**: `top - (pane_h - h) / 2`, clamped to the
+  document. A target at the very top of the pane reads like the start of the
+  file; the middle reads like "here it is".
+- **Split hands over a fraction, not pixels**: the two panes share one progress,
+  and their documents need not be the same height, so a preview pixel becomes
+  `target / preview_max` and `set_scroll_ratio` turns it back into the shared
+  offset. Writing the pixel count straight into `scroll.offset` there moved the
+  pane by that many pixels of whichever document is taller (the test's panes
+  disagree by 40 %, and the old code lands at 335 244 instead of 475 008).
+- **The band painter's unit was wrong** (`app.rs`): the virtualized branch built
+  its band and painted it at `scroll.offset` — the shared progress in the taller
+  document's units — while the scrollbar, hit tests, `preview_scroll` and the
+  full-list branch all use preview pixels. Whenever the panes' heights differed
+  (a folded tree, a JSON with blank lines) Split painted a different slice than
+  its own scrollbar described. It reads `preview_scroll()` now, like every other
+  reader-pane path. This was found by the jump: without it the pane "jumped" to
+  row 2 549 when asked for 1 800.
+- **The bar's outputs are one struct** (`ui/statusbar.rs`): the painter had grown
+  to eight parameters filling three rects; `Targets { buttons, copy, detail }`
+  says what they are — the answer to "where is the pointer?". `detail` is
+  `Some` only when the detail is an action, and the hover pill it paints is
+  measured from the *fitted* text, so a detail cut short of the buttons cannot
+  leave a target reaching past its last glyph. The error's hand cursor comes
+  from the same rect (`cursor_at`), so the pointer agrees with the press.
+- **Tests**: in `statusbar.rs`, the detail is a target (bar-height rect, error
+  ink, hover does not move it) only when it means something; in `app.rs`, a
+  document with nothing broken offers no target at all; a comma inside a nested
+  array half-way down a 3 600-record JSON (with blank lines between records, so
+  the editor pane is much taller than the tree) makes the bar name the break,
+  and pressing it centres the broken row — the painted band then contains the
+  `! …` row — in Split and again in Preview after the pane is replanned full
+  width; `reloaded` in the same slot is a fact, and Edit offers nothing.
+- **Validation**: `cargo test` 502 passed, `cargo clippy --all-targets -- -D
+  warnings` and `cargo fmt --check` clean, release cost gate 7/7.
+- **Limitations**: the target is for a JSON tree the tab holds — a JSONL
+  record's error count and a document that never parsed (no tree, the bar says
+  `error line:col`) are not links. A broken node hidden inside a collapsed
+  parent is not expanded for you: the jump centres the folded row that hides it.
+  In Split the panes still share one progress, so the editor half moves with the
+  reading half, as it does for every other scroll.
+
+## The typing round: dirty, status counts and find ride the edit (Oct 2026) — 521 tests green
+Three backlog items (POLISH.md T4, T5, T7) that all charged the document for a
+keystroke even after the last round, each fixed by keeping the running answer
+and pricing only what the edit touched.
+
+- **T7 · The dirty compare starts at the edit.** `sync_dirty` used to walk from
+  line 0 and stop at the first difference, so a keystroke at the end of an 8 MB
+  file compared the file each time. The saved text now keeps its line count
+  beside it (`tab.saved_lines`, replacing the per-compare `split('\n').count()`
+  that walked every byte first), and the walk starts at the tab's `edited_from`
+  watermark — the smallest line any edit since the load or save touched —
+  because nothing above it differs. It is a tab field, raised by every edit and
+  reset on save/reload, since the edit log is capped and `install_preview` eats
+  it. The top-of-file test still compares `dirty` against a full walk and they
+  agree.
+- **T4 · The status bars' counts are running tallies.** The log status used to
+  rescan 20 000 lines and the JSONL status walked every record after each
+  keystroke. The log keeps a `LogTally` on the tab — one severity byte per line
+  plus error/warn counts over exactly the window the status quotes; one
+  localized edit batch patches the byte array and adjusts the counters, and
+  anything else (a multi-edit batch, a tally the text outgrew, a wholesale
+  replace) falls back to the full scan. JSONL keeps `records_errors` beside the
+  records; the JSONL plan's patch already knows the replaced record range, so
+  it now returns those records' error delta and the tally moves by it. Both
+  statuses equal a recount in tests (a keystroke in a good row, a heal, a
+  break).
+- **T5 · The find bar's list is patched onto the edit.** A keystroke with the
+  bar open used to rescan the whole buffer (`Find::rescan`). `Find::patch` now
+  rebuilds the list for one `EditSpan`: matches strictly above the edit keep
+  their positions, matches strictly below shift by the edit's line delta (a
+  multiline edit shifts by more than one), and only the edited run
+  `[start, start+inserted)` is searched anew. `after_edit` feeds it the same
+  spans the rest of the pipeline consumed once, so the bar's next relayout only
+  re-lands on the caret. Anything a round cannot be localized to — no span, a
+  multi-span batch, an edit past the buffer, a lost log — still falls back to
+  the full rescan, and the current match is re-landed against the caret either
+  way.
+- **Tests**: `patch_onto_edits_agrees_with_a_full_rescan` (key typed below the
+  caret, a line inserted above it, a deletion across a line break, the edited
+  line itself) with a hand-checked endpoints test so the patches are the
+  incremental shapes; `patch_falls_back_when_the_batch_cannot_be_localized`; the
+  JSONL count test over a 6 000-record virtual file; the log tally compared
+  against full scans; the top-of-file dirty oracle for T7. The gate passes
+  7/7 in release with the G4 last-caret values unchanged.
+- **Measured**: `pipeline_breakdown` on the 8 MB code fixture: find full rescan
+  51.4 ms → the edit patch 0.4 ms per keystroke (well under the 10 ms buy),
+  giving the bar the same headline as the dirty flag.
+- **Validation**: 521 tests pass, `cargo clippy --all-targets -- -D warnings`
+  and `cargo fmt --check` clean.
+- **Limitations**: find's multi-span batches (a doc-wide replace) and an undo
+  across several spans pay the full rescan; the log tally rides the same cap,
+  rescanning instead of incrementing on anything wider than one localized
+  edit.
+
+## The banding round: the CSV grid and the Markdown band between frames (Oct 2026) — 523 tests green
+Row 9 of the order table (POLISH.md S1, S2): the last document-sized pane bands
+its rows, and the one band that kept re-rendering holds its ops across frames.
+
+- **S1 · The CSV sheet paints in bands.** `layout::csv` now has a plan: the same
+  width scan `layout` always ran, recorded once (column widths, x positions, the
+  numeric-right-align decision) plus a `plan::Rows` index over the sheet's units
+  — the header band with its rule, one unit per data row, the cap note. A band
+  painter lays out only the units a viewport covers, through the same shared
+  painter `layout` runs over every unit, so the band and the full list are the
+  same ops (a pixel-for-pixel test asserts equality and a mid-sheet subsequence).
+  The sheet parses once and stays on the tab beside its revision
+  (`csv_sheet`), and `PanePlan::Csv` joins the planned kinds — the banded
+  paint path, the replan, and the patch dispatch all gained the CSV arm.
+- **T6, answered by the measurement S1 made possible**: a CSV keystroke
+  re-parses the capped sheet and replans inline (the patch arm in both patch
+  sites), and the gate now records CSV typing. At the gate's view: type 3–4 ms,
+  band 314 ops, frame 2.8–3.6 ms. The row-patch alternative would spare only
+  the parse of a sheet the parser has already capped at 2 000 rows, so the
+  decision is: keep the re-parse, documented here as the intended behavior,
+  and revisit only if that parse ever stops being bounded.
+- **S2 · The Markdown band is cached between frames.** The tab keeps the last
+  band it laid out with the units it covers and what it answered to (buffer
+  revision, pane width, zoom, DPI scale). A scroll whose viewport's units all
+  lie inside the covered range reuses the ops — the clip does the edges — and
+  everything else builds fresh and becomes the next cache. An edit invalidates
+  the cache by revision; the counter test proves rebuild-free scrolling inside
+  a band, a rebuild past its end, and a rebuild after an edit with the typed
+  text visible.
+- **Measured** (release gate): csv frame 4.65 → 2.8–3.6 ms, whole-sheet install
+  17 011 ops → 314; markdown frame 4.30 → 1.82 ms with the cache holding inside
+  a band. Both budget keepers pass, 7/7 gate.
+- **Validation**: 523 tests pass (the band-index test exempts CSV like JSONL —
+  a planned pane carries no index — and the plan-or-bounded test now counts CSV
+  among the planned kinds), `cargo clippy --all-targets -- -D warnings` and
+  `cargo fmt --check` clean.
+- **Found by the G4 row this round**: code's first far band pays the document
+  once. The line plan's lazy checkpoint fill (`state_at`) scans from the last
+  known checkpoint when nothing is known between it and the caret — an edit
+  at the top resets all of them — so the gate's `end` keystroke measured a
+  ~590 ms one-time pass over the document (band otherwise 0.1–0.2 ms). This
+  is the T1-era checkpoint design, not the band cache. It was recorded as C1
+  in POLISH.md and **landed the following round**: the worker builds with its
+  checkpoints filled, a width replan adopts them, a keystroke re-proves them
+  with one bounded scan, and where no worker exists (headless opens;
+  `--pretty` has since dropped the `App` construction altogether) the plan
+  fills at load — the gate's `end` row is band speed and every kind stays
+  within budget (the landed note in POLISH.md has the numbers). App-level
+  pin: `a_width_change_hands_the_plan_over_and_a_stale_plan_rebuilds`
+  drives both halves through the event loop (hand-off on a current plan;
+  rebuild on a stale one that matches the edited buffer).
+- **Limitations**: the CSV plan's units are one per *physical* row, so a
+  sheet whose rows wrap (a narrow pane) re-plans rather than re-flows them;
+  the markdown cache serves one viewport-sized range at a time, so a big
+  scroll jump pays one rebuild — a second-level cache of a page above and
+  below the caret would absorb that too, if the numbers ever ask for it.
+
+### Audit round (Oct 2026) — what a risk sweep asked for and got
+- **The worker outcome could go stale twice.** A result landing after the
+  view changed was already dropped; but if the worker *died* without sending
+  (a panicked closure — sender disconnected), the old band stayed on screen
+  with nothing ever marking the layout dirty. `poll_preview_job` now starts
+  a rebuild in that arm too.
+- **The loopback fetch test had a burnable connection.** Its listener
+  accepted exactly one connection; urlmon's failed attempt opens the TCP
+  connection and exhausts it, then curl (the next rung) finds the listener
+  gone. Served now on an unbounded accept loop; the assertion is unchanged.
+- **Tests no longer mistake a locked temp dir for a regression.**
+  `testing::temp_dir()` answers once per process: the OS temp dir when a
+  probe write lands there, `target/.tmp` otherwise — 100+ fixture writes used
+  to fail as `PermissionDenied` en masse on hosts where `CreateFileW` into
+  the user temp is refused. Shipped code keeps `std::env::temp_dir()`; the
+  net fetch's test-only scratch override does the same job for a live
+  download whose scratch file the rung itself must write.
+- **The MSRV is named and gated.** `rust-version = "1.88"` (the floor the
+  code's own `slice::as_chunks` sets), and a `msrv-clean-check` CI job
+  type-checks the whole tree from an empty target dir on exactly 1.88.0 —
+  with no rust-cache to mask, and the old toolchain to catch syntax a newer
+  local rustc quietly accepts (the `if let` guard that a clean `cargo run`
+  caught first). Verified locally: `cargo +1.88.0 test`, 528 green.
+
+
+## Remaining responsiveness work
+
+The product is frozen, so what is left is making the window answer faster. The
+measurements, the workstreams and their acceptance tests are in
+[`POLISH.md`](POLISH.md): the gate measures the wrong paths today (headless opens
+inline; the typing keystroke is measured only near the top of a file), typing
+still re-derives each kind's pane around the edit, and the editor half is laid
+out from the whole buffer on every keystroke.

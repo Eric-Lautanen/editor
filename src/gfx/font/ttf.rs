@@ -48,7 +48,7 @@ const FLATTEN_TOL_UNITS: f32 = 8.0;
 
 /// Vertical supersamples per pixel row: coverage bands in y are quantized to
 /// these; horizontal coverage stays exact per sample.
-const RASTER_SAMPLES: u32 = 4;
+const RASTER_SAMPLES: u32 = 8;
 
 /// Hostile fonts can carry enormous coordinate deltas; cap the bitmap size
 /// in each axis so a single glyph can never ask for an absurd allocation.

@@ -11,6 +11,7 @@ mod crash;
 mod error;
 mod gfx;
 mod layout;
+mod load;
 #[cfg(any(test, feature = "mem-census"))]
 mod mem;
 #[cfg(any(test, feature = "mem-census"))]
@@ -27,6 +28,8 @@ mod platform;
 #[cfg(test)]
 mod scratch_test;
 mod settings;
+#[cfg(test)]
+mod testing;
 mod ui;
 mod update;
 // update sits with the other top-level app concerns (settings, cli); see

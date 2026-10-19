@@ -110,10 +110,18 @@ pub enum Event {
     /// Continuous manipulation: a finger (or pen) dragging the content. This
     /// tracks the input exactly — a glide in the way of a finger reads as lag
     /// — and on release hands over to [`Event::PanEnd`].
+    ///
+    /// `x`/`y` carry the contact's own position (client px): a gesture is
+    /// located at the finger, not at wherever a mouse last roamed, and the
+    /// app uses it to decide which pane the gesture belongs to.
     #[cfg(any(target_os = "windows", test))]
     Pan {
         dx: f32,
         dy: f32,
+        /// Finger position, client px. Optional: synthesized pans in tests
+        /// may omit it.
+        x: f32,
+        y: f32,
     },
     /// The finger came up, with its velocity across the last ~100 ms in client
     /// px/ms. A quick flick coasts from there; a release after the finger held

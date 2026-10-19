@@ -138,7 +138,7 @@ pub const SECTIONS: &[Section] = &[
             // a reset is a no-op on a fresh window.
             Binding::key("Ctrl + / - / 0", "zoom in / out / reset", ctrl('=')),
             Binding::key("Ctrl+T", "light / dark theme", ctrl('t')),
-            Binding::prose("click [+]", "fold / unfold JSON nodes"),
+            Binding::prose("click ▶", "fold / unfold JSON nodes"),
             Binding::prose(
                 "hover a link",
                 "show its address in the status bar; click to open it",

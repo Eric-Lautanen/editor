@@ -88,6 +88,42 @@ impl Canvas {
         };
     }
 
+    /// A straight antialiased segment from (x0,y0) to (x1,y1) with round
+    /// quality: drawn as a thick line by walking the longer axis one pixel at
+    /// a time and stamping a disc of the given thickness (faded by coverage
+    /// across the disc), which gives spinner arcs and rules a clean look.
+    pub fn stroke_segment(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, th: f32, c: Color) {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 0.5 {
+            return;
+        }
+        let r = th / 2.0;
+        let n = len.ceil() as i32;
+        let (ux, uy) = (dx / len, dy / len);
+        for i in 0..=n {
+            let px = x0 + ux * i as f32;
+            let py = y0 + uy * i as f32;
+            // Stamp one pixel-column disc: the alpha falls off radially so a
+            // thick segment has antialiased edges rather than a hard border.
+            let ix0 = (px - r).floor() as i32;
+            let ix1 = (px + r).ceil() as i32;
+            let iy0 = (py - r).floor() as i32;
+            let iy1 = (py + r).ceil() as i32;
+            for yy in iy0..iy1 {
+                for xx in ix0..ix1 {
+                    let ddx = xx as f32 + 0.5 - px;
+                    let ddy = yy as f32 + 0.5 - py;
+                    let d = (ddx * ddx + ddy * ddy).sqrt();
+                    let cov = (r - d + 0.5).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        self.put(xx, yy, c, (cov * 255.0 + 0.5) as u32);
+                    }
+                }
+            }
+        }
+    }
+
     /// Fill a rectangle (pixel-snapped: rounds edges). Alpha-blends if `c.a < 255`.
     pub fn fill_rect(&mut self, r: Rect, c: Color) {
         let (cx0, cy0, cx1, cy1) = self.clip;

@@ -36,6 +36,13 @@ pub struct Bar<'a> {
     /// Appended after `info` when non-empty: caret position in Edit, a parse
     /// error, `reloaded`, `open failed: …` and other transients.
     pub detail: &'a str,
+    /// Whether the detail is somewhere to go rather than a fact: the caller
+    /// offers a target (`detail` rect) only when it is, and paints it in the
+    /// error colour it already means.
+    pub detail_action: bool,
+    /// Whether the pointer is on that target right now, so it can wear the
+    /// same pill the Copy button does.
+    pub detail_hover: bool,
     /// The address under the pointer, shown after the Copy button. `None`
     /// when nothing is hovered, so the bar carries no empty slot.
     pub link: Option<&'a str>,
@@ -60,19 +67,37 @@ fn fit(fonts: &FontSystem, style: FontStyle, text: &str, size: f32, max_w: f32) 
     "…".to_string()
 }
 
+/// What a paint leaves behind for the next press: the buttons carry their
+/// labels in and get their rects filled in, and the Copy button and an
+/// actionable detail exist only while there is something to press.
+///
+/// One struct because they are one answer to one question — where is the
+/// pointer? — and because eight parameters to a painter is a shape nobody
+/// can read at the call site.
+pub struct Targets<'a> {
+    pub buttons: &'a mut [StatusButton],
+    pub copy: &'a mut Option<StatusButton>,
+    /// Filled in only when the bar's detail is somewhere to go; `None`
+    /// otherwise, so a fact is never pressed.
+    pub detail: &'a mut Option<Rect>,
+}
+
 /// Bottom status bar: the document's facts at the far left (then the Copy
 /// button and a hovered link), and a row of clickable mode buttons at the
-/// right edge. `buttons` carries label/active in; `rect` is filled in for hit
-/// testing, as is `copy`'s.
+/// right edge. `targets` receives the rects the next press hit-tests against.
 pub fn paint(
     canvas: &mut Canvas,
     fonts: &FontSystem,
     theme: &Theme,
     area: Rect,
     bar: Bar<'_>,
-    buttons: &mut [StatusButton],
-    copy: &mut Option<StatusButton>,
+    targets: Targets<'_>,
 ) {
+    let Targets {
+        buttons,
+        copy,
+        detail,
+    } = targets;
     let scale = area.h / HEIGHT;
     canvas.set_clip(Some(area));
     canvas.fill_rect(area, theme.code_bg);
@@ -169,9 +194,46 @@ pub fn paint(
     };
 
     x += draw(canvas, bar.info, theme.muted, x, limit - x);
+    *detail = None;
     if !bar.detail.is_empty() {
-        let sep = format!("  ·  {}", bar.detail);
-        x += draw(canvas, &sep, theme.fg, x, limit - x);
+        x += draw(canvas, "  ·  ", theme.muted, x, limit - x);
+        // The detail is part of the bar's left-hand text like anything else —
+        // unless it stands for somewhere to go, and then it takes the bar
+        // height as a target, a hairline of air either side so a finger lands,
+        // and the error colour it already means.
+        // Measured from what will actually be painted, not from the full
+        // string: a detail cut short of the buttons must not leave a target
+        // reaching past the last glyph it shows.
+        let shown = fit(fonts, FontStyle::Regular, bar.detail, size, limit - x);
+        let tw = fonts.measure(FontStyle::Regular, &shown, size);
+        let color = if bar.detail_action {
+            let dx = x - 4.0 * scale;
+            let w = (tw + 8.0 * scale).min(limit - dx).max(0.0);
+            let target = Rect::new(dx, area.y, w, area.h);
+            if bar.detail_hover && w > 0.0 {
+                canvas.fill_rounded_rect(
+                    Rect::new(target.x, (mid - pill_h / 2.0).round(), target.w, pill_h),
+                    radius,
+                    Color::rgba(theme.error.r, theme.error.g, theme.error.b, 32),
+                );
+            }
+            *detail = Some(target);
+            theme.error
+        } else {
+            theme.fg
+        };
+        canvas.draw_text(
+            fonts,
+            &shown,
+            x,
+            baseline,
+            TextSpec {
+                size,
+                style: FontStyle::Regular,
+                color,
+            },
+        );
+        x += tw;
     }
 
     // The Copy button, after the document facts. Accent-tinted so it reads as
@@ -241,6 +303,18 @@ mod tests {
         link: Option<&str>,
         copy_label: Option<&'static str>,
     ) -> (Canvas, Option<StatusButton>) {
+        let (c, copy, _) = paint_bar_full(detail, link, copy_label, false, false);
+        (c, copy)
+    }
+
+    /// [`paint_bar`], with the detail's action state and the rects it filled.
+    fn paint_bar_full(
+        detail: &str,
+        link: Option<&str>,
+        copy_label: Option<&'static str>,
+        detail_action: bool,
+        detail_hover: bool,
+    ) -> (Canvas, Option<StatusButton>, Option<Rect>) {
         let fonts = FontSystem::load_embedded();
         let theme = Theme::light();
         let area = Rect::new(0.0, 0.0, 900.0, HEIGHT);
@@ -253,6 +327,7 @@ mod tests {
             group_start: false,
             rect: Rect::default(),
         });
+        let mut target = None;
         paint(
             &mut c,
             &fonts,
@@ -262,11 +337,16 @@ mod tests {
                 info: INFO,
                 detail,
                 link,
+                detail_action,
+                detail_hover,
             },
-            &mut buttons,
-            &mut copy,
+            Targets {
+                buttons: &mut buttons,
+                copy: &mut copy,
+                detail: &mut target,
+            },
         );
-        (c, copy)
+        (c, copy, target)
     }
 
     /// First and last column carrying ink (the bar's own background is not
@@ -314,6 +394,7 @@ mod tests {
             rect: Rect::default(),
         }];
         let mut copy = None;
+        let mut target = None;
         paint(
             &mut c,
             &fonts,
@@ -323,11 +404,69 @@ mod tests {
                 info: "",
                 detail: "",
                 link: None,
+                detail_action: false,
+                detail_hover: false,
             },
-            &mut buttons,
-            &mut copy,
+            Targets {
+                buttons: &mut buttons,
+                copy: &mut copy,
+                detail: &mut target,
+            },
         );
+        assert!(target.is_none(), "an empty detail is no target");
         (c, buttons[0], area)
+    }
+
+    /// A detail that names a place to go is a target: its rect is filled in,
+    /// it takes the bar's height, and it is painted in the error colour instead
+    /// of the plain fact colour. A detail that is only a fact is not.
+    #[test]
+    fn the_detail_is_a_target_only_when_it_means_something() {
+        let detail = "error: expected a value";
+        let (plain, _, fact) = paint_bar_full(detail, None, None, false, false);
+        assert!(fact.is_none(), "a fact is not a target");
+        let (actionable, _, target) = paint_bar_full(detail, None, None, true, false);
+        let target = target.expect("an error detail is a target");
+        assert_eq!(target.h, HEIGHT, "full bar height for a finger");
+        assert_eq!(target.y, 0.0);
+        // The words are inside it: the last column with ink on the bar is the
+        // detail's last glyph (nothing follows it here), and the target reaches
+        // at least that far.
+        let (_, last) = ink_span(&actionable);
+        assert!(
+            target.x < last as f32 && target.right() >= last as f32 - 1.0,
+            "target {target:?} misses the text ending at {last}"
+        );
+        // And it is the error colour: the same glyphs, different ink.
+        let w = actionable.width;
+        let mut differs = 0;
+        for y in (target.y as usize + 2)..(target.bottom() as usize) {
+            for x in (target.x as usize)..(target.right() as usize) {
+                if plain.pixels[y * w + x] != actionable.pixels[y * w + x] {
+                    differs += 1;
+                }
+            }
+        }
+        assert!(differs > 0, "the target painted like a fact");
+        // A hover only adds the pill; it does not move the target.
+        let (with_hover, _, hovered) = paint_bar_full(detail, None, None, true, true);
+        assert_eq!(hovered, Some(target));
+        // The pill is there to be seen: it tints the air inside the target and
+        // stops at its edge rather than bleeding into the facts beside it.
+        let w = with_hover.width;
+        let mid = (HEIGHT / 2.0) as usize;
+        let inside = target.x as usize + 1;
+        assert_ne!(
+            with_hover.pixels[mid * w + inside],
+            actionable.pixels[mid * w + inside],
+            "the hover pill painted nothing"
+        );
+        let outside = (target.x as usize).saturating_sub(2);
+        assert_eq!(
+            with_hover.pixels[mid * w + outside],
+            actionable.pixels[mid * w + outside],
+            "the hover pill spilt out of its target"
+        );
     }
 
     #[test]
@@ -362,6 +501,7 @@ mod tests {
             rect: Rect::default(),
         }];
         let mut copy = None;
+        let mut target = None;
         paint(
             &mut c,
             &fonts,
@@ -371,9 +511,14 @@ mod tests {
                 info: "",
                 detail: "",
                 link: None,
+                detail_action: false,
+                detail_hover: false,
             },
-            &mut buttons,
-            &mut copy,
+            Targets {
+                buttons: &mut buttons,
+                copy: &mut copy,
+                detail: &mut target,
+            },
         );
         // A column two pixels inside the pill's left edge: rounded corners keep
         // it clear of the glyphs, so what it finds is the pill itself.

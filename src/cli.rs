@@ -146,6 +146,16 @@ fn parse(args: &[String]) -> Result<Opts> {
     Ok(o)
 }
 
+/// The settings file's view mode, decoded in one place: 1 = Edit, 2 = Split,
+/// everything else (0 today, unknown tomorrow) = Preview.
+fn session_view(mode: u8) -> Mode {
+    match mode {
+        1 => Mode::Edit,
+        2 => Mode::Split,
+        _ => Mode::Preview,
+    }
+}
+
 pub fn run(args: Vec<String>) -> Result<()> {
     let o = parse(&args)?;
     if let Some(act) = o.immediate {
@@ -172,7 +182,16 @@ pub fn run(args: Vec<String>) -> Result<()> {
     if o.render.is_some() && o.files.len() != 1 {
         return Err(usage("--render takes exactly one FILE"));
     }
-    let headless = o.render.is_some() || o.pretty || o.mem_report;
+    // `--pretty` never opens a window and builds no App: it only reads the
+    // bytes and echoes or re-prints them. Leaving the startup below would
+    // parse and lay out the document (and plan the code pane — see
+    // src/app/preview.rs) only to throw it all away, which cost a full
+    // load on every print. Everything here that inspects the session or
+    // the running instance is window logic, and a print has no window.
+    if o.pretty {
+        return pretty_print(o.files.first().map(|p| p.as_path()));
+    }
+    let headless = o.render.is_some() || o.mem_report;
     // Hand a second launch's files to the already-running window and exit
     // before anything is loaded or restored. This used to happen *after* the
     // App was built: a big file was parsed only to be thrown away, and an
@@ -182,7 +201,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let mut app = App::new(o.files.first().cloned())?;
+    let mut app = App::new_streaming(o.files.first().cloned(), headless)?;
     // A file argument opens by construction (`App::new`), not through
     // `open_path`, so it would otherwise never reach the recent list.
     if let Some(f) = o.files.first() {
@@ -205,12 +224,16 @@ pub fn run(args: Vec<String>) -> Result<()> {
     app.set_reduce_motion(platform::prefers_reduced_motion());
     // Restore the last session's tabs and view unless a file was given.
     if o.files.is_empty() && !session.files.is_empty() {
-        let mode = match session.mode {
-            1 => Mode::Edit,
-            2 => Mode::Split,
-            _ => Mode::Preview,
-        };
-        app.restore(&session.files, session.active, mode);
+        app.restore(&session.files, session.active, session_view(session.mode));
+    } else if !o.files.is_empty() && !headless {
+        // A double-clicked file lands here when no instance is running, and
+        // used to open at the hardcoded open-at-Preview default no matter
+        // how the user browses: switch to Edit or Split, close, and the
+        // next double-click came back at Preview anyway. Adopt the view the
+        // session persisted — the file is the *first* tab (App::new built
+        // it), so the untitled→Edit rule never applies. Headless snapshots
+        // keep their explicit `--mode` (below) and don't consult this.
+        app.set_mode(session_view(session.mode));
     }
     // The recent list crosses sessions whether or not tabs were restored.
     app.restore_recent(&session.recent);
@@ -243,13 +266,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
     if let Some(report) = crash::latest() {
         app.status_extra = format!("previous run crashed — report: {}", report.display());
     }
-    if o.pretty {
-        return pretty_print(o.files.first().map(|p| p.as_path()));
-    }
     #[cfg(any(test, feature = "mem-census"))]
     if o.mem_report {
         if let Some(path) = o.files.first() {
-            let mut a = App::new(Some(path.to_path_buf()))?;
+            let mut a = App::new_streaming(Some(path.to_path_buf()), true)?;
             let _ = a.render_headless(o.size.0, o.size.1, o.scale);
             crate::platform::print_line("-- after tab 1 --");
             crate::platform::print_line(&crate::mem::report());
@@ -363,6 +383,16 @@ fn pretty_print(file: Option<&std::path::Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_view_decodes_the_persisted_numbers() {
+        // The encoding `App::settings` writes (0 = Preview, 1 = Edit,
+        // 2 = Split); anything unknown still opens somewhere usable.
+        assert_eq!(session_view(0), Mode::Preview);
+        assert_eq!(session_view(1), Mode::Edit);
+        assert_eq!(session_view(2), Mode::Split);
+        assert_eq!(session_view(9), Mode::Preview);
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

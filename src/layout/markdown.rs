@@ -7,6 +7,7 @@
 
 use super::{
     display_list::{DisplayList, DrawOp, FontStyle, HitAction, HitRegion},
+    plan, syntax,
     theme::Theme,
     Ctx,
 };
@@ -19,6 +20,28 @@ use crate::{
 /// continuation row gets. Both are unscaled: they sit next to padded text.
 const CODE_PAD: f32 = 12.0;
 const CODE_HANG: &str = "  ";
+
+/// `text` clipped to `budget` px with a trailing ellipsis. Measures once per
+/// character instead of re-measuring a shrinking prefix, which matters when a
+/// long image path sits in a paragraph.
+fn truncate(fonts: &FontSystem, style: FontStyle, size: f32, text: &str, budget: f32) -> String {
+    if fonts.measure(style, text, size) <= budget {
+        return text.to_string();
+    }
+    let ell = fonts.measure(style, "…", size);
+    let mut out = String::new();
+    let mut w = 0.0;
+    for ch in text.chars() {
+        let cw = fonts.advance(style, ch, size);
+        if w + cw + ell > budget {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
 
 /// A run of uniformly styled text inside a paragraph or cell.
 #[derive(Clone)]
@@ -249,114 +272,6 @@ fn ranges_of(atoms: &[Atom], start: usize, end: usize) -> Vec<(usize, usize, usi
     out
 }
 
-/// Keywords tinted inside fenced/indented code. One generic C-like set covers
-/// rust/js/py/go/etc. well enough for a reader; a full per-language
-/// highlighter would cost tables and state this app does not need.
-const CODE_KEYWORDS: &[&str] = &[
-    "fn", "let", "mut", "const", "static", "struct", "enum", "impl", "trait", "type", "where",
-    "pub", "use", "mod", "return", "if", "else", "match", "for", "while", "loop", "in", "break",
-    "continue", "true", "false", "null", "nil", "None", "def", "class", "import", "from", "export",
-    "default", "new", "this", "self", "crate", "async", "await", "try", "catch", "switch", "case",
-    "do", "var",
-];
-
-/// Split one code row into `(text, color)` runs: comments muted, strings and
-/// keywords tinted with the theme's code colors, everything else `fg`.
-/// Single-line scanner, no state across rows: a string split by a fold
-/// paints its tail default, which beats complicating the wrapper.
-pub(crate) fn code_spans(line: &str, lang: Option<&str>, theme: &Theme) -> Vec<(String, Color)> {
-    // Whole-line `#` comments (scripts, configs, C preprocessor, attrs).
-    if line.trim_start().starts_with('#') {
-        return vec![(line.to_string(), theme.muted)];
-    }
-    let script_hash = matches!(
-        lang.unwrap_or("").to_lowercase().as_str(),
-        "py" | "python"
-            | "sh"
-            | "bash"
-            | "rb"
-            | "yml"
-            | "yaml"
-            | "toml"
-            | "ini"
-            | ""
-            | "text"
-            | "plain"
-    );
-    let chars: Vec<char> = line.chars().collect();
-    let mut out: Vec<(String, Color)> = Vec::new();
-    let mut cur = String::new();
-    let flush = |out: &mut Vec<(String, Color)>, cur: &mut String| {
-        if !cur.is_empty() {
-            out.push((std::mem::take(cur), theme.fg));
-        }
-    };
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        // `//` comments, anywhere outside a string.
-        if c == '/' && chars.get(i + 1) == Some(&'/') {
-            flush(&mut out, &mut cur);
-            out.push((chars[i..].iter().collect(), theme.muted));
-            break;
-        }
-        // Inline `#` comments for script/config flavors (` # comment`).
-        if script_hash && c == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
-            flush(&mut out, &mut cur);
-            out.push((chars[i..].iter().collect(), theme.muted));
-            break;
-        }
-        // Strings with backslash escapes; unclosed runs to end of line.
-        if c == '"' || c == '\'' || c == '`' {
-            flush(&mut out, &mut cur);
-            let mut j = i + 1;
-            while j < chars.len() {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == c {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            out.push((
-                chars[i..j.min(chars.len())].iter().collect(),
-                theme.json_string,
-            ));
-            i = j;
-            continue;
-        }
-        // Words: keywords tinted, the rest default.
-        if c.is_alphanumeric() || c == '_' {
-            let mut j = i + 1;
-            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
-                j += 1;
-            }
-            let word: String = chars[i..j].iter().collect();
-            if word.chars().next().is_some_and(|d| d.is_ascii_digit()) {
-                flush(&mut out, &mut cur);
-                out.push((word, theme.json_number));
-            } else if CODE_KEYWORDS.contains(&word.as_str()) {
-                flush(&mut out, &mut cur);
-                out.push((word, theme.json_key));
-            } else {
-                cur.push_str(&word);
-            }
-            i = j;
-            continue;
-        }
-        cur.push(c);
-        i += 1;
-    }
-    flush(&mut out, &mut cur);
-    if out.is_empty() {
-        out.push((String::new(), theme.fg));
-    }
-    out
-}
-
 struct Md<'a> {
     fonts: &'a FontSystem,
     theme: &'a Theme,
@@ -365,6 +280,10 @@ struct Md<'a> {
     ops: Vec<DrawOp>,
     hits: Vec<HitRegion>,
     y: f32,
+    /// Height of the most recent block gap. A list item removes its last
+    /// block's trailing gap so items sit close together instead of reading as
+    /// one-paragraph-per-bullet.
+    last_gap: f32,
 }
 
 impl Md<'_> {
@@ -373,7 +292,9 @@ impl Md<'_> {
     }
 
     fn gap(&mut self, size: f32, factor: f32) {
-        self.y += (self.line_h(size) * factor).round();
+        let g = (self.line_h(size) * factor).round();
+        self.y += g;
+        self.last_gap = g;
     }
 
     fn baseline(&self, top: f32, style: FontStyle, size: f32) -> f32 {
@@ -529,25 +450,64 @@ impl Md<'_> {
     }
 
     fn render_image(&mut self, x: f32, max_w: f32, src: &str, alt: &str) {
+        // PNG decoding is a v2 feature, so the placeholder has to earn its
+        // space instead: a framed card naming the image and, when the source
+        // says one, the alt text. It used to be a bare labelled box with half
+        // its height empty.
+        let pad = 12.0;
+        let small = self.body * 0.8;
         let lh = self.line_h(self.body);
-        let h = lh * 2.0;
+        let lh_small = self.line_h(small);
+        let show_src = !alt.is_empty();
+        let h = pad * 2.0 + lh_small + lh + if show_src { lh_small } else { 0.0 };
         self.ops.push(DrawOp::RoundedRect {
             rect: Rect::new(x, self.y, max_w, h),
             radius: 6.0,
+            color: self.theme.rule,
+        });
+        self.ops.push(DrawOp::RoundedRect {
+            rect: Rect::new(x + 1.0, self.y + 1.0, (max_w - 2.0).max(1.0), h - 2.0),
+            radius: 5.0,
             color: self.theme.code_bg,
         });
-        let label = if alt.is_empty() { src } else { alt };
-        let size = self.body * 0.85;
-        let baseline = self.baseline(self.y + (h - lh) / 2.0, FontStyle::Regular, size);
+        let budget = (max_w - 2.0 * pad).max(20.0);
+        let mut cy = self.y + pad;
+        let caption = truncate(self.fonts, FontStyle::Regular, small, "image", budget);
+        let baseline = self.baseline(cy, FontStyle::Regular, small);
         self.text_op(
-            x + 12.0,
+            x + pad,
             baseline,
-            format!("image: {label}"),
+            caption,
             FontStyle::Regular,
-            size,
+            small,
             self.theme.muted,
         );
-        self.y += h + lh * 0.4;
+        cy += lh_small;
+        let title = if alt.is_empty() { src } else { alt };
+        let title = truncate(self.fonts, FontStyle::Regular, self.body, title, budget);
+        let baseline = self.baseline(cy, FontStyle::Regular, self.body);
+        self.text_op(
+            x + pad,
+            baseline,
+            title,
+            FontStyle::Regular,
+            self.body,
+            self.theme.fg,
+        );
+        cy += lh;
+        if show_src {
+            let path = truncate(self.fonts, FontStyle::Regular, small, src, budget);
+            let baseline = self.baseline(cy, FontStyle::Regular, small);
+            self.text_op(
+                x + pad,
+                baseline,
+                path,
+                FontStyle::Regular,
+                small,
+                self.theme.muted,
+            );
+        }
+        self.y += h + (lh * 0.5).round();
     }
 
     fn render_blocks(&mut self, blocks: &[Block], x: f32, max_w: f32) {
@@ -582,34 +542,74 @@ impl Md<'_> {
                     // disappears past the edge is not. A continuation is
                     // indented so it cannot be mistaken for a new line.
                     let inner = (max_w - 2.0 * CODE_PAD).max(40.0);
-                    let mut rows: Vec<String> = Vec::new();
+                    let lang_kind = syntax::Lang::from_hint(lang_opt.unwrap_or(""));
+                    let mut highlight = syntax::State::default();
+                    // Tint the logical line first, then slice the runs across
+                    // its wrapped rows: a string or comment that folds keeps
+                    // its color on the continuation instead of restarting as
+                    // plain text.
+                    let mut rows: Vec<Vec<(String, Color)>> = Vec::new();
                     for line in text.split('\n') {
+                        let runs = syntax::runs(line, lang_kind, &mut highlight, self.theme);
                         let mut wrapped = false;
                         for (s, e) in super::text::wrap_ranges(self.fonts, style, size, line, inner)
                         {
-                            let piece: String = line.chars().skip(s).take(e - s).collect();
-                            rows.push(if wrapped {
-                                format!("{CODE_HANG}{piece}")
-                            } else {
-                                piece
-                            });
+                            let mut row = Vec::new();
+                            if wrapped {
+                                row.push((CODE_HANG.to_string(), self.theme.fg));
+                            }
+                            row.extend(syntax::slice_runs(&runs, s, e));
+                            rows.push(row);
                             wrapped = true;
                         }
                     }
-                    let h = rows.len() as f32 * lh + 16.0;
+                    // An info string earns a small header strip: the language
+                    // named at the top right, over a hairline rule. It frames
+                    // the panel as a code block and tells a reader at a glance
+                    // what they are looking at.
+                    let label = lang_opt.map(str::trim).filter(|s| !s.is_empty());
+                    let chip_h = if label.is_some() {
+                        (lh * 0.9).round()
+                    } else {
+                        0.0
+                    };
+                    let h = chip_h + rows.len() as f32 * lh + 16.0;
                     self.ops.push(DrawOp::RoundedRect {
                         rect: Rect::new(x, self.y, max_w, h),
                         radius: 6.0,
                         color: self.theme.code_bg,
                     });
-                    let mut cy = self.y + 8.0;
+                    if let Some(label) = label {
+                        let chip_size = (size * 0.78).max(1.0);
+                        let label = truncate(self.fonts, style, chip_size, label, inner);
+                        let lw = self.fonts.measure(style, &label, chip_size);
+                        let m = self.fonts.metrics(style, chip_size);
+                        let baseline = (self.y + (chip_h - m.height()) / 2.0 + m.ascent).round();
+                        self.text_op(
+                            x + max_w - CODE_PAD - lw,
+                            baseline,
+                            label,
+                            style,
+                            chip_size,
+                            self.theme.muted,
+                        );
+                        let rule_y = (self.y + chip_h).round();
+                        self.ops.push(DrawOp::Line {
+                            x0: x + CODE_PAD,
+                            y0: rule_y,
+                            x1: x + max_w - CODE_PAD,
+                            y1: rule_y,
+                            color: self.theme.rule,
+                        });
+                    }
+                    let mut cy = self.y + chip_h + 8.0;
                     for row in &rows {
                         let baseline = self.baseline(cy, style, size);
                         let mut rx = x + CODE_PAD;
-                        for (piece, color) in code_spans(row, lang_opt, self.theme) {
+                        for (piece, color) in row {
                             if !piece.is_empty() {
-                                self.text_op(rx, baseline, piece.clone(), style, size, color);
-                                rx += self.fonts.measure(style, &piece, size);
+                                self.text_op(rx, baseline, piece.clone(), style, size, *color);
+                                rx += self.fonts.measure(style, piece, size);
                             }
                         }
                         cy += lh;
@@ -624,8 +624,10 @@ impl Md<'_> {
                     let top = self.y;
                     let top_op = self.ops.len();
                     self.render_blocks(inner, content_x, content_w);
-                    // The children end with a block gap; the bar stops above it.
-                    let bottom = self.y - self.gap_size();
+                    // The children end with a block gap; the bar stops above
+                    // it. `last_gap` is that exact gap, whatever kind of block
+                    // the quote ended with.
+                    let bottom = self.y - self.last_gap;
                     self.ops.insert(
                         top_op,
                         DrawOp::Rect {
@@ -663,11 +665,6 @@ impl Md<'_> {
         }
     }
 
-    /// Trailing gap left by the last rendered block (excluded from quote bars).
-    fn gap_size(&self) -> f32 {
-        (self.line_h(self.body) * 0.55).round()
-    }
-
     fn render_list_item(
         &mut self,
         item: &ListItem,
@@ -678,21 +675,18 @@ impl Md<'_> {
         indent: f32,
     ) {
         let size = self.body;
-        let marker = if let Some(checked) = item.checked {
-            if checked { "[x] " } else { "[ ] " }.to_string()
-        } else if ordered {
-            format!("{num}. ")
-        } else {
-            "• ".to_string()
+        // Real task boxes, not the source's `[x]` text: the glyph family in
+        // `gfx::font::shapes` draws both states, so the marker reads like a
+        // checklist at any size and needs no image assets.
+        let (marker, marker_color) = match item.checked {
+            Some(true) => ("☑ ".to_string(), self.theme.accent),
+            Some(false) => ("☐ ".to_string(), self.theme.muted),
+            None if ordered => (format!("{num}. "), self.theme.fg),
+            None => ("• ".to_string(), self.theme.fg),
         };
         let mw = self.fonts.measure(FontStyle::Regular, &marker, size);
         let content_x = x + indent;
         let content_w = (max_w - indent).max(40.0);
-        let marker_color = if item.checked == Some(true) {
-            self.theme.accent
-        } else {
-            self.theme.fg
-        };
         // Marker aligns with the first row's baseline.
         let baseline = self.baseline(self.y, FontStyle::Regular, size);
         self.text_op(
@@ -703,7 +697,17 @@ impl Md<'_> {
             size,
             marker_color,
         );
+        let before = self.y;
         self.render_blocks(&item.blocks, content_x, content_w);
+        // A list item is not a paragraph: replace the block gap it ended with
+        // by a small inter-item gap, so a list reads as one group instead of a
+        // stack of paragraphs.
+        if self.y > before {
+            let trailing = self.last_gap;
+            let tight = (self.line_h(size) * 0.16).round();
+            self.y = self.y - trailing + tight;
+            self.last_gap = tight;
+        }
     }
 
     fn render_table(
@@ -823,13 +827,188 @@ impl Md<'_> {
         });
         render_row(self, head, FontStyle::Bold);
         self.rule(x, table_w);
-        for row in rows {
+        // Alternate body rows get a barely-there tint: with columns measured
+        // rather than ruled, a reader's eye otherwise slides sideways across a
+        // wide row. The header band stays the strongest fill.
+        let zebra = Color::rgba(self.theme.fg.r, self.theme.fg.g, self.theme.fg.b, 8);
+        for (ri, row) in rows.iter().enumerate() {
+            if ri % 2 == 1 {
+                self.ops.push(DrawOp::Rect {
+                    rect: Rect::new(x, self.y, table_w, lh),
+                    color: zebra,
+                });
+            }
             // Pad short rows with empty cells.
             let mut full = row.clone();
             full.resize_with(n, Default::default);
             render_row(self, &full, FontStyle::Regular);
         }
     }
+}
+
+/// A Markdown document as a plan: one entry per top-level block.
+///
+/// A block's height is measured by rendering it once at y=0 and dropping the
+/// ops: unlike a code line, a paragraph's height is whatever its spans wrap
+/// to, so it cannot be counted without shaping. What the plan buys is memory
+/// and per-frame cost — a 56 000-block document keeps 56 000 `f32`s instead of
+/// 787 846 ops — not a cheaper first measure.
+pub struct MdPlan {
+    pub rows: plan::Rows,
+    /// `Md::last_gap` at each block's start. Only an empty quote reads it
+    /// before its children overwrite it, and the bar must still be the height
+    /// a full layout gives it.
+    gaps: Vec<f32>,
+}
+
+/// Measure every top-level block, keeping where it starts and nothing else.
+pub fn plan(doc: &Document, width: f32, ctx: &Ctx) -> MdPlan {
+    let t = ctx.theme;
+    let body = ctx.body_size();
+    let pad = ctx.px(32.0);
+    let (col_w, x0) = super::column(width, ctx);
+    let mut tops = Vec::with_capacity(doc.blocks.len());
+    let mut gaps = Vec::with_capacity(doc.blocks.len());
+    let mut y = pad;
+    let mut last_gap = 0.0f32;
+    for block in &doc.blocks {
+        tops.push(y);
+        gaps.push(last_gap);
+        let mut md = Md {
+            fonts: ctx.fonts,
+            theme: t,
+            scale: ctx.scale,
+            body,
+            ops: Vec::new(),
+            hits: Vec::new(),
+            y: 0.0,
+            last_gap,
+        };
+        md.render_blocks(std::slice::from_ref(block), x0, col_w);
+        y += md.y;
+        last_gap = md.last_gap;
+    }
+    MdPlan {
+        rows: plan::Rows::new(tops, y + pad, pad),
+        gaps,
+    }
+}
+
+impl MdPlan {
+    /// Patch the plan for an edited document: the blocks an edit left alone
+    /// keep their measured heights, and only the changed run between the
+    /// common prefix and suffix is measured again.
+    ///
+    /// Markdown still has to be re-parsed (a block list is the parser's
+    /// output, not a line index), but not re-measured: shaping every block's
+    /// spans is the expensive pass this skips.
+    ///
+    /// With a run already known from the splice — [`patch_run`] — this walk
+    /// is a check, not a derivation: the compare here is for tests that hold
+    /// two whole documents, which owe the diff themselves.
+    #[cfg(test)]
+    pub fn patch(&mut self, old: &Document, new: &Document, width: f32, ctx: &Ctx) -> bool {
+        let (o, n) = (&old.blocks, &new.blocks);
+        let mut pre = 0;
+        while pre < o.len() && pre < n.len() && o[pre] == n[pre] {
+            pre += 1;
+        }
+        let mut suf = 0;
+        while suf < o.len() - pre
+            && suf < n.len() - pre
+            && o[o.len() - 1 - suf] == n[n.len() - 1 - suf]
+        {
+            suf += 1;
+        }
+        let run = (pre, o.len() - pre - suf, n.len() - pre - suf);
+        self.patch_run(new, width, ctx, run)
+    }
+
+    /// The run the splice named: `(prefix, old-run length, new-run length)`.
+    /// The splice guarantees the blocks above and below are the old ones
+    /// verbatim, so no compare walks the document — the plan re-measures the
+    /// re-parsed blocks and splices the row heights.
+    pub fn patch_run(
+        &mut self,
+        new: &Document,
+        width: f32,
+        ctx: &Ctx,
+        (pre, removed, inserted): (usize, usize, usize),
+    ) -> bool {
+        if removed == 0 && inserted == 0 {
+            return true;
+        }
+        if pre + removed > self.rows.len() || self.gaps.len() != self.rows.len() {
+            return false;
+        }
+        let t = ctx.theme;
+        let body = ctx.body_size();
+        let (col_w, x0) = super::column(width, ctx);
+        // The gap the run starts after; a bar's height in an empty quote reads
+        // it, so measuring from the document's own earlier state keeps the
+        // patched block the height a full layout gives it.
+        let mut last_gap = self.gaps.get(pre).copied().unwrap_or(0.0);
+        let mut gaps = Vec::with_capacity(inserted);
+        let mut heights = Vec::with_capacity(inserted);
+        for block in &new.blocks[pre..pre + inserted] {
+            gaps.push(last_gap);
+            let mut md = Md {
+                fonts: ctx.fonts,
+                theme: t,
+                scale: ctx.scale,
+                body,
+                ops: Vec::new(),
+                hits: Vec::new(),
+                y: 0.0,
+                last_gap,
+            };
+            md.render_blocks(std::slice::from_ref(block), x0, col_w);
+            heights.push(md.y);
+            last_gap = md.last_gap;
+        }
+        if !self.rows.splice(pre, removed, &heights) {
+            return false;
+        }
+        self.gaps.splice(pre..pre + removed, gaps);
+        // The block after the run starts after the run's trailing gap, which
+        // may differ from the one the old block left.
+        if pre + inserted < self.gaps.len() {
+            self.gaps[pre + inserted] = last_gap;
+        }
+        true
+    }
+}
+
+/// Lay out only the blocks that overlap `[top, bottom)`, each at the y the
+/// plan carries. Blocks are independent given their start height and gap
+/// state, so the band is the full layout with the rest left out.
+pub fn layout_band(
+    doc: &Document,
+    plan: &MdPlan,
+    width: f32,
+    ctx: &Ctx,
+    top: f32,
+    bottom: f32,
+) -> DisplayList {
+    let t = ctx.theme;
+    let body = ctx.body_size();
+    let (col_w, x0) = super::column(width, ctx);
+    let mut md = Md {
+        fonts: ctx.fonts,
+        theme: t,
+        scale: ctx.scale,
+        body,
+        ops: Vec::new(),
+        hits: Vec::new(),
+        y: 0.0,
+        last_gap: 0.0,
+    };
+    for i in plan.rows.band(top, bottom) {
+        md.y = plan.rows.top(i);
+        md.last_gap = plan.gaps.get(i).copied().unwrap_or(0.0);
+        md.render_blocks(std::slice::from_ref(&doc.blocks[i]), x0, col_w);
+    }
+    DisplayList::new(md.ops, plan.rows.height(), md.hits)
 }
 
 /// Lay out a parsed Markdown document.
@@ -847,14 +1026,11 @@ pub fn layout(doc: &Document, width: f32, ctx: &Ctx) -> DisplayList {
         ops: Vec::new(),
         hits: Vec::new(),
         y: pad,
+        last_gap: 0.0,
     };
     md.render_blocks(&doc.blocks, x0, col_w);
     let height = md.y + pad;
-    DisplayList {
-        ops: md.ops,
-        height,
-        hits: md.hits,
-    }
+    DisplayList::new(md.ops, height, md.hits)
 }
 
 #[cfg(test)]
@@ -1020,7 +1196,7 @@ mod tests {
         let t = Theme::light();
         let c = ctx(&f, &t);
         let list = layout(
-            &doc("- a\n  - b\n- [x] done\n\n| h1 | h2 |\n|---|---:|\n| x | 1 |"),
+            &doc("- a\n  - b\n- [x] done\n- [ ] todo\n\n| h1 | h2 |\n|---|---:|\n| x | 1 |"),
             800.0,
             &c,
         );
@@ -1035,13 +1211,106 @@ mod tests {
             .collect::<Vec<_>>()
             .join("|");
         assert!(text.contains('•'), "bullet missing: {text}");
-        assert!(text.contains("[x]"), "task marker missing: {text}");
+        assert!(text.contains('☑'), "checked task box missing: {text}");
+        assert!(text.contains('☐'), "unchecked task box missing: {text}");
+        assert!(!text.contains("[x]"), "raw task marker leaked: {text}");
         assert!(text.contains("h1"), "table header missing");
         assert!(
             list.ops.iter().any(|op| matches!(op, DrawOp::Line { .. })),
             "table rule missing"
         );
         assert!(list.height > 200.0);
+    }
+
+    #[test]
+    fn list_items_sit_closer_than_paragraphs() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(&doc("- a\n- b\n- c"), 800.0, &c);
+        let mut ys = Vec::new();
+        for op in &list.ops {
+            if let DrawOp::Text { y, text, .. } = op {
+                if matches!(text.as_str(), "a" | "b" | "c") {
+                    ys.push(*y);
+                }
+            }
+        }
+        ys.sort_by(|a, b| a.total_cmp(b));
+        assert_eq!(ys.len(), 3, "expected three item rows: {ys:?}");
+        let gap = ys[1] - ys[0];
+        let lh = (16.0f32 * 1.55).round();
+        assert!(
+            gap < lh * 1.35,
+            "list items are paragraph-spaced: {gap} for a {lh} line"
+        );
+    }
+
+    #[test]
+    fn fenced_code_names_its_language_and_frames_it() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(&doc("```rust\nfn main() {}\n```\n"), 800.0, &c);
+        assert!(
+            list.ops.iter().any(|op| matches!(
+                op,
+                DrawOp::Text { text, color, .. } if text == "rust" && *color == t.muted
+            )),
+            "language chip missing"
+        );
+        // The chip sits above a hairline rule inside the panel.
+        let rule = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Line { y0, color, .. } if *color == t.rule => Some(*y0),
+                _ => None,
+            })
+            .count();
+        assert!(rule >= 1, "code header rule missing");
+    }
+
+    #[test]
+    fn an_image_placeholder_names_alt_and_source() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(&doc("![A cat](pictures/cat.png)\n"), 800.0, &c);
+        let text: String = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("A cat"), "alt text missing: {text}");
+        assert!(text.contains("pictures/cat.png"), "source missing: {text}");
+        // The card is a framed panel, not a bare filled box: an outer rule
+        // rect plus the inset background.
+        let rounded = list
+            .ops
+            .iter()
+            .filter(|op| matches!(op, DrawOp::RoundedRect { .. }))
+            .count();
+        assert!(rounded >= 2, "image card frame missing");
+    }
+
+    #[test]
+    fn table_body_rows_alternate_their_tint() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(&doc("| h |\n|---|\n| a |\n| b |\n| c |\n"), 800.0, &c);
+        // One header band plus at least one zebra stripe for the odd row.
+        let rects = list
+            .ops
+            .iter()
+            .filter(|op| matches!(op, DrawOp::Rect { .. }))
+            .count();
+        assert!(rects >= 2, "zebra rows missing: {rects} rects");
     }
 
     #[test]
@@ -1148,5 +1417,178 @@ mod tests {
         assert!(!list.ops.is_empty());
         assert!(!list.hits.is_empty(), "sample link has no hit region");
         assert!(list.height > 400.0);
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+    use crate::gfx::font::FontSystem;
+
+    fn ctx<'a>(f: &'a FontSystem, t: &'a Theme) -> Ctx<'a> {
+        Ctx {
+            fonts: f,
+            theme: t,
+            scale: 1.0,
+            zoom: 1.0,
+        }
+    }
+
+    /// Every block kind the renderer has, repeated enough that a band lands in
+    /// the middle of the document.
+    fn doc() -> Document {
+        let mut s = String::new();
+        for i in 0..120 {
+            s.push_str(&format!("## Section {i}\n\n"));
+            s.push_str(&format!(
+                "A paragraph with **bold**, `code`, a [link](https://example.com/{i}) and enough \
+                 words to wrap across the reading column at least once, because a wrapped \
+                 paragraph is the height case that matters.\n\n"
+            ));
+            s.push_str("- one\n- two\n  - deeper\n\n");
+            s.push_str(&format!("```rust\nfn f{i}() -> u32 {{ {} }}\n```\n\n", i));
+            s.push_str("| a | b |\n|---|---|\n| 1 | 2 |\n\n");
+            s.push_str("> quoted text\n\n");
+            s.push_str("---\n\n");
+        }
+        crate::parse::markdown::parse(&s)
+    }
+
+    fn all<T: std::fmt::Debug>(items: &[T]) -> Vec<String> {
+        items.iter().map(|i| format!("{i:?}")).collect()
+    }
+
+    /// A band over the whole document is the full layout: same ops, same hit
+    /// regions, same height. The plan measures blocks one at a time, so this
+    /// is what proves a block's height and gap do not depend on the document
+    /// being rendered around it.
+    #[test]
+    fn a_whole_document_band_is_the_full_layout() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let d = doc();
+        let full = layout(&d, 900.0, &c);
+        let plan = plan(&d, 900.0, &c);
+        let band = layout_band(&d, &plan, 900.0, &c, f32::NEG_INFINITY, f32::INFINITY);
+        assert!((band.height - full.height).abs() < 0.5);
+        assert_eq!(all(&band.ops), all(&full.ops), "ops");
+        assert_eq!(all(&band.hits), all(&full.hits), "hits");
+    }
+
+    #[test]
+    fn a_band_claims_nothing_and_misses_nothing_visible() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let d = doc();
+        let full = layout(&d, 900.0, &c);
+        let plan = plan(&d, 900.0, &c);
+        let all_ops = all(&full.ops);
+        for top in [0.0, 900.0, 4_000.0, plan.rows.height() - 700.0] {
+            let bottom = top + 700.0;
+            let band = layout_band(&d, &plan, 900.0, &c, top, bottom);
+            let mut seen = 0;
+            for s in all(&band.ops) {
+                let at = all_ops[seen..]
+                    .iter()
+                    .position(|a| *a == s)
+                    .unwrap_or_else(|| panic!("at {top}: the band invented {s}"));
+                seen += at + 1;
+            }
+            // A full op whose y is strictly inside the band must be painted.
+            let got = all(&band.ops);
+            for op in &full.ops {
+                let y = match op {
+                    DrawOp::Text { y, .. } => *y,
+                    DrawOp::Rect { rect, .. } | DrawOp::RoundedRect { rect, .. } => rect.y,
+                    DrawOp::Line { y0, .. } => *y0,
+                };
+                if y > top + 80.0 && y < bottom - 80.0 && !got.contains(&format!("{op:?}")) {
+                    // Rect/Line ops can belong to a block that started above
+                    // the band; only text ink is required to be present.
+                    if matches!(op, DrawOp::Text { .. }) {
+                        panic!("at {top}: the band missed {op:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Blocks come from the parser, so an edit re-parses; the *plan* does not
+    /// re-measure the blocks the edit left alone. Patching in a paragraph, a
+    /// deleted heading and a renamed first heading must land on the index a
+    /// fresh plan of the edited document has, gaps included, and a
+    /// whole-document band must still be the full layout.
+    #[test]
+    fn an_edit_patches_the_plan_to_match_a_fresh_one() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let mut base = String::new();
+        for i in 0..60 {
+            base.push_str(&format!("## Section {i}\n\n"));
+            base.push_str(
+                "A paragraph with **bold**, `code` and a [link](https://example.com) that is \
+                 long enough to wrap across the reading column at least once.\n\n",
+            );
+            base.push_str(&format!("```rust\nfn f{i}() -> u32 {{ {i} }}\n```\n\n"));
+        }
+        let before = crate::parse::markdown::parse(&base);
+        let mut patched = plan(&before, 900.0, &c);
+
+        let mut edited = base.replacen("## Section 0", "## Renamed", 1);
+        edited = edited.replace(
+            "## Section 30\n\n",
+            "## Section 30\n\nA brand new paragraph that wraps across the reading column \
+             and is therefore measured, unlike the blocks around it.\n\n",
+        );
+        edited = edited.replace("## Section 50\n\n", "");
+        let after = crate::parse::markdown::parse(&edited);
+        assert_ne!(before, after, "the edit changed the document");
+        assert!(patched.patch(&before, &after, 900.0, &c));
+
+        let fresh = plan(&after, 900.0, &c);
+        assert_eq!(patched.rows.len(), fresh.rows.len(), "block count");
+        for i in 0..fresh.rows.len() {
+            assert_eq!(patched.rows.top(i), fresh.rows.top(i), "top {i}");
+            assert_eq!(patched.gaps[i], fresh.gaps[i], "gap {i}");
+        }
+        assert_eq!(patched.rows.height(), fresh.rows.height());
+
+        let full = layout(&after, 900.0, &c);
+        let band = layout_band(
+            &after,
+            &patched,
+            900.0,
+            &c,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+        );
+        assert_eq!(all(&band.ops), all(&full.ops), "ops after the patch");
+        assert_eq!(all(&band.hits), all(&full.hits), "hits after the patch");
+    }
+
+    /// An edit that leaves the block list identical (a typo fixed inside a
+    /// paragraph still changes its block) patches to the same shape without
+    /// touching a neighbour's height.
+    #[test]
+    fn a_patch_that_changes_one_block_keeps_the_rest_of_the_index() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let base = "one\n\ntwo\n\nthree\n\nfour\n";
+        let before = crate::parse::markdown::parse(base);
+        let after = crate::parse::markdown::parse(&base.replace("two", "two, edited"));
+        let mut patched = plan(&before, 900.0, &c);
+        let before_tops: Vec<f32> = (0..before.blocks.len())
+            .map(|i| patched.rows.top(i))
+            .collect();
+        assert!(patched.patch(&before, &after, 900.0, &c));
+        let fresh = plan(&after, 900.0, &c);
+        assert_eq!(patched.rows.height(), fresh.rows.height());
+        // Blocks outside the changed run sit exactly where they did.
+        assert_eq!(before_tops[0], patched.rows.top(0));
+        assert_eq!(before_tops[3], patched.rows.top(3));
     }
 }

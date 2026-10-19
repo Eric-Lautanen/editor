@@ -11,7 +11,7 @@ pub(crate) fn escape(s: &str) -> String {
     out
 }
 
-fn escape_into(out: &mut String, s: &str) {
+pub(crate) fn escape_into(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -39,6 +39,11 @@ fn write(value: &Value, indent: usize, out: &mut String) {
         Value::Bool(false) => out.push_str("false"),
         Value::Number(n) => out.push_str(n),
         Value::String(s) => escape_into(out, s),
+        // A patch's error row stands for text that is not JSON, so there is no
+        // source to print for it. The printer only ever sees a parsed document
+        // (a `--pretty` run parses the file it prints), and a parsed document
+        // has no broken nodes.
+        Value::Broken(_) => unreachable!("a parsed document has no broken nodes"),
         Value::Array(items) if items.is_empty() => out.push_str("[]"),
         Value::Object(pairs) if pairs.is_empty() => out.push_str("{}"),
         Value::Array(items) => {

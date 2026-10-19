@@ -1173,7 +1173,7 @@ mod tests {
             ),
         ];
         for (i, (input, want)) in cases.iter().enumerate() {
-            let p = std::env::temp_dir().join(format!("editor-sha-test-{i}"));
+            let p = crate::testing::temp_dir().join(format!("editor-sha-test-{i}"));
             std::fs::write(&p, input).unwrap();
             assert_eq!(sha256_file(&p).unwrap(), *want, "input {i}");
             let _ = std::fs::remove_file(&p);
@@ -1185,7 +1185,7 @@ mod tests {
         // A buffer larger than one block, built byte by byte, must hash the
         // same as fed all at once (this is where a broken `update` shows).
         let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-        let p = std::env::temp_dir().join("editor-sha-test-chunk");
+        let p = crate::testing::temp_dir().join("editor-sha-test-chunk");
         std::fs::write(&p, &data).unwrap();
         let streamed = sha256_file(&p).unwrap();
 
@@ -1231,7 +1231,7 @@ mod tests {
     /// fresh ones and everything else in a shared temp dir stay.
     #[test]
     fn sweep_removes_old_payloads_and_nothing_else() {
-        let root = std::env::temp_dir().join("editor_sweep_test");
+        let root = crate::testing::temp_dir().join("editor_sweep_test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("editor-update-v0.0.1")).unwrap();
         std::fs::write(
@@ -1265,6 +1265,9 @@ mod tests {
     #[test]
     fn staged_payloads_live_in_one_named_temp_directory() {
         let dir = payload_dir("v0.2.1");
+        // The runtime answer is the OS temp dir, not the test fallback: this
+        // test compares paths only and never writes, so it pins the real
+        // staging shape on every machine, writable temp or not.
         assert_eq!(dir.parent().unwrap(), std::env::temp_dir());
         assert_eq!(dir.file_name().unwrap(), "editor-update-v0.2.1");
         assert!(dir

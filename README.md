@@ -60,6 +60,17 @@ keyboard.
 
 ## What's new (October 2026)
 
+- **A sharper preview.** Markdown task lists get real check boxes, list items
+  sit together instead of reading as one paragraph per bullet, tables band
+  alternate rows, fenced code carries a language label, and an image
+  placeholder names both its alt text and its source. JSON now reads as JSON —
+  commas, `▼`/`▶` expanders, and exact alignment for wide keys — and CSV
+  right-aligns numeric columns and bands its rows.
+- **Code that knows its language.** The highlighter separates language
+  families (Rust, Python, shell, Ruby, C-like/Go/PHP, JS/TS, SQL, Lua, JSON,
+  HTML/XML, CSS, config) and understands their comment forms, strings, numbers, types
+  and keywords — including block comments and Python docstrings that cross
+  lines — with no new dependency.
 - **Self-update you can trust.** Checks run twice a day, the download is
   verified against the release's `SHA256SUMS` before anything executes, and on
   Windows the fetch happens inside the app through the OS's own HTTP stack —
@@ -98,11 +109,11 @@ One renderer for every kind of file — each of these is a real file from
   <tr>
     <td width="50%" align="center">
       <img src="assets/screenshots/json-tree.png" alt="A JSON document as a collapsible tree"><br>
-      <sub><b>JSON</b> — a collapsible tree (<code>[-]</code> / <code>[+]</code>), one per line for JSONL</sub>
+      <sub><b>JSON</b> — a collapsible tree (<code>▶</code> / <code>▼</code>), commas and folded field counts, one per line for JSONL</sub>
     </td>
     <td width="50%" align="center">
       <img src="assets/screenshots/csv.png" alt="A CSV file laid out as a column table with a header band"><br>
-      <sub><b>CSV / TSV</b> — columns, a header band, measured cells</sub>
+      <sub><b>CSV / TSV</b> — columns, a header band, right-aligned numbers, banded rows</sub>
     </td>
   </tr>
   <tr>
@@ -297,7 +308,7 @@ a row whose chord no longer works:
 | `Ctrl+F` | find bar (Enter/F3 next, Shift back) |
 | `Ctrl + / - / 0` | zoom in / out / reset |
 | `Ctrl+T` | light / dark theme |
-| `click [+]` | fold / unfold JSON nodes |
+| `click ▶` | fold / unfold JSON nodes |
 | `hover a link` | show its address in the status bar; click to open it |
 | `F1` | this help |
 | `F2` | about editor |

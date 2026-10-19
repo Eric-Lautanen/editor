@@ -1,6 +1,10 @@
 [package]
 name = "editor"
-version = "0.2.4"
+version = "0.2.5"
+# The floor the code itself sets: `slice::as_chunks` (1.88) is the newest
+# std API the tree uses. Named here so `cargo check` on an older stable
+# refuses the build with that reason instead of a mystery error.
+rust-version = "1.88"
 edition = "2021"
 description = "A small native viewer/editor for Markdown, JSON, CSV, configs, logs and code. std only."
 license = "MIT"

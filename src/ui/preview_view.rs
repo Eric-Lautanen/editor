@@ -202,11 +202,54 @@ pub struct WordSel {
     pub text: String,
 }
 
+/// Width of one laid-out run. A monospace ASCII run is `advance × chars`; the
+/// general measure walks every glyph, which is the wrong cost for the tree and
+/// code panes' hundreds of thousands of runs.
+fn run_width(fonts: &FontSystem, style: FontStyle, text: &str, size: f32) -> f32 {
+    if style == FontStyle::Mono && text.is_ascii() {
+        fonts.advance(style, '0', size) * text.len() as f32
+    } else {
+        fonts.measure(style, text, size)
+    }
+}
+
 /// A character that a double-click treats as part of a word. Deliberately the
 /// editor's idea of one (`is_alphanumeric` plus underscore), so the same
 /// gesture picks the same text in both panes.
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
+}
+
+/// Append one text run to `rows`, extending the last row when it shares the
+/// run's baseline. The single definition of what a row is, shared by the
+/// ordered build and the sorted fallback.
+fn push_run(
+    rows: &mut Vec<Row>,
+    fonts: &FontSystem,
+    baseline: f32,
+    x: f32,
+    size: f32,
+    style: FontStyle,
+    text: &str,
+) {
+    let w = run_width(fonts, style, text, size);
+    match rows.last_mut() {
+        Some(r) if r.baseline == baseline => {
+            r.x0 = r.x0.min(x);
+            r.x1 = r.x1.max(x + w);
+            r.top = r.top.min(baseline - size * 0.8);
+            r.bottom = r.bottom.max(baseline + size * 0.3);
+            r.text.push_str(text);
+        }
+        _ => rows.push(Row {
+            baseline,
+            top: baseline - size * 0.8,
+            bottom: baseline + size * 0.3,
+            x0: x,
+            x1: x + w,
+            text: text.to_string(),
+        }),
+    }
 }
 
 /// One visual row of the preview: text ops grouped by baseline. Backs
@@ -221,45 +264,132 @@ pub struct Row {
     pub text: String,
 }
 
+/// The pane's paint transform for one frame: content offset, the viewport's
+/// y band (the culling test), and the DPI scale for hairline strokes.
+struct PaintView {
+    ox: f32,
+    oy: f32,
+    top: f32,
+    bottom: f32,
+    scale: f32,
+}
+
+impl PaintView {
+    fn ops(&self, canvas: &mut Canvas, fonts: &FontSystem, ops: &[DrawOp]) {
+        for op in ops {
+            match op {
+                DrawOp::Rect { rect, color } => {
+                    let r = Rect::new(rect.x + self.ox, rect.y + self.oy, rect.w, rect.h);
+                    if r.bottom() >= self.top && r.y <= self.bottom {
+                        canvas.fill_rect(r, *color);
+                    }
+                }
+                DrawOp::RoundedRect {
+                    rect,
+                    radius,
+                    color,
+                } => {
+                    let r = Rect::new(rect.x + self.ox, rect.y + self.oy, rect.w, rect.h);
+                    if r.bottom() >= self.top && r.y <= self.bottom {
+                        canvas.fill_rounded_rect(r, *radius, *color);
+                    }
+                }
+                DrawOp::Text {
+                    x,
+                    y,
+                    text,
+                    size,
+                    style,
+                    color,
+                } => {
+                    let by = y + self.oy;
+                    if by >= self.top && by <= self.bottom {
+                        let spec = TextSpec {
+                            size: *size,
+                            style: *style,
+                            color: *color,
+                        };
+                        canvas.draw_text(fonts, text, x + self.ox, by, spec);
+                    }
+                }
+                DrawOp::Line {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    color,
+                } => {
+                    let (lx, rx) = (x0.min(*x1) + self.ox, x0.max(*x1) + self.ox);
+                    let (ty, by) = (y0.min(*y1) + self.oy, y0.max(*y1) + self.oy);
+                    let thick = self.scale.max(1.0).round();
+                    canvas.fill_rect(
+                        Rect::new(lx, ty, (rx - lx).max(thick), (by - ty).max(thick)),
+                        *color,
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl PreviewView {
     /// Group the laid-out text ops into visual rows, top to bottom.
     pub fn rows(&self, fonts: &FontSystem) -> Vec<Row> {
         #[cfg(any(test, feature = "mem-census"))]
         crate::mem::begin(crate::mem::Component::DisplayList);
-        let mut texts: Vec<(f32, f32, f32, FontStyle, String)> = Vec::new();
+        // Layout emits rows top-to-bottom and runs left-to-right, so the sort
+        // is usually a no-op. Verify that with a bare scan, then build the rows
+        // straight off the ops: the ordered case used to stage every run in a
+        // side `Vec` first (a 3.8 M-op tree: ~120 MB, and a second pass over
+        // it) purely to sort a list that was already sorted.
+        let mut prev: Option<(f32, f32)> = None;
+        let mut ordered = true;
         for op in &self.list.ops {
-            if let DrawOp::Text {
-                x,
-                y,
-                text,
-                size,
-                style,
-                ..
-            } = op
-            {
-                texts.push((*y, *x, *size, *style, text.clone()));
+            if let DrawOp::Text { x, y, .. } = op {
+                if let Some((py, px)) = prev {
+                    if !(*y > py || (*y == py && *x >= px)) {
+                        ordered = false;
+                        break;
+                    }
+                }
+                prev = Some((*y, *x));
             }
         }
-        texts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-        let mut rows: Vec<Row> = Vec::new();
-        for (baseline, x, size, style, text) in texts {
-            let w = fonts.measure(style, &text, size);
-            match rows.last_mut() {
-                Some(r) if r.baseline == baseline => {
-                    r.x0 = r.x0.min(x);
-                    r.x1 = r.x1.max(x + w);
-                    r.top = r.top.min(baseline - size * 0.8);
-                    r.bottom = r.bottom.max(baseline + size * 0.3);
-                    r.text.push_str(&text);
-                }
-                _ => rows.push(Row {
-                    baseline,
-                    top: baseline - size * 0.8,
-                    bottom: baseline + size * 0.3,
-                    x0: x,
-                    x1: x + w,
+        let mut rows: Vec<Row> = Vec::with_capacity(self.list.ops.len().min(4096));
+        if ordered {
+            for op in &self.list.ops {
+                if let DrawOp::Text {
+                    x,
+                    y,
                     text,
-                }),
+                    size,
+                    style,
+                    ..
+                } = op
+                {
+                    push_run(&mut rows, fonts, *y, *x, *size, *style, text);
+                }
+            }
+        } else {
+            // A block (a list marker, say) emitted out of order: sort the runs
+            // first, as before.
+            let mut texts: Vec<(f32, f32, f32, FontStyle, &str)> = Vec::new();
+            for op in &self.list.ops {
+                if let DrawOp::Text {
+                    x,
+                    y,
+                    text,
+                    size,
+                    style,
+                    ..
+                } = op
+                {
+                    texts.push((*y, *x, *size, *style, text.as_str()));
+                }
+            }
+            texts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            for (baseline, x, size, style, text) in texts {
+                push_run(&mut rows, fonts, baseline, x, size, style, text);
             }
         }
         #[cfg(any(test, feature = "mem-census"))]
@@ -269,7 +399,11 @@ impl PreviewView {
 
     /// Index of the row containing document-space `y`, if any.
     pub fn row_at(&self, rows: &[Row], y: f32) -> Option<usize> {
-        rows.iter().position(|r| y >= r.top && y < r.bottom)
+        // Rows are in top-to-bottom order; find the first whose bottom edge
+        // reaches `y`. A linear scan over a large tree's hundreds of thousands
+        // of rows ran on every pointer move.
+        let i = rows.partition_point(|r| r.bottom <= y);
+        rows.get(i).filter(|r| y >= r.top).map(|_| i)
     }
 
     /// The word under a document-space point (`x`, `doc_y`), for the
@@ -281,9 +415,7 @@ impl PreviewView {
     /// Runs once per double-click, not per paint, so the allocations here
     /// (one `Vec` of chars, one `String` for the word) are not a hot path.
     pub fn word_at(&self, fonts: &FontSystem, rows: &[Row], x: f32, doc_y: f32) -> Option<WordSel> {
-        let row = rows
-            .iter()
-            .position(|r| doc_y >= r.top && doc_y < r.bottom)?;
+        let row = self.row_at(rows, doc_y)?;
         // The text op under the pointer, in reverse paint order (the topmost
         // run wins where two overlap, which is how `action_at` resolves hits
         // too). A row can be several ops — bold, code, plain — and the word
@@ -394,58 +526,28 @@ impl PreviewView {
         );
         let (top, bottom) = (area.y - 64.0 * scale, area.bottom() + 64.0 * scale);
 
-        for op in &self.list.ops {
-            match op {
-                DrawOp::Rect { rect, color } => {
-                    let r = Rect::new(rect.x + ox, rect.y + oy, rect.w, rect.h);
-                    if r.bottom() >= top && r.y <= bottom {
-                        canvas.fill_rect(r, *color);
-                    }
-                }
-                DrawOp::RoundedRect {
-                    rect,
-                    radius,
-                    color,
-                } => {
-                    let r = Rect::new(rect.x + ox, rect.y + oy, rect.w, rect.h);
-                    if r.bottom() >= top && r.y <= bottom {
-                        canvas.fill_rounded_rect(r, *radius, *color);
-                    }
-                }
-                DrawOp::Text {
-                    x,
-                    y,
-                    text,
-                    size,
-                    style,
-                    color,
-                } => {
-                    let by = y + oy;
-                    if by >= top && by <= bottom {
-                        let spec = TextSpec {
-                            size: *size,
-                            style: *style,
-                            color: *color,
-                        };
-                        canvas.draw_text(fonts, text, x + ox, by, spec);
-                    }
-                }
-                DrawOp::Line {
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                    color,
-                } => {
-                    let (lx, rx) = (x0.min(*x1) + ox, x0.max(*x1) + ox);
-                    let (ty, by) = (y0.min(*y1) + oy, y0.max(*y1) + oy);
-                    let thick = scale.max(1.0).round();
-                    canvas.fill_rect(
-                        Rect::new(lx, ty, (rx - lx).max(thick), (by - ty).max(thick)),
-                        *color,
-                    );
+        // Only the chunks of ops whose y extent can touch the viewport are
+        // walked: a big tree's list is millions of ops, and a scan of all of
+        // them — even just to reject each by its baseline — was ~10 ms of
+        // every frame, scrolled or not. Small lists carry no index and take
+        // the whole list, which is the same work either way.
+        let view = PaintView {
+            ox,
+            oy,
+            top,
+            bottom,
+            scale,
+        };
+        // The index is keyed on document-space y; the band above is in view
+        // space, so undo the pane's own offset before asking it.
+        match &self.list.bands {
+            Some(bands) => {
+                for (start, end) in bands.touching(top - oy, bottom - oy) {
+                    let end = end.min(self.list.ops.len());
+                    view.ops(canvas, fonts, &self.list.ops[start..end]);
                 }
             }
+            None => view.ops(canvas, fonts, &self.list.ops),
         }
         self.paint_scrollbar(canvas, theme, area, scroll.y, m);
         // Horizontal scrollbar for the no-wrap editor lines, inset right of
@@ -455,6 +557,43 @@ impl PreviewView {
             canvas.fill_rounded_rect(g.thumb, g.thumb.h / 2.0, c);
         }
         canvas.set_clip(None);
+    }
+
+    /// The stream-ingauge: a small radial arc the tab's preview pane paints
+    /// while a streamed load is still filling the buffer (called by `app`
+    /// after the pane itself has painted — a spinner belongs on top of
+    /// whatever partial content is visible underneath).
+    ///
+    /// `phase` (app tick count) rotates the arc so the animation runs at the
+    /// app's own heartbeat, on the tick clock every other animation here uses.
+    pub fn paint_stream_gauge(
+        &self,
+        canvas: &mut Canvas,
+        theme: &Theme,
+        area: Rect,
+        phase: u32,
+        m: PaneMetrics,
+    ) {
+        // Bottom-right, the corner the scrollbar thumb least occupies.
+        let r = (14.0 * m.scale).max(10.0);
+        let inset = 18.0 * m.scale;
+        let cx = area.right() - inset - r;
+        let cy = area.bottom() - inset - r;
+        // One arc segment per 1/8 turn, rotated by the phase; segments fade
+        // against the phase so the ring reads as motion at the app's tick
+        // heartbeat (25 Hz) with no easing state of its own.
+        let n = 8u32;
+        let seg = std::f32::consts::TAU / n as f32;
+        let rot = (phase % n) as f32 * seg;
+        for i in 0..n {
+            let t0 = i as f32 * seg + rot;
+            let t1 = t0 + seg * 0.7;
+            let (x0, y0) = (cx + r * t0.cos(), cy + r * t0.sin());
+            let (x1, y1) = (cx + r * t1.cos(), cy + r * t1.sin());
+            let a = ((n - i) * 255 / n) as u8;
+            let c = Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, a);
+            canvas.stroke_segment(x0, y0, x1, y1, 2.5 * m.scale, c);
+        }
     }
 
     /// Thin overlay scrollbar, painted from the shared geometry.
@@ -665,6 +804,54 @@ mod tests {
             assert!(h.thumb.bottom() <= area.bottom() - grip);
             assert!(h.zone.bottom() <= area.bottom() - grip + 0.001);
             assert!(area.bottom() - h.thumb.bottom() <= grip + 0.001);
+        }
+    }
+
+    /// The band index is a culling optimisation, not a second painter: an
+    /// indexed list must paint exactly what the linear scan paints, at every
+    /// scroll position — including a band that straddles a chunk boundary.
+    #[test]
+    fn indexed_paint_matches_the_linear_scan() {
+        use crate::gfx::canvas::Canvas;
+        use crate::gfx::font::{FontStyle, FontSystem};
+        use crate::layout::display_list::DrawOp;
+        use crate::layout::theme::Theme;
+
+        let fonts = FontSystem::load_embedded();
+        let theme = Theme::light();
+        let mut ops = Vec::new();
+        for i in 0..3000 {
+            ops.push(DrawOp::Text {
+                x: 20.0 + (i % 3) as f32 * 90.0,
+                y: 20.0 + i as f32 * 14.0,
+                text: format!("run {i}"),
+                size: 13.0,
+                style: FontStyle::Mono,
+                color: theme.fg,
+            });
+        }
+        let height = 3000.0 * 14.0 + 40.0;
+        let indexed = PreviewView {
+            list: DisplayList::new(ops.clone(), height, Vec::new()),
+        };
+        assert!(indexed.list.bands.is_some(), "a big list needs an index");
+        let linear = PreviewView {
+            list: DisplayList {
+                bands: None,
+                ..DisplayList::new(ops, height, Vec::new())
+            },
+        };
+        let area = Rect::new(0.0, 0.0, 700.0, 400.0);
+        for scroll in [0.0, 511.0, 512.0, 4096.0, 3000.0 * 14.0] {
+            let mut a = Canvas::new(700, 400);
+            let mut b = Canvas::new(700, 400);
+            let s = PaneScroll::vertical(scroll);
+            indexed.paint(&mut a, &fonts, &theme, area, s, m());
+            linear.paint(&mut b, &fonts, &theme, area, s, m());
+            assert!(
+                a.pixels == b.pixels,
+                "indexed paint differs at scroll {scroll}"
+            );
         }
     }
 }

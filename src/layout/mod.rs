@@ -3,6 +3,8 @@ pub mod display_list;
 pub mod highlight;
 pub mod json_tree;
 pub mod markdown;
+pub mod plan;
+pub mod syntax;
 pub mod text;
 pub mod theme;
 
@@ -47,6 +49,37 @@ pub fn column(viewport_w: f32, ctx: &Ctx) -> (f32, f32) {
         .max(pad.min(viewport_w / 4.0))
         .round();
     (col_w, x0)
+}
+
+/// A reader pane that paints a band of itself instead of holding a
+/// whole-document display list.
+///
+/// The families differ only in how a unit is measured and painted; the index
+/// that turns a scroll offset into the units on screen ([`plan::Rows`]) and
+/// the rule for which units a band covers are shared, so a new reader kind
+/// plugs in by building one of these rather than by inventing a cache.
+pub enum PanePlan {
+    /// Plain text: one entry per buffer line.
+    Text(plan::Rows),
+    /// Code, logs and configs: rows plus the tint checkpoints a band needs.
+    Lines(highlight::LinePlan),
+    /// Markdown: one entry per top-level block.
+    Markdown(markdown::MdPlan),
+    /// S1 · CSV: the sheet's units (header, data rows, cap note) plus the
+    /// grid geometry they paint from. The sheet itself stays on the tab.
+    Csv(csv::CsvPlan),
+}
+
+impl PanePlan {
+    /// The document height, for the scrollbar and the pane's content size.
+    pub fn height(&self) -> f32 {
+        match self {
+            PanePlan::Text(rows) => rows.height(),
+            PanePlan::Lines(p) => p.rows.height(),
+            PanePlan::Markdown(p) => p.rows.height(),
+            PanePlan::Csv(p) => p.rows.height(),
+        }
+    }
 }
 
 /// Everything layout needs besides the document itself. All outputs are in *physical pixels*.

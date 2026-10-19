@@ -86,3 +86,16 @@ file in this repository, including history. They apply to work you do on your
 own initiative as well as work you were asked to do.
 
 When in doubt: the repository belongs to its owner. Leave no fingerprints.
+
+## 6. Nothing that did not contribute may be credited
+
+The contributor list is the owner's alone. Nothing else may appear in it — no
+tool, agent, model, vendor, service, or harness, whether or not it touched the
+work. A thing that did not contribute is not a contributor; a thing that did
+contribute still gets no credit line, because commit messages carry no
+attribution at all (section 2).
+
+Never add a `CONTRIBUTORS` / `AUTHORS` file, never add a credits or
+acknowledgements section, and never let a harness register itself as a
+contributor through a commit trailer, a bot identity, or a `.gitignore` entry
+for its state directory.

@@ -86,7 +86,7 @@ fn config_base() -> Option<PathBuf> {
 /// the last test happened to be looking at.
 #[cfg(test)]
 fn config_base() -> Option<PathBuf> {
-    Some(std::env::temp_dir().join("editor_test_config"))
+    Some(crate::testing::temp_dir().join("editor_test_config"))
 }
 
 fn file_in(dir: &Path) -> PathBuf {
@@ -320,7 +320,7 @@ mod tests {
         // The file is written elsewhere and renamed over the old one, so the
         // session on disk is always a complete one, and the scratch file it was
         // staged in is gone afterwards.
-        let dir = std::env::temp_dir().join("editor_settings_atomic");
+        let dir = crate::testing::temp_dir().join("editor_settings_atomic");
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = Settings {
             dark: true,
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn a_write_interrupted_before_the_rename_keeps_the_previous_session() {
-        let dir = std::env::temp_dir().join("editor_settings_interrupted");
+        let dir = crate::testing::temp_dir().join("editor_settings_interrupted");
         let _ = std::fs::remove_dir_all(&dir);
         let s = Settings {
             dark: false,
@@ -372,7 +372,7 @@ mod tests {
         // Neither the rename nor the fallback can work when the session path is
         // a directory, which stands in for a locked file or an unwritable spot:
         // persisting is best effort, and reading falls back to defaults.
-        let dir = std::env::temp_dir().join("editor_settings_unwritable");
+        let dir = crate::testing::temp_dir().join("editor_settings_unwritable");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(file_in(&dir)).unwrap();
         save_in(&dir, &Settings::default());
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn save_then_load() {
-        let dir = std::env::temp_dir().join("editor_settings_test");
+        let dir = crate::testing::temp_dir().join("editor_settings_test");
         let _ = std::fs::remove_dir_all(&dir);
         let s = Settings {
             dark: true,
@@ -408,7 +408,7 @@ mod tests {
     fn tests_never_reach_the_real_config_dir() {
         let dir = config_dir().expect("a config dir under test");
         assert!(
-            dir.starts_with(std::env::temp_dir()),
+            dir.starts_with(crate::testing::temp_dir()),
             "tests would write {dir:?}"
         );
     }

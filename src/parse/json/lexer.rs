@@ -1,8 +1,14 @@
-//! JSON lexer: source text -> tokens with 1-based line/col positions.
+//! JSON lexer: source text -> tokens with 1-based line/col positions and byte
+//! offsets.
 //!
 //! Strict superset-free JSON: `"`-quoted strings with `\uXXXX` escapes,
 //! spec-valid numbers (kept as source text to avoid precision loss), and the
 //! `true`/`false`/`null` literals. A leading UTF-8 BOM is skipped.
+//!
+//! The cursor walks the source's bytes rather than a `Vec<char>` copy: a token
+//! carries the byte range it came from, which is what lets an edit re-parse one
+//! node's slice of the document instead of all of it, and it keeps a copy of
+//! the whole document out of memory on the way.
 
 use crate::error::{Error, Result};
 
@@ -21,33 +27,40 @@ pub enum Token {
     Null,
 }
 
-/// A token plus the 1-based position where it starts.
+/// A token plus where it starts (1-based line/col for messages) and the byte
+/// range it occupies.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lexeme {
     pub tok: Token,
     pub line: usize,
     pub col: usize,
+    /// Byte offset of the token's first byte.
+    pub at: usize,
+    /// Byte offset just past the token's last byte.
+    pub end: usize,
 }
 
 /// Where the input ended (for "unexpected end of file" errors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
+pub struct Eof {
     pub line: usize,
     pub col: usize,
+    /// The source's byte length.
+    pub at: usize,
 }
 
 #[derive(Debug)]
 pub struct Lexed {
     pub toks: Vec<Lexeme>,
-    pub eof: Span,
+    pub eof: Eof,
 }
 
 struct Lexer<'a> {
-    chars: Vec<char>,
-    pos: usize,
+    src: &'a str,
+    /// Byte offset of the next character.
+    at: usize,
     line: usize,
     col: usize,
-    _src: &'a str,
 }
 
 fn err(line: usize, col: usize, msg: impl Into<String>) -> Error {
@@ -60,12 +73,12 @@ fn err(line: usize, col: usize, msg: impl Into<String>) -> Error {
 
 impl Lexer<'_> {
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+        self.src[self.at..].chars().next()
     }
 
     fn bump(&mut self) -> Option<char> {
-        let c = self.chars.get(self.pos).copied()?;
-        self.pos += 1;
+        let c = self.peek()?;
+        self.at += c.len_utf8();
         if c == '\n' {
             self.line += 1;
             self.col = 1;
@@ -75,7 +88,7 @@ impl Lexer<'_> {
         Some(c)
     }
 
-    fn lex_string(&mut self, line: usize, col: usize) -> Result<Lexeme> {
+    fn lex_string(&mut self, line: usize, col: usize, at: usize) -> Result<Lexeme> {
         let mut out = String::new();
         loop {
             match self.bump() {
@@ -96,6 +109,8 @@ impl Lexer<'_> {
             tok: Token::Str(out),
             line,
             col,
+            at,
+            end: self.at,
         })
     }
 
@@ -128,7 +143,7 @@ impl Lexer<'_> {
                 } else if (0xDC00..0xE000).contains(&hi) {
                     Err(err(line, col, "lone low surrogate"))
                 } else {
-                    char::from_u32(hi as u32).ok_or_else(|| err(self.line, self.col, "bad escape"))
+                    char::from_u32(hi as u32).ok_or_else(|| err(line, col, "bad escape"))
                 }
             }
             _ => Err(err(self.line, self.col, "bad escape")),
@@ -148,12 +163,12 @@ impl Lexer<'_> {
     }
 
     /// Strict JSON number: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
-    fn lex_number(&mut self, line: usize, col: usize) -> Result<Lexeme> {
-        let start = self.pos;
+    fn lex_number(&mut self, line: usize, col: usize, at: usize) -> Result<Lexeme> {
+        let start = self.at;
         if self.peek() == Some('-') {
             self.bump();
         }
-        let int_start = self.pos;
+        let int_start = self.at;
         match self.peek() {
             Some(c) if c.is_ascii_digit() => {
                 while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
@@ -162,7 +177,7 @@ impl Lexer<'_> {
             }
             _ => return Err(err(line, col, "bad number")),
         }
-        if self.chars[int_start] == '0' && self.pos - int_start > 1 {
+        if self.src.as_bytes()[int_start] == b'0' && self.at - int_start > 1 {
             return Err(err(line, col, "leading zeros are not allowed"));
         }
         if self.peek() == Some('.') {
@@ -187,14 +202,16 @@ impl Lexer<'_> {
             }
         }
         Ok(Lexeme {
-            tok: Token::Num(self.chars[start..self.pos].iter().collect()),
+            tok: Token::Num(self.src[start..self.at].to_string()),
             line,
             col,
+            at,
+            end: self.at,
         })
     }
 
     /// `true` / `false` / `null`: the next char must not extend the word.
-    fn lex_word(&mut self, line: usize, col: usize) -> Result<Lexeme> {
+    fn lex_word(&mut self, line: usize, col: usize, at: usize) -> Result<Lexeme> {
         let tail_ok =
             |lx: &Lexer<'_>| !matches!(lx.peek(), Some(c) if c.is_alphanumeric() || c == '_');
         let rest = |lx: &mut Lexer<'_>, s: &str| {
@@ -205,113 +222,92 @@ impl Lexer<'_> {
             }
             true
         };
-        match self.peek() {
-            Some('t') if rest(self, "true") && tail_ok(self) => Ok(Lexeme {
-                tok: Token::True,
-                line,
-                col,
-            }),
-            Some('f') if rest(self, "false") && tail_ok(self) => Ok(Lexeme {
-                tok: Token::False,
-                line,
-                col,
-            }),
-            Some('n') if rest(self, "null") && tail_ok(self) => Ok(Lexeme {
-                tok: Token::Null,
-                line,
-                col,
-            }),
-            _ => Err(err(line, col, "unexpected character")),
-        }
+        let tok = match self.peek() {
+            Some('t') if rest(self, "true") && tail_ok(self) => Token::True,
+            Some('f') if rest(self, "false") && tail_ok(self) => Token::False,
+            Some('n') if rest(self, "null") && tail_ok(self) => Token::Null,
+            _ => return Err(err(line, col, "unexpected character")),
+        };
+        Ok(Lexeme {
+            tok,
+            line,
+            col,
+            at,
+            end: self.at,
+        })
     }
 }
 
 pub fn lex(src: &str) -> Result<Lexed> {
     let mut lx = Lexer {
-        chars: src.chars().collect(),
-        pos: 0,
+        src,
+        at: 0,
         line: 1,
         col: 1,
-        _src: src,
     };
     // A Windows-editor BOM is not JSON content.
     if lx.peek() == Some('\u{FEFF}') {
         lx.bump();
     }
     let mut toks = Vec::new();
+    // A one-byte punctuation token: its range is its own byte.
+    let punct = |lx: &Lexer<'_>, tok: Token| Lexeme {
+        tok,
+        line: lx.line,
+        col: lx.col,
+        at: lx.at,
+        end: lx.at + 1,
+    };
     while let Some(c) = lx.peek() {
         match c {
             ' ' | '\t' | '\n' | '\r' => {
                 lx.bump();
             }
             '{' => {
-                toks.push(Lexeme {
-                    tok: Token::LBrace,
-                    line: lx.line,
-                    col: lx.col,
-                });
+                toks.push(punct(&lx, Token::LBrace));
                 lx.bump();
             }
             '}' => {
-                toks.push(Lexeme {
-                    tok: Token::RBrace,
-                    line: lx.line,
-                    col: lx.col,
-                });
+                toks.push(punct(&lx, Token::RBrace));
                 lx.bump();
             }
             '[' => {
-                toks.push(Lexeme {
-                    tok: Token::LBracket,
-                    line: lx.line,
-                    col: lx.col,
-                });
+                toks.push(punct(&lx, Token::LBracket));
                 lx.bump();
             }
             ']' => {
-                toks.push(Lexeme {
-                    tok: Token::RBracket,
-                    line: lx.line,
-                    col: lx.col,
-                });
+                toks.push(punct(&lx, Token::RBracket));
                 lx.bump();
             }
             ':' => {
-                toks.push(Lexeme {
-                    tok: Token::Colon,
-                    line: lx.line,
-                    col: lx.col,
-                });
+                toks.push(punct(&lx, Token::Colon));
                 lx.bump();
             }
             ',' => {
-                toks.push(Lexeme {
-                    tok: Token::Comma,
-                    line: lx.line,
-                    col: lx.col,
-                });
+                toks.push(punct(&lx, Token::Comma));
                 lx.bump();
             }
             '"' => {
-                let (line, col) = (lx.line, lx.col);
+                let (line, col, at) = (lx.line, lx.col, lx.at);
                 lx.bump();
-                toks.push(lx.lex_string(line, col)?);
+                toks.push(lx.lex_string(line, col, at)?);
             }
             '-' | '0'..='9' => {
-                let (line, col) = (lx.line, lx.col);
-                toks.push(lx.lex_number(line, col)?);
+                let (line, col, at) = (lx.line, lx.col, lx.at);
+                toks.push(lx.lex_number(line, col, at)?);
             }
             _ => {
-                let (line, col) = (lx.line, lx.col);
-                toks.push(lx.lex_word(line, col)?);
+                let (line, col, at) = (lx.line, lx.col, lx.at);
+                toks.push(lx.lex_word(line, col, at)?);
             }
         }
     }
     Ok(Lexed {
         toks,
-        eof: Span {
+        eof: Eof {
             line: lx.line,
             col: lx.col,
+            at: lx.at,
         },
     })
 }
@@ -404,5 +400,35 @@ mod tests {
     #[test]
     fn bom_is_skipped() {
         assert_eq!(toks("\u{FEFF}1"), vec![Token::Num("1".into())]);
+    }
+
+    /// Every token carries the byte range it came from, whatever the encoding
+    /// around it: an edit slice is cut with these, so a wide glyph before a
+    /// token must not shift its offsets.
+    #[test]
+    fn tokens_carry_their_byte_range() {
+        let src = "\u{FEFF}[\"é𝄞x\", 123, true]";
+        let lexed = lex(src).unwrap();
+        for l in &lexed.toks {
+            // The range is exactly the token's own source text.
+            let text = &src[l.at..l.end];
+            match &l.tok {
+                Token::Str(s) => {
+                    assert!(text.starts_with('"') && text.ends_with('"'), "{text:?}");
+                    // The decoded string is what the slice holds, escapes aside.
+                    assert!(s.contains('é') && s.contains('𝄞') && s.contains('x'));
+                }
+                Token::Num(n) => assert_eq!(text, n),
+                Token::True => assert_eq!(text, "true"),
+                Token::LBracket => assert_eq!(text, "["),
+                Token::RBracket => assert_eq!(text, "]"),
+                Token::Comma => assert_eq!(text, ","),
+                other => panic!("unexpected token {other:?}"),
+            }
+        }
+        // The BOM is not part of the first token.
+        assert_eq!(lexed.toks[0].at, '\u{FEFF}'.len_utf8());
+        assert_eq!(lexed.eof.at, src.len());
+        assert_eq!(lexed.eof.line, 1);
     }
 }
