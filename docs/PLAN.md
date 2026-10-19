@@ -1882,7 +1882,21 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
 
 The product is frozen, so what is left is making the window answer faster. The
 measurements, the workstreams and their acceptance tests are in
-[`POLISH.md`](POLISH.md): the gate measures the wrong paths today (headless opens
-inline; the typing keystroke is measured only near the top of a file), typing
-still re-derives each kind's pane around the edit, and the editor half is laid
-out from the whole buffer on every keystroke.
+[`POLISH.md`](POLISH.md). Landed so far, per its notes: the gate's honesty set
+(G1–G4), the unifications (R1–R5 — `app.rs` is `app/` now), the editor band
+(T1), Markdown's block-splice typing (T2), the running status counts and find
+patch (T4/T5), the dirty watermark (T7), CSV's plan/band (S1), the Markdown
+band cache (S2), and code's tint-checkpoint fill (C1). Typing in every
+planned kind is band speed except JSON's ~119 ms, which is T3's walking pace
+while its slot-move suspect waits to be measured (the probe exists,
+`pipeline_breakdown`).
+
+Still open, in the order their numbers argue for it: **T3** (attribute and cut
+JSON's keystroke; the gate measures it at both ends today, the attribution
+probe is written), **S3** (a test proving five resizes during one worker job
+end on the last size's plan — the coalescing has no proof in the suite),
+**S4** (the streaming pump's per-tick cost, now measured only indirectly
+through `readable`), and the P5 budget keepers **B1/B2** (typing is measured
+at both positions but not budget-enforced; `pane_ops` bounds the planned
+panes, the editor band has no op budget). Each carries its numbers in
+POLISH.md; the ordering and the shortcuts not to take are its sections 5–8.

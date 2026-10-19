@@ -264,8 +264,10 @@ two or three.
 > the perf gate's before/after reference only. Suite 507/0 (T1's equality
 > test in text::tests), clippy clean, release gate 7/7.
 >
-> **Session checkpoint (all P0 + P0r + T1 done; per order §5, next is
-> T2 — the plan-patch counter/coverage items).**
+> **Session checkpoint (all P0 + P0r + T1 done).** T2–T7, S1, S2 and C1 have
+> since landed — each carries its note below — and the gate runs every kind
+> within budget (see the P5 section for the part still open: the typing
+> numbers are measured but not yet budget-enforced).
 
 **G1 · A fair load measurement.** (S)
 The harness writes the fixture and immediately opens it, so the first read pays the filesystem's first-touch cost
@@ -441,6 +443,16 @@ shifting `plan.slots` and `spans` for 545k nodes, `plan.patch_node`,
 guesses), then fix what it shows; the likely one is the slot/span move, which
 M2 would shrink. *Should buy:* under 30 ms. *Verify:* gate (both caret
 positions, G4) + the existing patch-equals-parse tests.
+>
+> **Status (Oct 2026 audit): still open.** The gate measures json at both
+> caret ends today: `type` 119 / `end` 119 ms on the sync-patched path — the
+> topics above were reworked by the patch rounds (`Doc::patch_node`'s slot
+> move went away with the virtualized tree's plan; `sync_dirty` starts at
+> T7's watermark), and the number stopped moving once T7 landed, so the
+> residual ~119 ms is `plan.slots`/spans maintenance the measurement cannot
+> name yet. The node may legitimately be smaller now; run the attribution
+> probe in `pipeline_breakdown` before touching anything — §9's recipe is
+> the rule, not the localhost numbers.
 
 **T4 · Count status facts incrementally.** (S)
 `log_counts` rescans 20 000 lines on every log keystroke and
@@ -585,7 +597,10 @@ kind, mode, width, scale, zoom or collapse generation no longer match, marking
 the layout dirty so the next paint starts a job that does. So a drag coalesces,
 but nothing tests the end state. Add the test: five resizes during a pending job
 end with the last size's plan installed and no stale plan painted. No behavior
-change.
+change. Carried forward by the Oct 2026 audit: no such test exists in the
+suite yet (it is the one C1-adjacent semantic without a regression pin — both
+the hand-off and the stale-job drop are proven in their own tests, not
+across a worker round-trip).
 
 **S4 · Measure the stream pump's tick.** (S)
 The gate opens headless, so `Loader::drain` runs synchronously at open and the
@@ -595,7 +610,9 @@ sizes a chunk at "~15–20 ms", which is a whole frame on a 60 Hz display before
 the paint. Measure it on a 64 MB stream (drain + band + editor rebuild, per
 tick, in Split) and only then decide whether the chunk or the pump's work needs
 to change. After T1 the editor half of that tick is O(visible), so re-measure
-there rather than pre-emptively tuning `STREAM_CHUNK_BYTES`.
+there rather than pre-emptively tuning `STREAM_CHUNK_BYTES`. Carried forward
+by the Oct 2026 audit: the gate's `readable` row measures the whole open,
+not the per-tick slice, so this number still does not exist.
 
 ### P3 — Opening a document
 
@@ -629,10 +646,27 @@ live number.
 Once T1/T2/T7 land, assert per-kind typing in the gate at both caret positions
 at ~3× the new measured value, the same doctrine as the other budgets, and
 tighten as the numbers fall. The structural assertions (patched, no worker) stay.
+>
+> **Status (Oct 2026 audit): half landed.** The half that needed the numbers
+> is done — the gate measures both caret positions per kind
+> (`Cost::typing_ms` / `typing_end_ms`, `code end` now the headline row) and
+> prints them; the enforcement half is not: `Budget` has no typing fields,
+> so a typing regression fails nothing today except CI's eyes on the
+> printed rows. Budgeting it is a small diff (two fields + their 3×
+> calibration) gated on a stable three-run baseline of the current values —
+> do it with T3, so json's number is final before it is frozen.
 
 **B2 · Budget the bands.** (S)
 Pane ops < 500 for CSV after S1, and the editor band's ops < 500 in Split after
 T1, so a future change cannot quietly reintroduce a document-sized list.
+>
+> **Status (Oct 2026 audit): the planned half is landed.** `Budget::pane_ops`
+> bounds what every planned pane may hold (json/jsonl/markdown/log/code at
+> 2 000 ops, CSV bounded by its parser's row cap instead, so it cannot grow
+> with the file), and `check` fails the build naming the kind and the
+> count. The editor band is the uncovered half — its op count is not a
+> gate row at all; counting it into the existing `pane_ops` check in Split
+> is the natural home, guarded by the measured screenful.
 
 **B3 · Keep one command honest.** (S)
 Every budget failure must name the kind and the number; the gate stays green on
