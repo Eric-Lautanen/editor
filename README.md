@@ -60,6 +60,12 @@ keyboard.
 
 ## What's new (October 2026)
 
+- **Big files stay instant (0.2.5).** Jumping to the end of a multi-megabyte
+  code file paints immediately: the highlighter carries its tint state along
+  the document instead of re-deriving it from the top, a resize adopts that
+  work instead of re-lexing, and `--pretty` prints without ever building the
+  app at all. Measured by the repo's release-cost gate: the end-of-file
+  keystroke went from a ~590 ms one-frame stall to band speed.
 - **A sharper preview.** Markdown task lists get real check boxes, list items
   sit together instead of reading as one paragraph per bullet, tables band
   alternate rows, fenced code carries a language label, and an image
@@ -263,7 +269,9 @@ what you had open — the session file it wrote on the way out (open tabs, the
 file you were in, the window's size and place) is what the fresh process reads.
 On Windows the updater runs the installer and reopens the app once it has
 finished, because Restart Manager closes a running app for an upgrade but does
-not reopen it.
+not reopen it. The whole attempt — check, download, checksum, the installer's
+exit code, the relaunch — is also appended to `%APPDATA%\Editor\last-update.log`
+(the previous attempt kept as `last-update.1.log`), so an update that  misbehaves is diagnosable from a file afterwards instead of by guesswork.
 
 A newer install always replaces the older one in place, so file associations
 keep working — re-running `--install` is only needed if you *move* the
@@ -325,6 +333,26 @@ or the window's ×.
 
 Your session — theme, view mode, open tabs, window size and position — is
 restored on the next start.
+
+## Console flags
+
+The window is the whole product, but the binary answers a few console flags
+for scripting and recovery (run `editor --help` for the authoritative list,
+which `cli.rs` keeps next to its argument parser):
+
+| Flag | What it does |
+|---|---|
+| `editor [FILE ...]` | open files as tabs, in order; the first one focused |
+| `--version` / `-V` | print the version |
+| `--install` / `--uninstall` | register / remove the "Open with" entries (portable use) |
+| `--update` | check GitHub and install the newest release now |
+| `--no-update` | skip the automatic check for this one launch |
+| `--pretty FILE` | print FILE: `.json`/`.jsonl` canonicalized (a broken one fails with its position), any other file echoed unchanged |
+
+Dev-only flags (`--render OUT.ppm --size WxH --scale S --dark/--light
+--mode preview|edit|split --scroll PX`, and `--mem-report` in `mem-census`
+builds) draw the screenshots for this README and measure allocations; they
+are documented in `--help` and used by the tests, not by people.
 
 ## Code signing policy
 
