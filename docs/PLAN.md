@@ -1926,6 +1926,43 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   the filter.
 
 
+### Blank editor after a mode switch, and a wheel that barely moved (Oct 2026) — 534 tests green
+- **Report**: scroll a preview to the bottom, switch to the editor, and the
+  editor is blank until the view is toggled away and back (Split suspected
+  too); and the mouse wheel moves so little that the page needs a lot of
+  spinning, while a finger on the glass is smooth with its momentum.
+- **What the tests showed**: the editor paints a band — a screenful of rows
+  built at the offset the layout ran at. `editor_band_stale` answered with the
+  test for *does the band still cover the view?*, the negated question the
+  paint path reads as stale, so a covered band was rebuilt every frame while a
+  band the view had jumped out of was never rebuilt at all — and a mode switch,
+  which settles the offset against the editor's own height *after* the range was
+  measured against the preview's, left an empty inverted range painting nothing.
+  That check also reused the band builder's slack-widened range, so every
+  downward scroll counted as stale and rebuilt. The paint path then asked the
+  question *after* its relayout decision, so a band that had gone stale was
+  painted once more (clipped away, i.e. blank) and repaired only by whatever
+  frame came next — which, after a click-driven mode switch, is nothing.
+- **Fix**: the staleness test is the negation it should have been, asked against
+  the rows the pane actually paints (not the builder's slack) and answered
+  *before* the paint decides whether to relayout; a relayout whose settle moved
+  the view gets one more pass from the settled offset, so a switch shows its text
+  on the frame it paints. The wheel was a fixed 48 px per notch — 2.2 lines at
+  the stock font, fewer as soon as the user zoomed — with X11 sending 120, so one
+  wheel moved three distances on three platforms: a notch is now
+  `WHEEL_LINES_PER_NOTCH` (3, Windows' own default) times `Handler::line_step_px`,
+  the pane's line height, so it is three lines at any DPI or zoom and the same
+  three lines everywhere.
+- **Verified**: `switching_from_a_scrolled_preview_paints_the_editor_at_once`
+  (one frame after the switch: text ops present, band covering, canvas painted),
+  `the_editor_band_is_stale_only_once_the_view_leaves_it` (covered at rest and
+  two rows down, stale at the end of the document),
+  `the_split_editor_pane_stays_painted_wherever_the_progress_lands` (0, 35, 90
+  and 100% of the shared progress) and
+  `a_wheel_notch_steps_by_three_lines_of_the_current_text` (the step is the
+  pane's line height, and doubles with a 2x zoom).
+
+
 ## Remaining responsiveness work
 
 The product is frozen, so what is left is making the window answer faster. The

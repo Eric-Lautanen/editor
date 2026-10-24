@@ -110,9 +110,10 @@ struct PreviewTouch {
 const BLINK_TICKS: u32 = 12;
 
 /// Smallest scroll delta treated as a discrete step worth gliding to. A wheel
-/// notch is ~48 px and a PageDown a whole pane; a touchpad or a finger arrives
-/// in deltas of a few px, and those must be applied the instant they land or
-/// the input feels sticky.
+/// notch is three lines (see `platform::WHEEL_LINES_PER_NOTCH`) and a
+/// PageDown a whole pane; a touchpad or a finger arrives in deltas of a few
+/// px, and those must be applied the instant they land or the input feels
+/// sticky.
 const GLIDE_MIN_STEP: f32 = 16.0;
 
 /// How long a reported window size/place has to hold still before it is
@@ -2866,16 +2867,29 @@ impl App {
                 self.layout_dirty = true;
             }
         }
-        if self.layout_dirty {
-            self.relayout();
-        }
         // T1 · The editor pane's list is a band: a scroll (or caret follow)
         // that left its covered rows, or a width change since it was built,
-        // rebuilds it next frame rather than painting blank lines. The
-        // reader pane's equivalent is the `stream_top`/`stream_bottom` check
-        // above.
+        // is rebuilt *before* this frame paints, never after it — a frame
+        // that notices stale rows and paints them anyway is a blank pane
+        // whenever the view jumped far enough for the old ops to be clipped
+        // away entirely, with the repair one paint late and nothing left to
+        // trigger it. The reader pane's equivalent is the
+        // `stream_top`/`stream_bottom` check above.
         if !self.layout_dirty && self.editor_band_stale() {
             self.layout_dirty = true;
+        }
+        if self.layout_dirty {
+            self.relayout();
+            // The relayout settles the view against the *new* pane's height
+            // (a switch out of a taller preview lands far from the offset the
+            // band in that same pass was measured at), so the band it just
+            // built may cover rows the pane no longer paints. One more pass
+            // from the settled offset is what makes such a switch show its
+            // text on the same frame, instead of painting blank down to the
+            // next piece of input.
+            if !self.layout_dirty && self.editor_band_stale() {
+                self.relayout();
+            }
         }
         // A virtualized reader pane — a big JSONL's records, a big JSON's
         // tree — paints a band laid out fresh each frame (only the blocks at
@@ -3599,6 +3613,13 @@ impl Handler for App {
 
     fn title(&self) -> String {
         App::title(self)
+    }
+
+    /// One line of the pane's text, as painted now: the preview column and
+    /// the editor share the row grid, so one number serves both, and it
+    /// already carries DPI and the user's zoom.
+    fn line_step_px(&self) -> f32 {
+        layout::text::line_height(self.viewport().w, &self.ctx())
     }
 
     fn title_hit(&self, x: f32, y: f32) -> TitleHit {

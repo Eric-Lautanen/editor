@@ -416,6 +416,14 @@ impl App {
     /// `paint_panes` checks it and falls into `relayout`, which rebuilds
     /// the band instead of painting blank rows — the reader pane's
     /// stream_top/Bottom check, for the editor half.
+    ///
+    /// The band answers when it *contains* the rows this view needs — that
+    /// is `bf <= first && next <= bn` — so the answer here is its negation.
+    /// Getting that backwards is invisible while the view sits inside the
+    /// band (it rebuilds every frame, which looks right) and blank the pane
+    /// the moment the view jumps outside it: the rows then missing are
+    /// never rebuilt, because the question "is this stale?" was answered
+    /// with the test for "is this fresh?".
     pub(super) fn editor_band_stale(&self) -> bool {
         if self.mode == Mode::Preview {
             return false;
@@ -423,13 +431,22 @@ impl App {
         let Some((bf, bn, w, zoom, n)) = self.tabs[self.active].editor_band else {
             return true;
         };
-        let edit_w = self.editor_area().w;
-        if w != edit_w || zoom != self.zoom || n != self.buffer.line_count() {
+        let area = self.editor_area();
+        if w != area.w || zoom != self.zoom || n != self.buffer.line_count() {
             return true;
         }
-        let (first, next) =
-            self.editor_band_range(edit_w, self.editor_area(), self.editor_scroll().max(0.0));
-        bf <= first && next <= bn
+        // The window the pane paints, not the slack-widened one
+        // `editor_band_range` builds from: asking for the slack back as well
+        // marks the band stale on every single downward scroll, which is a
+        // rebuild per frame rather than the "only leaving the covered range
+        // rebuilds" the band exists for.
+        let p = layout::text::plain_params(area.w, &self.ctx(), false);
+        let first = (self.editor_scroll().max(0.0) / p.line_h).floor().max(0.0) as usize;
+        // One extra row for the partial one at the bottom of the pane; the
+        // window stops at the document's end, where the band does, so a view
+        // of the last lines is not asked for rows that do not exist.
+        let rows = (area.h / p.line_h).ceil() as usize + 1;
+        first < bf || (first + rows).min(n) > bn
     }
 
     /// The fast band: a wrapped plain pass over only the visible rows, with

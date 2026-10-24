@@ -10,7 +10,7 @@
 //! server decorations, `_NET_WM_STATE` for maximize, dark preference via
 //! `gsettings`. Single-instance handoff and IME/XIM are tracked in
 //! docs/PLAN.md (M8 follow-up); drag-and-drop likewise.
-use super::Handler;
+use super::{Handler, WHEEL_LINES_PER_NOTCH};
 use crate::{
     error::{Error, Result},
     gfx::canvas::Canvas,
@@ -1137,23 +1137,16 @@ unsafe fn handle_event(x: *mut X, ev: &XEvent) {
                 x.move_drag = Some(((*bev).x_root, (*bev).y_root, x.geom.0, x.geom.1));
                 return;
             }
+            // One click of the wheel or the tilt is a notch: three lines of
+            // the text on screen, the same distance Win32 and AppKit move it
+            // (a hardcoded pixel count made the same wheel scroll twice as
+            // far on X11 as on Windows).
+            let step = WHEEL_LINES_PER_NOTCH * x.handler.line_step_px();
             match (*bev).button {
-                WHEEL_UP => dispatch(x, Event::Scroll { dx: 0.0, dy: 120.0 }),
-                WHEEL_DOWN => dispatch(
-                    x,
-                    Event::Scroll {
-                        dx: 0.0,
-                        dy: -120.0,
-                    },
-                ),
-                TILT_LEFT => dispatch(
-                    x,
-                    Event::Scroll {
-                        dx: -120.0,
-                        dy: 0.0,
-                    },
-                ),
-                TILT_RIGHT => dispatch(x, Event::Scroll { dx: 120.0, dy: 0.0 }),
+                WHEEL_UP => dispatch(x, Event::Scroll { dx: 0.0, dy: step }),
+                WHEEL_DOWN => dispatch(x, Event::Scroll { dx: 0.0, dy: -step }),
+                TILT_LEFT => dispatch(x, Event::Scroll { dx: -step, dy: 0.0 }),
+                TILT_RIGHT => dispatch(x, Event::Scroll { dx: step, dy: 0.0 }),
                 b => {
                     if let Some(button) = button_of(b) {
                         if button == MouseButton::Left {

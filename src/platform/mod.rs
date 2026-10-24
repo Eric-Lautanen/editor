@@ -15,6 +15,14 @@ pub mod install;
 /// default open size cannot drift per OS.
 pub const DEFAULT_SIZE: (usize, usize) = (1280, 720);
 
+/// Lines a wheel notch scrolls — Windows' own default, and what every
+/// mainstream app does, so a notch here moves the page by as much as a notch
+/// anywhere else on the machine. Backends multiply it by
+/// [`Handler::line_step_px`], never by a fixed pixel count: text size,
+/// DPI and zoom all belong to the app, and a hardcoded 48 px notch quietly
+/// became two lines the moment the font grew.
+pub(crate) const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
+
 // The `editor_check_*` cfgs (RUSTFLAGS) type-check one backend from another
 // OS: `editor_check_win` the Win32 backend, `editor_check_linux` the X11
 // one, `editor_check_macos` the AppKit one. Dev-only: they never link the
@@ -140,6 +148,21 @@ pub trait Handler {
     /// Cursor shape for a client-space point (I-beam over text, hand over
     /// clickable things).
     fn cursor_at(&self, x: f32, y: f32) -> CursorShape;
+
+    /// Height of one line of the text the app is showing, in physical px.
+    ///
+    /// The wheel is a *line* device: one notch should move three lines in
+    /// this app exactly as it moves three lines in every other one, and the
+    /// only layer that knows how tall a line is today — the window's DPI
+    /// and the user's zoom both feed it — is the app. A backend that
+    /// hardcodes a pixel count instead scrolls fewer lines the larger the
+    /// text gets, which reads as a wheel that barely moves.
+    ///
+    /// The default is a line of the stock 13.5 px font at 100%:
+    /// backends' own tests never lay text out.
+    fn line_step_px(&self) -> f32 {
+        21.0
+    }
 
     /// Where to open the window, asked once before it exists: the geometry the
     /// last session was closed at (see [`Event::WindowGeometry`]). `None` — the

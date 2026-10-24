@@ -5196,3 +5196,134 @@ fn collapsing_inside_a_jsonl_band_rebuilds_the_index() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// The report: scroll a preview to the bottom, switch to the editor, and the
+/// pane is blank until the view is toggled away and back. The switch settles
+/// the view against the editor's own height, and the band the same relayout
+/// built was measured at the *preview's* offset — an empty, inverted range the
+/// staleness check then called fresh, so nothing ever rebuilt it.
+#[test]
+fn switching_from_a_scrolled_preview_paints_the_editor_at_once() {
+    let body = "# Heading\n\nSome **bold** text with `code` and a [link](https://example.com).\n\n- one\n- two\n\n";
+    let mut app = open("editor_test_switch_at_end.md", &body.repeat(40));
+    let _ = app.render_headless(1100, 800, 1.0);
+    app.set_mode(Mode::Preview);
+    let _ = app.render_headless(1100, 800, 1.0);
+    let preview_end = app.scroll.max();
+    assert!(preview_end > 0.0, "the fixture must scroll");
+    app.set_scroll(f32::MAX);
+    assert_eq!(app.scroll.offset, preview_end, "at the preview's end");
+    let mut host = NullHost::default();
+    let mut canvas = Canvas::new(1100, 800);
+    app.on_event(Event::Tick, &mut host);
+    Handler::paint(&mut app, &mut canvas);
+    // The switch itself, and one frame — no toggle away and back.
+    app.set_mode(Mode::Edit);
+    app.on_event(Event::Tick, &mut host);
+    let mut canvas = Canvas::new(1100, 800);
+    Handler::paint(&mut app, &mut canvas);
+    assert!(
+        !app.tabs[0].editor_pane.list.ops.is_empty(),
+        "the editor pane must have text on the frame the switch paints"
+    );
+    assert!(
+        !app.editor_band_stale(),
+        "and its band must cover the rows it is about to show"
+    );
+    assert!(
+        canvas.pixels.iter().any(|&p| p != 0),
+        "the switch painted an empty pane"
+    );
+}
+
+/// The other half of that bug: `editor_band_stale` answered with the test for
+/// "does this band still cover the view?", so a covered band asked for a
+/// rebuild on every frame (the paint path read `true` as stale) while a band
+/// the view had jumped out of asked for none — the one case that needed it.
+#[test]
+fn the_editor_band_is_stale_only_once_the_view_leaves_it() {
+    let mut app = open("editor_test_band_stale.txt", &"line\n".repeat(400));
+    let _ = app.render_headless(800, 600, 1.0);
+    app.set_mode(Mode::Edit);
+    let _ = app.render_headless(800, 600, 1.0);
+    assert!(
+        !app.editor_band_stale(),
+        "the band was built for the view it covers"
+    );
+    // A row or two of scroll stays inside the band's slack: no rebuild.
+    let line = app.line_step_px();
+    app.set_scroll(line * 2.0);
+    assert!(
+        !app.editor_band_stale(),
+        "two rows are inside the band's slack"
+    );
+    // Far past it — the end of the document — the rows on screen are not the
+    // ones the band holds.
+    app.set_scroll(f32::MAX);
+    assert!(
+        app.editor_band_stale(),
+        "the band cannot answer for rows it never measured"
+    );
+}
+
+/// The report: a wheel notch barely moved the page and moved less the larger
+/// the text got. A notch is a *line* device — three lines, as everywhere else
+/// on the machine — so the distance comes from the text the pane is showing,
+/// never from a fixed pixel count.
+#[test]
+fn a_wheel_notch_steps_by_three_lines_of_the_current_text() {
+    let mut app = open("editor_test_wheel_step.txt", &"line\n".repeat(400));
+    let _ = app.render_headless(800, 600, 1.0);
+    let line_h = |app: &App| layout::text::plain_params(app.viewport().w, &app.ctx(), true).line_h;
+    assert_eq!(
+        app.line_step_px(),
+        line_h(&app),
+        "the step is one line of the pane's own text"
+    );
+    let at_100 = app.line_step_px();
+    app.zoom_by(2.0);
+    let at_200 = app.line_step_px();
+    assert!(
+        at_200 > at_100 * 1.9,
+        "the step must grow with the text: {at_100} -> {at_200}"
+    );
+    assert_eq!(
+        at_200,
+        line_h(&app),
+        "and stay exactly one line of it after zooming"
+    );
+    // Three of those is a notch: a full notch keeps moving three rows at
+    // either size, which is the whole point of measuring in lines.
+    assert!((crate::platform::WHEEL_LINES_PER_NOTCH * at_200 - 3.0 * line_h(&app)).abs() < 0.001);
+}
+
+/// The report named Split as a suspect too. There the two panes share one
+/// progress rather than one pixel offset, so the editor's own offset moves by
+/// more than either pane's raw scroll — and the band must follow it, not paint
+/// the rows of wherever the previous frame's progress was.
+#[test]
+fn the_split_editor_pane_stays_painted_wherever_the_progress_lands() {
+    let body = "# Heading\n\nSome **bold** text with `code` and a [link](https://example.com).\n\n- one\n- two\n\n";
+    let mut app = open("editor_test_split_scroll.md", &body.repeat(40));
+    let _ = app.render_headless(1100, 800, 1.0);
+    app.set_mode(Mode::Split);
+    let _ = app.render_headless(1100, 800, 1.0);
+    let mut host = NullHost::default();
+    let max = app.scroll.max();
+    assert!(max > 0.0, "the fixture must scroll");
+    for fraction in [0.0, 0.35, 0.9, 1.0] {
+        app.set_scroll(max * fraction);
+        app.on_event(Event::Tick, &mut host);
+        let mut canvas = Canvas::new(1100, 800);
+        Handler::paint(&mut app, &mut canvas);
+        assert!(
+            !app.tabs[0].editor_pane.list.ops.is_empty(),
+            "the editor half is blank at {fraction} of the document"
+        );
+        assert!(
+            !app.editor_band_stale(),
+            "its band does not cover the rows at {fraction} of the document: {:?}",
+            app.tabs[0].editor_band
+        );
+    }
+}

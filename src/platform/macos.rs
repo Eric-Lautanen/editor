@@ -15,7 +15,7 @@
 //! Not yet: IME/`NSTextInputClient` (`characters` covers Latin-1 and
 //! composed keys), live theme-change notification (no KVO on the
 //! appearance), and the scroll direction/multipliers want a real-wheel pass.
-use super::Handler;
+use super::{Handler, WHEEL_LINES_PER_NOTCH};
 use crate::{
     error::{Error, Result},
     gfx::canvas::Canvas,
@@ -812,15 +812,17 @@ unsafe extern "C" fn view_other_mouse_up(_: Id, _: Sel, ev: Id) {
 
 unsafe extern "C" fn view_scroll_wheel(_: Id, _: Sel, ev: Id) {
     let m = state();
-    // Line-mode deltas are ~1 line per notch (a line ≈ the 48 px the Win32
-    // backend scrolls per notch); precise (trackpad) deltas are points.
+    // Line-mode deltas are ~1 line per notch; precise (trackpad) deltas are
+    // points. A notch is three lines of the text on screen, the same distance
+    // Win32 and X11 move it — the line's height comes from the app, so this is
+    // three lines at any zoom or display scale rather than a pixel guess.
     // AppKit already applies the user's natural-scrolling preference to the
     // sign, so positive means "scroll up" in both modes.
     let precise = msg::<i8>(ev, sel("hasPreciseScrollingDeltas")) != 0;
     let k = if precise {
         m.scale as f64
     } else {
-        48.0 * m.scale as f64
+        (WHEEL_LINES_PER_NOTCH * m.handler.line_step_px()) as f64
     };
     dispatch(Event::Scroll {
         dx: (msg::<f64>(ev, sel("deltaX")) * k) as f32,

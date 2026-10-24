@@ -15,7 +15,7 @@
 //! (comdlg32), `WM_DROPFILES` with `DragAcceptFiles`, and `AttachConsole` so
 //! `--help` reaches a console despite the GUI subsystem. The remaining
 //! cross-platform gaps are per-target, not per-milestone: see `Event`'s gates.
-use super::{Handler, Host};
+use super::{Handler, Host, WHEEL_LINES_PER_NOTCH};
 use crate::{
     error::{Error, Result},
     gfx::canvas::Canvas,
@@ -2186,14 +2186,20 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             def_window_proc_w(hwnd, msg, wp, lp)
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-            // HIWORD(wParam) is a signed delta in multiples of 120 (WHEEL_DELTA).
-            let delta = ((wp >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
-            let dpi = get_dpi_for_window(hwnd);
-            let px = 48.0 * if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }; // ~3 lines per notch
+            // HIWORD(wParam) is a signed delta in multiples of 120 (WHEEL_DELTA)
+            // — one notch for a real wheel, a fraction of one for a precision
+            // touchpad's continuous reports.
+            let notches = ((wp >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
+            // Three lines per notch, Windows' own default, measured in the
+            // text the app is showing: a fixed pixel count would move fewer
+            // and fewer lines as the user zoomed in. A precision touchpad's
+            // fraction of a notch scales with it, so its travel is the same
+            // three-lines-per-notch it is everywhere else.
+            let step = WHEEL_LINES_PER_NOTCH * st.handler.line_step_px();
             let (dx, dy) = if msg == WM_MOUSEWHEEL {
-                (0.0, delta * px)
+                (0.0, notches * step)
             } else {
-                (delta * px, 0.0)
+                (notches * step, 0.0)
             };
             dispatch(st, hwnd, Event::Scroll { dx, dy });
             0
