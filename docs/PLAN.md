@@ -1877,6 +1877,40 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   the user's in-app update closed the app, never relaunched, left no
   report — and nothing in the config dir said what msiexec had done.
 
+### Update relaunch round (Oct 2026) — the installer's exit is not "installed"
+- **Report**: installing a new version from the app's own UI closed the app,
+  installed the new build, and never brought it back — no editor process
+  afterwards, no crash report, nothing to read.
+- **What the machine said**: the new version was on disk at the path the
+  updater relaunches (`%LOCALAPPDATA%\Programs\Editor\editor.exe`) and its
+  Add/Remove row was machine-wide, i.e. that install ran elevated. The two
+  mechanisms the relaunch leans on were both exercised here and both work:
+  cmd *does* wait for a GUI child inside a batch (a batch's `echo` after
+  `winver.exe` only ran once the dialog closed), and `explorer.exe "<exe>"`
+  *does* launch a GUI app from a hidden console. What neither of those does is
+  prove the install is finished or that the launch happened.
+- **Fix**: the batch no longer treats "msiexec returned" as "installed". It
+  takes the installed exe's file stamp before the install and waits for it to
+  change before reopening anything (bounded, and it stops waiting as soon as no
+  msiexec is left, so a refused install opens what is there instead of sitting
+  on the clock); it then asks Explorer to open the new build, checks the process
+  table, retries that up to `LAUNCH_TRIES`, and falls back to
+  `start "" /max` — an explicit show state, so the window cannot come up
+  hidden the way `start`'s inherited one did in 0.2.3. Every attempt, the
+  stamp-gate outcomes and the fallback reach `last-update.log`, so a report of
+  "it didn't come back" now names the step that failed instead of being
+  reconstructed from guesswork.
+- **Verified**: the generated script was dumped from the real
+  `windows_install_script` with a stand-in installer and run under cmd, twice
+  — installer changes the exe (stamp gate takes `goto launch`, log shows
+  `relaunch attempt 1: explorer …` then `relaunch: editor.exe is running`, no
+  "left the exe alone" line) and installer leaves it alone (the escape fires
+  immediately instead of waiting out the timeout). With a launch that starts
+  nothing, the retry bounded at three and the `start /max` fallback ran, all
+  three logged. 529 tests green, clippy and fmt clean; the new pins are the
+  stamp capture/gate, the msiexec-presence escape, the verification banner and
+  the fallback in `windows_install_waits_then_installs_then_relaunches`.
+
 
 ## Remaining responsiveness work
 

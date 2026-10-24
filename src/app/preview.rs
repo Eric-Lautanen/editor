@@ -1597,7 +1597,7 @@ impl App {
                 }
                 layout::PanePlan::Lines(p) => {
                     let hk = line_kind(self.kind).unwrap_or(layout::highlight::Kind::Plain);
-                    p.layout_band(&self.buffer, pane_w, ctx, hk, &ext, top, bottom)
+                    p.layout_band(&self.buffer, pane_w, ctx, hk, &ext, top..bottom)
                 }
                 layout::PanePlan::Markdown(p) => match &self.markdown_doc {
                     Some((rev, doc)) if *rev == self.buffer.revision() => {

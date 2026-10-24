@@ -18,6 +18,7 @@ use crate::{
     core::buffer::{Buffer, EditSpan},
     gfx::color::Color,
 };
+use std::ops::Range;
 
 /// Which tint applies. `Code` carries the file extension (no dot) so the
 /// shared scanner can pick comment flavors; everything else is extension-free.
@@ -640,10 +641,9 @@ impl LinePlan {
         st
     }
 
-    /// Lay out the lines whose rows overlap `[top, bottom)`, each at the y the
-    /// plan carries. The tint state is the one a full layout would have at
-    /// that line, so the band is the whole list with the rest left out.
-    #[allow(clippy::too_many_arguments)]
+    /// Lay out the lines whose rows overlap `band`, each at the y the plan
+    /// carries. The tint state is the one a full layout would have at that
+    /// line, so the band is the whole list with the rest left out.
     pub fn layout_band(
         &self,
         buf: &Buffer,
@@ -651,13 +651,12 @@ impl LinePlan {
         ctx: &Ctx,
         kind: Kind,
         code_lang: &str,
-        top: f32,
-        bottom: f32,
+        band: Range<f32>,
     ) -> DisplayList {
         let p = text::plain_params(width, ctx, true);
         let adv = ctx.fonts.advance(FontStyle::Mono, '0', p.size).max(1.0);
         let lang = syntax::Lang::from_hint(code_lang);
-        let range = self.rows.band(top, bottom);
+        let range = self.rows.band(band.start, band.end);
         let mut state = if kind == Kind::Code {
             self.state_at(range.start, buf, lang, ctx.theme)
         } else {
@@ -676,11 +675,12 @@ impl LinePlan {
                 ctx,
                 &p,
                 adv,
-                &line,
-                runs,
-                self.rows.top(i),
-                top,
-                bottom,
+                TintedLine {
+                    text: &line,
+                    runs,
+                    y: self.rows.top(i),
+                },
+                band.clone(),
             );
         }
         DisplayList::new(ops, self.rows.height(), Vec::new())
@@ -758,21 +758,29 @@ fn line_rows(line: &str, ctx: &Ctx, p: &text::PlainParams, adv: f32) -> usize {
     }
 }
 
-/// One tinted line at `y`, emitting only the rows that touch `[top, bottom)`.
-/// A full layout passes the whole document as the band, so both paths run this
-/// one function and cannot disagree about a row's baseline or colour.
-#[allow(clippy::too_many_arguments)]
+/// One line waiting for its turn in a band: its text, its tinted runs, and the
+/// y its first visual row sits at.
+struct TintedLine<'a> {
+    text: &'a str,
+    runs: Vec<(String, Color)>,
+    y: f32,
+}
+
+/// One tinted line at its `y`, emitting only the rows that touch `band`. A
+/// full layout passes `..` as the band, so both paths run this one function
+/// and cannot disagree about a row's baseline or colour.
 fn emit_line(
     ops: &mut Vec<DrawOp>,
     ctx: &Ctx,
     p: &text::PlainParams,
     adv: f32,
-    line: &str,
-    runs: Vec<(String, Color)>,
-    mut y: f32,
-    top: f32,
-    bottom: f32,
+    line: TintedLine<'_>,
+    band: Range<f32>,
 ) -> f32 {
+    let (top, bottom) = (band.start, band.end);
+    let content = line.text;
+    let runs = line.runs;
+    let mut y = line.y;
     let style = FontStyle::Mono;
     let m = ctx.fonts.metrics(style, p.size);
     let visible = |y: f32| y + p.line_h >= top && y <= bottom;
@@ -781,7 +789,7 @@ fn emit_line(
     // (char-offset table, wrap call, a fresh `String` per run per visual row)
     // is what a *wrapped* line needs; paying it for every line of a code or
     // log pane was most of the remaining layout cost.
-    if line.is_ascii() && line.len() as f32 * adv <= p.col_w {
+    if content.is_ascii() && content.len() as f32 * adv <= p.col_w {
         if visible(y) {
             let baseline = (y + (p.line_h - m.height()) / 2.0 + m.ascent).round();
             let mut pen = p.x0;
@@ -811,7 +819,7 @@ fn emit_line(
         acc += text.chars().count();
         offsets.push(acc);
     }
-    for (s, e) in text::wrap_ranges(ctx.fonts, style, p.size, line, p.col_w) {
+    for (s, e) in text::wrap_ranges(ctx.fonts, style, p.size, content, p.col_w) {
         if visible(y) {
             let baseline = (y + (p.line_h - m.height()) / 2.0 + m.ascent).round();
             let mut pen = p.x0;
@@ -872,11 +880,12 @@ pub fn layout(buf: &Buffer, width: f32, ctx: &Ctx, kind: Kind, code_lang: &str) 
             ctx,
             &p,
             adv,
-            &line,
-            runs,
-            y,
-            f32::NEG_INFINITY,
-            f32::INFINITY,
+            TintedLine {
+                text: &line,
+                runs,
+                y,
+            },
+            f32::NEG_INFINITY..f32::INFINITY,
         );
     }
     DisplayList::new(ops, y + p.pad, Vec::new())
@@ -1061,8 +1070,7 @@ mod band_tests {
             &c,
             Kind::Code,
             "rs",
-            f32::NEG_INFINITY,
-            f32::INFINITY,
+            f32::NEG_INFINITY..f32::INFINITY,
         );
         assert!((band.height - full.height).abs() < 0.5);
         assert_eq!(
@@ -1084,7 +1092,7 @@ mod band_tests {
         let top = plan.rows.top(600);
         // A band wholly inside the comment: lines 600-614, well before the
         // `*/` at 620.
-        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, plan.rows.top(615));
+        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..plan.rows.top(615));
         assert!(!band.ops.is_empty());
         for op in &band.ops {
             if let DrawOp::Text { color, text, .. } = op {
@@ -1093,7 +1101,7 @@ mod band_tests {
         }
         // And the code below the comment still tints as code, not comment.
         let top = plan.rows.top(650);
-        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, top + 400.0);
+        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..top + 400.0);
         assert!(
             band.ops
                 .iter()
@@ -1114,7 +1122,7 @@ mod band_tests {
         let all: Vec<String> = full.ops.iter().map(text_of).collect();
         for top in [0.0, 300.0, 2_500.0, plan.rows.height() - 500.0] {
             let bottom = top + 700.0;
-            let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, bottom);
+            let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..bottom);
             let mut seen = 0;
             for op in &band.ops {
                 let s = text_of(op);
@@ -1165,10 +1173,10 @@ mod band_tests {
         // over the same rows.
         let top = plan.rows.top(650);
         let bottom = plan.rows.top(700);
-        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, bottom);
+        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..bottom);
         // The patched plan's band is the fresh plan's band, op for op: every
         // row, every run and every colour, at the same y.
-        let expected = fresh.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, bottom);
+        let expected = fresh.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..bottom);
         assert_eq!(
             band.ops.iter().map(text_of).collect::<Vec<_>>(),
             expected.ops.iter().map(text_of).collect::<Vec<_>>(),
@@ -1225,8 +1233,8 @@ mod band_tests {
             (lazy.rows.top(300), lazy.rows.top(360)),
             (lazy.rows.top(700), lazy.rows.top(760)),
         ] {
-            let band_eager = eager.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, bottom);
-            let band_lazy = lazy.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, bottom);
+            let band_eager = eager.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..bottom);
+            let band_lazy = lazy.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..bottom);
             assert_eq!(
                 band_eager.ops, band_lazy.ops,
                 "eager and lazy bands disagree over [{top:.0}, {bottom:.0})"
@@ -1296,8 +1304,8 @@ mod band_tests {
         // A band deep below still paints exactly the fresh plan's band.
         let top = plan.rows.top(700);
         let bottom = plan.rows.top(760);
-        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, bottom);
-        let want = fresh.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top, bottom);
+        let band = plan.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..bottom);
+        let want = fresh.layout_band(&buf, 900.0, &c, Kind::Code, "rs", top..bottom);
         assert_eq!(band.ops, want.ops, "band deep below the state change");
     }
 }

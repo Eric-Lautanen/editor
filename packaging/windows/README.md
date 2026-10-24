@@ -40,14 +40,21 @@ Two supported shapes:
   hung on the first one's single-instance mutex, while the process it left in
   the transaction could hold a file the install wanted to replace — which is
   how an update ends in a scheduled restart (a real reboot, seen once). The
-  updater now owns it, as one `cmd` line: `msiexec /i <msi> /passive
-  REBOOT=ReallySuppress & start "" <installed exe>`. `cmd` waits for msiexec,
-  so the window comes back after the install exits, once, argument-less into
-  the saved session; `REBOOT=ReallySuppress` means no update can reboot the
-  machine. Windows Installer alone does *not* relaunch anything: Restart
-  Manager closes the window whose exe it must replace and leaves it closed
-  (measured: a `/qn` install over a running Editor ended with no Editor at
-  all), which is why the updater does it. A manual wizard install and a
+  updater now owns it, from a staged `install.bat` that: waits for the running
+  Editor to leave the process table, runs `msiexec /i <msi> /passive
+  REBOOT=ReallySuppress`, waits for the installed exe's file stamp to change
+  (msiexec returning is not the same as the new build being on disk: an
+  elevated pass is not the process the batch started and can still be
+  finishing, and reopening early starts the old build, which the upgrade then
+  closes), and only then reopens it through Explorer. Explorer is asked,
+  the process table is checked, and the request is retried; `start "" /max` is
+  the last resort, because `start` inherits a hidden console's show state and
+  would otherwise open the window invisibly. Every step lands in
+  `%APPDATA%\Editor\last-update.log`. `REBOOT=ReallySuppress` means no update
+  can reboot the machine. Windows Installer alone does *not* relaunch anything:
+  Restart Manager closes the window whose exe it must replace and leaves it
+  closed (measured: a `/qn` install over a running Editor ended with no Editor
+  at all), which is why the updater does it. A manual wizard install and a
   scripted `/qn` deploy install quietly and open nothing.
   Argument-less is deliberate: the relaunched app restores the session it saved
   on the way out, which is the last file and the window place.

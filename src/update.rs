@@ -13,7 +13,7 @@
 //!
 //! | OS | Asset | Install |
 //! |---|---|---|
-//! | Windows | `editor-<tag>-windows-x86_64.msi` | one `cmd` line: `msiexec /i <msi> /passive REBOOT=ReallySuppress & start "" <installed exe>`. The per-user MSI needs no UAC and replaces the old build; the relaunch happens after msiexec exits, from here, once — the package itself launches nothing (see `packaging/windows/editor.wxs` for why that matters) |
+//! | Windows | `editor-<tag>-windows-x86_64.msi` | a staged `install.bat`: wait for this process to exit, `msiexec /i <msi> /passive REBOOT=ReallySuppress`, wait for the installed exe's file stamp to change, then reopen it through Explorer — verified, retried, `start /max` as the last resort. The per-user MSI replaces the old build; the package itself launches nothing (see `packaging/windows/editor.wxs` for why that matters) |
 //! | Linux | `editor-<tag>-linux-x86_64.tar.gz` | unpack, rename the fresh binary over the running one (legal while it runs on Linux), relaunch |
 //! | macOS | `editor-<tag>-macos.zip` | unpack to a staging dir, remove the old `Editor.app`, move the new one into place, relaunch |
 //!
@@ -785,15 +785,16 @@ mod sha256 {
 /// major-upgrade, all without a UAC prompt (per-user MSI).
 ///
 /// Restart Manager closes the running app when the exe has to be replaced, but
-/// it does not reopen it, so the relaunch is ours: install and reopen are one
-/// `cmd` line — `msiexec` runs synchronously, `&` then starts the installed exe
-/// — which means the window comes back *after* the install has finished, and
-/// exactly once. Neither part is optional. Launching from inside the package (a
-/// deferred custom action, which this used to do) fires on every pass of the
-/// upgrade's execute sequence: two Editors came up, the second hung on the
-/// first one's single-instance mutex, and a process started mid-transaction can
-/// still hold a file the install wants to replace — which is how Windows
-/// Installer ends up scheduling a restart, i.e. rebooting the machine.
+/// it does not reopen it, so the relaunch is ours: the staged batch waits for
+/// this process to leave, installs, waits for the installed exe to be the new
+/// one, and only then opens it (see [`windows_install_script`]) — so the window
+/// comes back *after* the install has finished, and exactly once. Neither part
+/// is optional. Launching from inside the package (a deferred custom action,
+/// which this used to do) fires on every pass of the upgrade's execute
+/// sequence: two Editors came up, the second hung on the first one's
+/// single-instance mutex, and a process started mid-transaction can still hold
+/// a file the install wants to replace — which is how Windows Installer ends
+/// up scheduling a restart, i.e. rebooting the machine.
 /// `REBOOT=ReallySuppress` closes that door for good: an update may close and
 /// reopen the app, never restart the computer.
 ///
@@ -927,11 +928,19 @@ pub fn note_install_result(status: &Status) {
 /// leave the process table before installing anyway.
 const WAIT_TICKS: u32 = 120;
 
+/// How many one-second ticks the install script waits for the installer to put
+/// the new exe on disk before reopening whatever is there.
+const SETTLE_TICKS: u32 = 120;
+
+/// How many times the relaunch asks Explorer to start the app before falling
+/// back to `start`.
+const LAUNCH_TRIES: u32 = 3;
+
 /// The batch file a Windows update runs. A file, not a `cmd /c` one-liner:
-/// the wait needs `goto`, and the exit code has to be read *after* msiexec
+/// the waits need `goto`, and the exit code has to be read *after* msiexec
 /// runs — a one-liner expands `%errorlevel%` before anything starts.
 ///
-/// Three things it has to get right, each one a failed update:
+/// Four things it has to get right, each one a failed update:
 ///
 /// * **Wait for this process to exit.** An upgrade removes the old files, and
 ///   `editor.exe` is one of them; deleting an executable a live process still
@@ -939,18 +948,34 @@ const WAIT_TICKS: u32 = 120;
 ///   version.
 /// * **Record the installer's exit code**, where the next launch reads it. A
 ///   refused install and a successful one used to look identical.
-/// * **Relaunch through Explorer, not `start`.** This console is created
+/// * **Reopen the new build, not the old one.** msiexec returning is not the
+///   same thing as the new exe being on disk: the install can still be
+///   finishing in a pass the batch did not start (elevation is one way that
+///   happens), and reopening too early starts the old build, which Windows
+///   Installer then closes when it replaces the file. The update ends with the
+///   app gone and nothing on screen: no window, no new version in front of the
+///   user, and the exit code saying success. So the script takes the installed
+///   exe's file stamp before the install and waits for it to change before
+///   opening anything. The wait is bounded, and it gives up as soon as no
+///   msiexec is left, so a refused install reopens what is there instead of
+///   hanging.
+/// * **Open it visibly, and check that it opened.** This console is created
 ///   hidden (`CREATE_NO_WINDOW`), and `start` passes its show state on, which
 ///   opened the new build invisibly — then its single-instance lock kept the
-///   next double-click from showing a window either.
+///   next double-click from showing a window either. Explorer does not, so
+///   Explorer is the first choice; but a shell hand-off reports nothing when
+///   it fails, so each attempt looks for the process and retries, and
+///   `start /max` — an explicit show state, so it cannot come up hidden — is
+///   the last resort. Every attempt reaches the log.
 ///
 /// Two details are load-bearing and easy to lose in a tidy-up:
 ///
 /// * `find.exe` is named by full path. Git for Windows ships a GNU `find` and
 ///   puts its `bin` on `PATH`; a bare `find` in that environment resolves to
 ///   it, which fails on a bare number, so the loop decided on its first tick
-///   that this process was already gone — the wait was a no-op.
-/// * The wait is bounded. A PID that never leaves the table (the number was
+///   that this process was already gone — the wait was a no-op. The same path
+///   is used for the process check after the relaunch.
+/// * Both waits are bounded. A PID that never leaves the table (the number was
 ///   reused by something else) must not leave the update spinning for ever
 ///   with no window, no new version and nothing to report.
 ///
@@ -962,6 +987,10 @@ fn windows_install_script(
     result: &std::path::Path,
     log: &std::path::Path,
 ) -> String {
+    let image = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("editor.exe");
     let mut s = String::new();
     s.push_str("@echo off\r\n");
     s.push_str("set /a waited=0\r\n");
@@ -981,6 +1010,13 @@ fn windows_install_script(
     s.push_str("ping -n 2 127.0.0.1 >nul\r\n");
     s.push_str("goto wait\r\n");
     s.push_str(":install\r\n");
+    // The before picture the relaunch waits on: the installed exe's own file
+    // stamp. Nothing else on this side of the install is trustworthy evidence
+    // that the new build has landed (see the comment above).
+    s.push_str(&format!(
+        "set \"stamp=\"\r\nfor %%f in (\"{}\") do set \"stamp=%%~tf\"\r\n",
+        exe.display()
+    ));
     s.push_str(&format!(
         "msiexec /i \"{}\" /passive REBOOT=ReallySuppress\r\n",
         msi.display()
@@ -995,12 +1031,73 @@ fn windows_install_script(
         ">>\"{}\" echo msiexec exit %errorlevel%\r\n",
         log.display()
     ));
-    s.push_str(&format!("explorer.exe \"{}\"\r\n", exe.display()));
+    s.push_str("set /a settled=0\r\n");
+    s.push_str(":settle\r\n");
     s.push_str(&format!(
-        ">>\"{}\" echo relaunch: explorer {}\r\n",
+        "for %%f in (\"{}\") do if not \"%%~tf\"==\"%stamp%\" goto launch\r\n",
+        exe.display()
+    ));
+    // An installer that is gone without touching the exe was refused: reopen
+    // what is installed (the About box names the exit code next launch) rather
+    // than sit out the timeout with no window on screen.
+    s.push_str(
+        "tasklist /FI \"IMAGENAME eq msiexec.exe\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" /i \"msiexec.exe\" >nul\r\n",
+    );
+    s.push_str(&format!(
+        "if errorlevel 1 >>\"{}\" echo the installer left the exe alone; opening what is installed\r\n",
+        log.display()
+    ));
+    s.push_str("if errorlevel 1 goto launch\r\n");
+    s.push_str(&format!(
+        "if %settled% geq {SETTLE_TICKS} >>\"{}\" echo the installer was still running after {SETTLE_TICKS}s; opening the app anyway\r\n",
+        log.display()
+    ));
+    s.push_str(&format!("if %settled% geq {SETTLE_TICKS} goto launch\r\n"));
+    s.push_str("set /a settled+=1\r\n");
+    s.push_str("ping -n 2 127.0.0.1 >nul\r\n");
+    s.push_str("goto settle\r\n");
+    s.push_str(":launch\r\n");
+    // One beat first: the stamp changes when the file starts landing, and a
+    // launch that beats the copy earns an Explorer error instead of a window.
+    s.push_str("ping -n 3 127.0.0.1 >nul\r\n");
+    s.push_str("set /a tried=0\r\n");
+    s.push_str(":attempt\r\n");
+    s.push_str(&format!("explorer.exe \"{}\"\r\n", exe.display()));
+    s.push_str("set /a tried+=1\r\n");
+    s.push_str(&format!(
+        ">>\"{}\" echo relaunch attempt %tried%: explorer {}\r\n",
         log.display(),
         exe.display()
     ));
+    // Long enough for a cold start to show up in the process table; the check
+    // is what turns "explorer was asked" into "the app is running".
+    s.push_str("ping -n 4 127.0.0.1 >nul\r\n");
+    s.push_str(&format!(
+        "tasklist /FI \"IMAGENAME eq {image}\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" /i \"{image}\" >nul\r\n"
+    ));
+    s.push_str(&format!(
+        "if not errorlevel 1 >>\"{}\" echo relaunch: {image} is running\r\n",
+        log.display()
+    ));
+    s.push_str("if not errorlevel 1 goto end\r\n");
+    s.push_str(&format!(
+        ">>\"{}\" echo relaunch attempt %tried% started nothing\r\n",
+        log.display()
+    ));
+    s.push_str(&format!("if %tried% geq {LAUNCH_TRIES} goto fallback\r\n"));
+    s.push_str("goto attempt\r\n");
+    s.push_str(":fallback\r\n");
+    // The last resort: `start` would pass this hidden console's show state on,
+    // but with `/max` the app is opened with an explicit one, so a maximized
+    // window beats no window. The session's own place is not consulted here,
+    // and the log says the fallback was the route that worked.
+    s.push_str(&format!("start \"\" /max \"{}\"\r\n", exe.display()));
+    s.push_str(&format!(
+        ">>\"{}\" echo relaunch fallback: start /max {}\r\n",
+        log.display(),
+        exe.display()
+    ));
+    s.push_str(":end\r\n");
     s
 }
 
@@ -1536,21 +1633,29 @@ mod tests {
 
     #[test]
     fn windows_install_waits_then_installs_then_relaunches() {
+        let msi =
+            r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi";
+        let exe = r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe";
+        let result = r"C:\Users\me\AppData\Roaming\Editor\last-install.txt";
+        let log = r"C:\Users\me\AppData\Roaming\Editor\last-update.log";
         let script = windows_install_script(
-            std::path::Path::new(
-                r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi",
-            ),
-            std::path::Path::new(r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe"),
+            std::path::Path::new(msi),
+            std::path::Path::new(exe),
             4321,
-            std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-install.txt"),
-            std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-update.log"),
+            std::path::Path::new(result),
+            std::path::Path::new(log),
         );
-        // The installer must install, then open the app exactly once.
+        // The installer must install, then open the app once it is the new
+        // build — never before, or the window it opens is the one the upgrade
+        // is about to close.
         let install = script.find("msiexec /i \"").expect("installer line");
-        let launch = script.find("explorer.exe \"").expect("relaunch line");
+        let launch = script.find(":launch\r\n").expect("the launch stage");
+        let explorer_line = script
+            .find(&format!("explorer.exe \"{exe}\""))
+            .expect("relaunch line");
         assert!(install < launch, "both present, install first");
+        assert!(launch < explorer_line, "and the launch stage opens the app");
         assert_eq!(script.matches("msiexec /i ").count(), 1);
-        assert_eq!(script.matches("explorer.exe").count(), 1);
         // An update may close and reopen the app; it may never restart the box.
         assert!(script.contains("/passive"));
         assert!(script.contains("REBOOT=ReallySuppress"));
@@ -1578,23 +1683,6 @@ mod tests {
             script.contains("still running after 120s, installing anyway"),
             "the timeout is logged, not just tolerated"
         );
-        // The batch outlives this process, so it writes the trail itself:
-        // the msiexec outcome and the relaunch attempt land in the log.
-        let outcome_into_log = script
-            .find(r#">"C:\Users\me\AppData\Roaming\Editor\last-update.log" echo msiexec exit"#)
-            .expect("the batch logs msiexec's exit");
-        assert!(outcome_into_log > install, "after the installer runs");
-        assert_eq!(
-            script.matches("last-update.log").count(),
-            3,
-            "timeout, msiexec outcome and relaunch all reach the log"
-        );
-        let relaunch_log = script.find("echo relaunch:").expect("logs the relaunch");
-        let explorer_line = script.find("explorer.exe \"").expect("relaunch line");
-        assert!(
-            explorer_line < relaunch_log,
-            "the relaunch is logged after it is attempted"
-        );
         // Bounded, so a reused PID cannot spin here for ever.
         let cap = script.find("if %waited% geq").expect("a bound on the wait");
         assert!(cap < install, "and it is checked before the install");
@@ -1606,16 +1694,68 @@ mod tests {
             .find("echo %errorlevel%")
             .expect("records the result");
         assert!(echo > install, "after the installer runs");
-        assert!(script.contains("last-install.txt"));
         // `echo %errorlevel%>file` turns into `echo 0>file` on success, and cmd
         // reads that `0` as a stream number — the result went missing.
         assert!(
-            script.contains(">\"C:\\Users\\me\\AppData\\Roaming\\Editor\\last-install.txt\" echo"),
+            script.contains(&format!(">\"{result}\" echo")),
             "redirection first, so the code cannot be read as a stream number"
         );
 
-        // `start` would inherit this hidden console's show state.
-        assert!(!script.contains("start \"\""));
+        // msiexec exiting is not the new build being on disk: the script takes
+        // the installed exe's stamp before the install and waits for it to
+        // change, which is what an early-returning (elevated, handed-off)
+        // install leaves behind.
+        let stamp = script
+            .find(&format!("for %%f in (\"{exe}\") do set \"stamp=%%~tf\""))
+            .expect("captures the installed exe's stamp");
+        assert!(stamp < install, "the stamp is the before picture");
+        assert!(
+            script.contains(&format!(
+                "for %%f in (\"{exe}\") do if not \"%%~tf\"==\"%stamp%\" goto launch"
+            )),
+            "the new build is waited for, not assumed"
+        );
+        // And the wait cannot outlive an installer that is already gone: a
+        // refused install opens what is installed and leaves the code to the
+        // next launch's notice instead of leaving the screen empty.
+        assert!(script.contains("IMAGENAME eq msiexec.exe"));
+        assert!(script.contains("left the exe alone; opening what is installed"));
+        assert!(script.contains("still running after 120s; opening the app anyway"));
+
+        // A shell hand-off reports nothing when it fails, so each attempt is
+        // verified against the process table and retried; `start` is the last
+        // resort, and `/max` gives it an explicit show state.
+        assert!(script.contains("IMAGENAME eq editor.exe"));
+        assert!(script.contains("if not errorlevel 1 goto end"));
+        assert!(script.contains(&format!("if %tried% geq {LAUNCH_TRIES} goto fallback")));
+        assert!(script.contains(&format!("start \"\" /max \"{exe}\"")));
+        assert_eq!(
+            script.matches("start \"\"").count(),
+            1,
+            "start is the last resort, never the first choice"
+        );
+
+        // The batch outlives this process, so it writes the trail itself, and
+        // every path through the tail of the update says what it did.
+        for line in [
+            "echo msiexec exit %errorlevel%",
+            "echo relaunch attempt %tried%: explorer",
+            "echo relaunch: editor.exe is running",
+            "echo relaunch attempt %tried% started nothing",
+            "echo relaunch fallback: start /max",
+        ] {
+            assert!(
+                script.contains(&format!(">>\"{log}\" {line}")),
+                "missing from the trail: {line}"
+            );
+        }
+        let relaunch_log = script
+            .find("echo relaunch attempt")
+            .expect("logs the attempt");
+        assert!(
+            explorer_line < relaunch_log,
+            "the relaunch is logged after it is attempted"
+        );
     }
 
     #[test]

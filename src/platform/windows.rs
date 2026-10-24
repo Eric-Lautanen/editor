@@ -931,7 +931,14 @@ fn velocity(samples: &[TouchSample]) -> (f32, f32) {
     }
     let vx = (n * stx - st * sx) / denom;
     let vy = (n * sty - st * sy) / denom;
-    ttrace!("[touch] velocity: n={} span_ms={:.1} -> vx={vx:.3} vy={vy:.3}", n, samples.last().map(|s| s.t.duration_since(t0).as_secs_f32() * 1000.0).unwrap_or(0.0));
+    ttrace!(
+        "[touch] velocity: n={} span_ms={:.1} -> vx={vx:.3} vy={vy:.3}",
+        n,
+        samples
+            .last()
+            .map(|s| s.t.duration_since(t0).as_secs_f32() * 1000.0)
+            .unwrap_or(0.0)
+    );
     (vx, vy)
 }
 
@@ -1876,7 +1883,14 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                     screen_to_client(hwnd, &mut pt);
                     let (x, y) = (pt.x as f32, pt.y as f32);
                     let now = Instant::now();
-                    if touch_trace() { touch_log(format!("[touch] WM_TOUCH contact action={:?} at=({x},{y})", touch_action(t.flags), x = x, y = y)); }
+                    if touch_trace() {
+                        touch_log(format!(
+                            "[touch] WM_TOUCH contact action={:?} at=({x},{y})",
+                            touch_action(t.flags),
+                            x = x,
+                            y = y
+                        ));
+                    }
                     if touch_action(t.flags) == TouchAction::Down && st.touch.is_none() {
                         st.touch = Some((x, y));
                         st.touch_travel = 0.0;
@@ -1886,7 +1900,10 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                         if let Some((lx, ly)) = st.touch {
                             let (dx, dy) = (x - lx, y - ly);
                             st.touch_travel += dx.abs() + dy.abs();
-                            ttrace!("[touch] move dx={dx:.1} dy={dy:.1} hist={}", st.touch_history.len());
+                            ttrace!(
+                                "[touch] move dx={dx:.1} dy={dy:.1} hist={}",
+                                st.touch_history.len()
+                            );
                             if dx != 0.0 || dy != 0.0 {
                                 // A finger is direct manipulation: `Pan`, not a
                                 // wheel-like step the app may glide to.
@@ -1905,7 +1922,12 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                         // nothing. Clear the history too, so a stray second
                         // `Up` cannot report a stale gesture.
                         let (vx, vy) = velocity(&st.touch_history);
-                        ttrace!("[touch] LIFT: vx={vx:.3} vy={vy:.3} travel={:.0} promoted={} hist={}", st.touch_travel, st.touch_promoted, st.touch_history.len());
+                        ttrace!(
+                            "[touch] LIFT: vx={vx:.3} vy={vy:.3} travel={:.0} promoted={} hist={}",
+                            st.touch_travel,
+                            st.touch_promoted,
+                            st.touch_history.len()
+                        );
                         st.touch_history.clear();
                         dispatch(st, hwnd, Event::PanEnd { vx, vy });
                         // A tap's promoted click was swallowed above, so issue

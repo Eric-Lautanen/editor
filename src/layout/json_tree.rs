@@ -1218,6 +1218,18 @@ pub struct ValuePlan {
     pub ids: u32,
 }
 
+/// The one node [`ValuePlan::patch_node`] replaces: its slot, its new value,
+/// and the three things the walk that built the plan was handed for it (its
+/// key or index prefix, its depth, and whether a comma follows it) — see
+/// [`head_for`].
+pub struct NodePatch<'a> {
+    pub slot: usize,
+    pub value: &'a Value,
+    pub head: &'a str,
+    pub indent: usize,
+    pub trailing_comma: bool,
+}
+
 impl ValuePlan {
     /// Whether this plan is worth virtualizing: a tree this deep has more rows
     /// than any window shows, so laying it all out to paint one screenful is
@@ -1229,29 +1241,26 @@ impl ValuePlan {
     /// Replace one node's block — its slot and everything under it — with a
     /// plan of that node as it now parses, and move everything below it.
     ///
-    /// `start` is the node's slot and `v` its new value; `head`, `indent` and
-    /// `trailing_comma` are the three things the walk that built the plan was
-    /// handed for it (its key or index prefix, its depth, and whether a comma
-    /// follows it) — see [`head_for`].
-    ///
     /// Only the node is measured. Its ancestors keep their slots and their
     /// subtree keeps its slots, so the work is one subtree's rows, and the
     /// index a patched plan holds is the index a full walk of the edited tree
     /// would give: positions, spans, node counts and toggle ids all included.
     /// Returns false when the node cannot be located, which the caller answers
     /// by rebuilding.
-    #[allow(clippy::too_many_arguments)]
     pub fn patch_node(
         &mut self,
-        start: usize,
-        v: &Value,
-        head: &str,
-        indent: usize,
-        trailing_comma: bool,
+        node: NodePatch<'_>,
         collapsed: &HashSet<usize>,
         width: f32,
         ctx: &Ctx,
     ) -> bool {
+        let NodePatch {
+            slot: start,
+            value: v,
+            head,
+            indent,
+            trailing_comma,
+        } = node;
         let Some(old) = self.slots.get(start).copied() else {
             return false;
         };
@@ -1425,6 +1434,16 @@ struct Planner<'a> {
     emit: bool,
 }
 
+/// A container's own rows — its opener, its empty form and its closer — and
+/// whether it is an object with `len` fields or an array with `len` items.
+struct Shape<'a> {
+    is_obj: bool,
+    len: usize,
+    open: &'a str,
+    empty: &'a str,
+    close: &'a str,
+}
+
 impl Planner<'_> {
     /// Plan the node `v` — whose `head` already carries its key or index —
     /// into a fresh slot, then everything under it.
@@ -1448,11 +1467,13 @@ impl Planner<'_> {
                 indent,
                 head,
                 trailing_comma,
-                true,
-                pairs.len(),
-                "v {",
-                "{}",
-                "}",
+                Shape {
+                    is_obj: true,
+                    len: pairs.len(),
+                    open: "v {",
+                    empty: "{}",
+                    close: "}",
+                },
             ),
             Value::Array(items) => self.container(
                 v,
@@ -1460,11 +1481,13 @@ impl Planner<'_> {
                 indent,
                 head,
                 trailing_comma,
-                false,
-                items.len(),
-                "v [",
-                "[]",
-                "]",
+                Shape {
+                    is_obj: false,
+                    len: items.len(),
+                    open: "v [",
+                    empty: "[]",
+                    close: "]",
+                },
             ),
             Value::Null => self.row(indent, head, "null", trailing_comma),
             Value::Bool(true) => self.row(indent, head, "true", trailing_comma),
@@ -1498,7 +1521,6 @@ impl Planner<'_> {
     /// Plan a container: an empty one is a single row, a collapsed one shows
     /// its summary row and walks its children silently, an open one is an
     /// opener row, its children, and a closing row.
-    #[allow(clippy::too_many_arguments)]
     fn container(
         &mut self,
         v: &Value,
@@ -1506,14 +1528,17 @@ impl Planner<'_> {
         indent: usize,
         head: &str,
         trailing_comma: bool,
-        is_obj: bool,
-        len: usize,
-        open_row: &str,
-        empty_row: &str,
-        close: &str,
+        shape: Shape<'_>,
     ) {
+        let Shape {
+            is_obj,
+            len,
+            open,
+            empty,
+            close,
+        } = shape;
         if len == 0 {
-            self.row(indent, head, empty_row, trailing_comma);
+            self.row(indent, head, empty, trailing_comma);
             return;
         }
         // Ids are handed out in walk order, so they match a full layout's ids
@@ -1541,7 +1566,7 @@ impl Planner<'_> {
             self.emit = emit;
             return;
         }
-        self.row(indent, head, open_row, false);
+        self.row(indent, head, open, false);
         self.children(v, indent);
         self.row(indent, "", close, trailing_comma);
     }
@@ -1850,10 +1875,18 @@ impl Doc {
                     other => other.to_string(),
                 };
                 let broken = Value::Broken(msg.clone());
-                if !self
-                    .plan
-                    .patch_node(slot, &broken, &head, indent, comma, collapsed, width, ctx)
-                {
+                if !self.plan.patch_node(
+                    NodePatch {
+                        slot,
+                        value: &broken,
+                        head: &head,
+                        indent,
+                        trailing_comma: comma,
+                    },
+                    collapsed,
+                    width,
+                    ctx,
+                ) {
                     return false;
                 }
                 if self.plan.slots.len() != self.spans.len() - old_block + 1 {
@@ -1875,10 +1908,18 @@ impl Doc {
                 return true;
             }
         };
-        if !self
-            .plan
-            .patch_node(slot, &value, &head, indent, comma, collapsed, width, ctx)
-        {
+        if !self.plan.patch_node(
+            NodePatch {
+                slot,
+                value: &value,
+                head: &head,
+                indent,
+                trailing_comma: comma,
+            },
+            collapsed,
+            width,
+            ctx,
+        ) {
             return false;
         }
         // The re-parse's own ranges, moved onto the document's offsets. A
@@ -2610,7 +2651,18 @@ mod tests {
             let (slot, head, indent, comma) = site(&value, &plan, path);
             let new = crate::parse::json::parser::parse(replacement).unwrap();
             assert!(
-                plan.patch_node(slot, &new, &head, indent, comma, &collapsed, width, &c),
+                plan.patch_node(
+                    NodePatch {
+                        slot,
+                        value: &new,
+                        head: &head,
+                        indent,
+                        trailing_comma: comma,
+                    },
+                    &collapsed,
+                    width,
+                    &c,
+                ),
                 "{what}: the patch was refused"
             );
             *value.get_mut_at(path).expect("the node exists") = new;
@@ -2653,11 +2705,33 @@ mod tests {
         let (value, _) = crate::parse::json::parser::parse_spanned("[1, 2, 3]").unwrap();
         let mut plan = build_value_plan(&value, &collapsed, 800.0, &c);
         let one = crate::parse::json::parser::parse("9").unwrap();
-        assert!(!plan.patch_node(99, &one, "", 1, false, &collapsed, 800.0, &c));
+        assert!(!plan.patch_node(
+            NodePatch {
+                slot: 99,
+                value: &one,
+                head: "",
+                indent: 1,
+                trailing_comma: false,
+            },
+            &collapsed,
+            800.0,
+            &c
+        ));
         // The last slot's `next` is the slot past it, so its own block is one
         // slot: patching it is still fine.
         let last = plan.slots.len() - 1;
-        assert!(plan.patch_node(last, &one, "3: ", 1, false, &collapsed, 800.0, &c));
+        assert!(plan.patch_node(
+            NodePatch {
+                slot: last,
+                value: &one,
+                head: "3: ",
+                indent: 1,
+                trailing_comma: false,
+            },
+            &collapsed,
+            800.0,
+            &c
+        ));
         assert_eq!(plan.slots.len(), 4);
     }
 
