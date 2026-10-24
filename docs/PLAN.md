@@ -1911,6 +1911,20 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   stamp capture/gate, the msiexec-presence escape, the verification banner and
   the fallback in `windows_install_waits_then_installs_then_relaunches`.
 
+- **End-to-end (0.2.9)**: the real hop, not a stand-in — 0.2.7 installed from
+  the shipped msi, a locally built 0.2.9 msi served as `v0.2.9` over loopback
+  through `EDITOR_UPDATE_API`, its consent box accepted — installs the new
+  build and reopens it: `msiexec exit 0`, `relaunch attempt 1: explorer …`,
+  `relaunch: editor.exe is running`, and the relaunched 0.2.9 writes
+  `the next launch read the install result: 0` into `last-update.log`. The hop
+  also exposed what the stand-in could not: the settle loop asked `tasklist`
+  for *any* `msiexec.exe`, and the Windows Installer service is a permanent
+  session-0 one, so a refused install never took the "installer left the exe
+  alone" escape and sat out the whole 120-tick timeout — about two minutes of
+  no window — before reopening what was always going to be the old build. That
+  check is now scoped to this session (`SESSIONNAME`), and the script test pins
+  the filter.
+
 
 ## Remaining responsiveness work
 

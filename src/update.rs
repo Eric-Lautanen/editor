@@ -1047,8 +1047,16 @@ fn windows_install_script(
     // An installer that is gone without touching the exe was refused: reopen
     // what is installed (the About box names the exit code next launch) rather
     // than sit out the timeout with no window on screen.
+    //
+    // Scoped to this session on purpose. `msiexec.exe` is not only the install
+    // pass: the Windows Installer *service* is a permanent session-0 msiexec
+    // that outlives every install, so an unfiltered image-name match answers
+    // "an installer is still running" for the whole 120-tick timeout even
+    // after the msi came back and changed nothing — two minutes of no window
+    // for an install that already knows it failed. The pass this wait is about
+    // runs in the session that started it, so match that.
     s.push_str(
-        "tasklist /FI \"IMAGENAME eq msiexec.exe\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" /i \"msiexec.exe\" >nul\r\n",
+        "tasklist /FI \"IMAGENAME eq msiexec.exe\" /FI \"SESSIONNAME eq %SESSIONNAME%\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" /i \"msiexec.exe\" >nul\r\n",
     );
     s.push_str(&format!(
         "if errorlevel 1 >>\"{}\" echo the installer left the exe alone; opening what is installed\r\n",
@@ -1726,6 +1734,10 @@ mod tests {
         // refused install opens what is installed and leaves the code to the
         // next launch's notice instead of leaving the screen empty.
         assert!(script.contains("IMAGENAME eq msiexec.exe"));
+        // Matching the image name alone would find the Windows Installer
+        // service, which runs in session 0 and never goes away, so the escape
+        // below would never fire.
+        assert!(script.contains("/FI \"SESSIONNAME eq %SESSIONNAME%\""));
         assert!(script.contains("left the exe alone; opening what is installed"));
         assert!(script.contains("still running after 120s; opening the app anyway"));
 
