@@ -433,6 +433,12 @@ fn payload_dir(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{PAYLOAD_PREFIX}{tag}"))
 }
 
+/// The uninstall hook's sweep, named so a test can drive it: it must keep the
+/// age gate (see [`clean_payloads`]), and nothing else pins that.
+fn sweep_for_uninstall(root: &std::path::Path) -> usize {
+    sweep_in(root, PAYLOAD_MIN_AGE)
+}
+
 /// Delete payload directories under `root` older than `min_age`; returns how
 /// many went away. Only directories this app names are touched — a shared
 /// temp dir holds plenty that is not ours.
@@ -475,16 +481,29 @@ pub fn sweep_stale_payloads() -> usize {
     sweep_in(&std::env::temp_dir(), PAYLOAD_MIN_AGE)
 }
 
-/// Remove every staged payload, whatever its age, plus the sidecar a failed
-/// Linux swap can leave next to the binary. `--uninstall` and the installer's
-/// uninstall step both call this: removing the app has to mean the megabytes
-/// it downloaded, not just its exe.
+/// Remove every staged payload — bar one that may still be in flight — plus
+/// the sidecar a failed Linux swap can leave next to the binary. `--uninstall`
+/// and the installer's uninstall step both call this: removing the app has to
+/// mean the megabytes it downloaded, not just its exe.
+///
+/// **The age gate is not tidiness, it is the update path.** A major upgrade
+/// removes the old product inside the new one's transaction, and this
+/// package's uninstall step runs the *old* exe with `--uninstall` to do it. If
+/// that call swept the staging directory with no age limit, it deleted the
+/// very payload the update was installing from — the staged `install.bat` and
+/// its msi — while the batch was still running out of it. cmd re-reads a batch
+/// line by line, so a deleted script stops executing mid-way: no `msiexec`
+/// exit code, no relaunch, no log line after the handoff. (Measured: an update
+/// from 0.2.10 to 0.2.11 ended with the payload directory gone, the installed
+/// exe untouched and the log stopping at "install.bat staged in …".) A
+/// payload younger than [`PAYLOAD_MIN_AGE`] is therefore left for the next
+/// launch's sweep, which is where cleanup belongs.
 ///
 /// Settings, session state and crash reports live in the config dir and are
 /// deliberately *not* touched — they are the user's, and a reinstall should
 /// find the window where it was left.
 pub fn clean_payloads() -> usize {
-    let gone = sweep_in(&std::env::temp_dir(), std::time::Duration::ZERO);
+    let gone = sweep_for_uninstall(&std::env::temp_dir());
     if let Ok(me) = std::env::current_exe() {
         let _ = std::fs::remove_file(me.with_extension("update-new"));
     }
@@ -1509,9 +1528,12 @@ mod tests {
         assert_eq!(sweep_in(&root, PAYLOAD_MIN_AGE), 0);
         assert!(root.join("editor-update-v0.0.3").exists());
 
-        // `clean_payloads` (the uninstall hook) ignores age by construction.
-        assert_eq!(sweep_in(&root, std::time::Duration::ZERO), 1);
-        assert!(!root.join("editor-update-v0.0.3").exists());
+        // The uninstall hook keeps that gate too. It used to sweep everything,
+        // and a major upgrade runs the outgoing build's `--uninstall` from
+        // inside the new install's transaction — with the update in flight
+        // staged in this very directory, its batch still reading it.
+        assert_eq!(sweep_for_uninstall(&root), 0);
+        assert!(root.join("editor-update-v0.0.3").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1896,6 +1918,66 @@ mod tests {
         assert!(
             wxs.contains("Property=\"LAUNCHAPP\""),
             "the completion page has the box that gates it"
+        );
+        // An in-app update runs `msiexec /passive`: a progress bar, no pages,
+        // so nothing publishes the launch above and the hop ended with the app
+        // closed. The package owns that relaunch too, from the sequence, once,
+        // after the transaction, and only where there is no page to ask.
+        let start = wxs
+            .find("Id=\"LaunchEditorPassive\"")
+            .expect("the unattended install's launch action");
+        let end = wxs[start..].find("/>").expect("the action element ends");
+        let passive = &wxs[start..start + end];
+        assert!(
+            passive.contains("Execute=\"immediate\"") && passive.contains("Return=\"asyncNoWait\""),
+            "the unattended launch must sit outside the transaction too: {passive}"
+        );
+        // After `InstallFinalize` there is no file costing and no directory
+        // state left, so `FileRef` and `Directory` both fail there (2753 and
+        // 1631, both measured). Only a property carrying the path survives.
+        assert!(
+            passive.contains("Property=\"EDITOR_LAUNCH\"") && !passive.contains("FileRef="),
+            "the launch has to name a property, not a file or directory: {passive}"
+        );
+        assert!(
+            wxs.contains("Value=\"[INSTALLFOLDER]editor.exe\""),
+            "the property the launch runs is the installed exe"
+        );
+        // `UILevel >= 3` and not `= 4`: an elevated `/passive` runs its execute
+        // sequence in the service, where Windows Installer logs `UILevel = 3`
+        // (measured), so `= 4` never matched the one path this exists for.
+        // Silent `/qn` logs 2. `REBOOT=ReallySuppress` is what the updaters
+        // already pass, including the ones that shipped before this action.
+        assert!(
+            wxs.contains(
+                "<Custom Action=\"LaunchTargetPath\" After=\"InstallFinalize\" \
+                 Condition=\"UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot;\""
+            ),
+            "passive installs launched by the updater relaunch, silent deploys do not"
+        );
+        assert!(
+            wxs.contains("<Custom Action=\"LaunchEditorPassive\" After=\"LaunchTargetPath\""),
+            "the path is set before it is launched"
+        );
+        // WiX writes the Dialog table's Minimize attribute by default; a dialog
+        // carrying it is what the user saw reported as "the install options
+        // start minimized". Both pages they interact with must say no.
+        for dialog in ["EditorWelcomeDlg", "EditorDoneDlg"] {
+            let at = wxs.find(&format!("Id=\"{dialog}\"")).expect("the dialog");
+            let body = &wxs[at..wxs[at..].find('>').expect("the element ends") + at];
+            assert!(
+                body.contains("NoMinimize=\"yes\""),
+                "{dialog} must not be shown minimized: {body}"
+            );
+        }
+        // The old product's uninstall step is what deleted the update's own
+        // payload during a major upgrade; the upgrade must not run it.
+        assert!(
+            wxs.contains(
+                "<Custom Action=\"UnregisterOnUninstall\" Before=\"RemoveFiles\" \
+                         Condition=\"REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE\""
+            ),
+            "an upgrade must not run the outgoing build's uninstall sweep"
         );
     }
 }

@@ -11,8 +11,9 @@ Two supported shapes:
   when Finish is pressed. Every box is ticked by
   default and each one owns a feature — `DocumentTypes`, `CodeTypes`,
   `DesktopShortcutFeature` — so the state of a checkbox is the state of that
-  group, and a silent run (from `editor --update` → `msiexec /passive`) runs no
-  UI and lands on the same three defaults. Either way the install
+  group. A silent `/qn` run shows no UI and lands on the same three defaults; an
+  `editor --update` run (`msiexec /passive`) shows a progress bar and reopens
+  the app afterwards without asking (see below). Either way the install
   major-upgrades any previous MSI in place, and the Start menu entry is not
   optional: it is how an app is expected to be reachable afterwards. Per-user is the preferred scope
   (`Scope="perUser"` plus `ALLUSERS=2` / `MSIINSTALLPERUSER=1`), so a standard
@@ -34,51 +35,82 @@ Two supported shapes:
   updater installs often, so the checkpoint bought nothing a re-run of the MSI
   does not; drop the property (or set it to 0) to get it back.
 
-  An update ends with the app running again — but that relaunch is **not** in
-  this package. It started there (`RestartEditor`, a deferred `asyncNoWait`
-  action before `InstallFinalize`) and had to be removed: a major upgrade runs
-  the execute sequence twice, so the action fired twice and the second Editor
-  hung on the first one's single-instance mutex, while the process it left in
-  the transaction could hold a file the install wanted to replace — which is
-  how an update ends in a scheduled restart (a real reboot, seen once). The
-  updater now owns it, from a staged `install.bat` that: waits for the running
-  Editor to leave the process table, runs `msiexec /i <msi> /passive
+  An update ends with the app running again, and **two** things can open it.
+
+  The updater stages an `install.bat` that: waits for the running Editor to
+  leave the process table, runs `msiexec /i <msi> /passive
   REBOOT=ReallySuppress`, waits for the installed exe's file stamp to change
   (msiexec returning is not the same as the new build being on disk: an
   elevated pass is not the process the batch started and can still be
   finishing, and reopening early starts the old build, which the upgrade then
-  closes), and only then reopens it through Explorer. Explorer is asked,
-  the process table is checked, and the request is retried; `start "" /max` is
-  the last resort, because `start` inherits a hidden console's show state and
-  would otherwise open the window invisibly. Every step lands in
+  closes), and only then reopens it through Explorer. Explorer is asked, the
+  process table is checked, and the request is retried; `start "" /max` is the
+  last resort, because `start` inherits a hidden console's show state and would
+  otherwise open the window invisibly. Every step lands in
   `%APPDATA%\Editor\last-update.log`. `REBOOT=ReallySuppress` means no update
-  can reboot the machine. Windows Installer alone does *not* relaunch anything:
-  Restart Manager closes the window whose exe it must replace and leaves it
-  closed (measured: a `/qn` install over a running Editor ended with no Editor
-  at all), which is why the updater does it. A scripted `/qn` or `/passive`
-  install shows no page and so opens nothing, which is what a deploy wants.
+  can reboot the machine.
 
-  A **wizard** install does open the app, from the completion page: Finish
-  publishes `LaunchEditor` (an immediate, `asyncNoWait`, impersonated action on
-  the installed exe) when the **Launch Editor** box is ticked, and the action
-  runs *after* `InstallFinalize`, outside the transaction. That placement is
-  the whole point — the earlier `RestartEditor` action was deferred and fired
-  before finalize, which is what double-launched during a major upgrade and
-  left a process holding the file during finalisation. From the finish dialog
-  it is one user-pressed action on a finished install. If an Editor is somehow
-  already running, the new process finds its single-instance mutex, hands the
-  launch over and exits, so no second window appears.
-  Argument-less is deliberate: the relaunched app restores the session it saved
-  on the way out, which is the last file and the window place.
+  The batch alone is not enough, and the reason is the outgoing build: a major
+  upgrade removes the old product from *inside* the new install's transaction,
+  and the old package's uninstall step calls `editor.exe --uninstall`, whose
+  payload sweep deletes `%TEMP%\editor-update-*` — the directory the batch is
+  running out of. cmd re-reads a batch line by line, so the handoff dies
+  silently: no exit code, no relaunch. (Measured on the 0.2.11 → 0.2.12 hop:
+  the payload directory was gone after a `/passive` install and the batch never
+  logged another line.) Two things fix it, and both are needed because an
+  installed package cannot change what the build it replaces does:
+
+  * This package skips that call during an upgrade (`NOT
+    UPGRADINGPRODUCTCODE`), so every hop *from 0.2.12 onwards* keeps the
+    batch's script, and the sweep keeps anything younger than two minutes
+    (`clean_payloads` in `src/update.rs`).
+  * It also launches the app itself, from `LaunchEditorPassive` — immediate,
+    `asyncNoWait`, sequenced after `InstallFinalize`, conditioned on
+    `UILevel >= 3 AND REBOOT="ReallySuppress"`. That is exactly what an
+    updater's `/passive` install passes and nothing else does, including the
+    updaters that shipped before this action, so the hop *into* the first
+    release that has it is rescued too. Silent (`/qn`, `UILevel = 2`) deploys
+    still open nothing. Whichever of the two relaunches comes second finds the
+    app running, hands off to it and exits.
+
+  Two placements of that action were measured and rejected, and both failures
+  are worth keeping in mind before moving it:
+
+  * **Before `InstallFinalize`** (the removed `RestartEditor`): a child process
+    inside the transaction, which is the scheduled restart this package once
+    caused, plus a second instance on the extra execute pass of an upgrade.
+  * **After `InstallFinalize` naming a `FileRef` or a `Directory`**: both fail
+    there, because the transaction took the file costing and the directory's
+    run-time state with it — `2753` ("the File 'EditorExe' is not marked for
+    installation") and `1631`. What survives is a property, so
+    `LaunchTargetPath` sets `EDITOR_LAUNCH` to `[INSTALLFOLDER]editor.exe` and
+    the launch runs that.
+
+  Windows Installer alone does *not* relaunch anything otherwise: Restart
+  Manager closes the window whose exe it must replace and leaves it closed
+  (measured: a `/qn` install over a running Editor ended with no Editor at
+  all). A double-clicked install opens the app only from the finish page's
+  tick box, argument-less on purpose: the relaunched app restores the session
+  it saved on the way out, which is the last file and the window place.
+
+  Both user-facing dialogs carry `NoMinimize`: WiX writes the Dialog table's
+  Minimize attribute by default (it is what a progress bar wants), and a
+  dialog that keeps it can be shown as a minimized taskbar window — the report
+  "the install options start minimized". The built table is
+  `EditorWelcomeDlg`/`EditorDoneDlg` `attr=3` (visible, modal), not `7`.
 
   The uninstall sequence runs `editor.exe --uninstall` (a deferred custom
-  action, `REMOVE="ALL"` only) before it removes the files. That call removes
-  the file associations the package wrote *and*, the part Windows Installer
-  cannot see, the staged update downloads under `%TEMP%`
-  (`editor-update-<tag>\` — the updater's own directory; the released 0.2.1
-  predates this and leaves its msi there). `Return="ignore"`, so a locked or
-  already-deleted exe never blocks the removal itself. User data
-  (`%APPDATA%\Editor`: settings, session, crash reports) is deliberately kept.
+  action, `REMOVE="ALL"` and `NOT UPGRADINGPRODUCTCODE`) before it removes
+  the files. That call removes the file associations the package wrote *and*,
+  the part Windows Installer cannot see, the staged update downloads under
+  `%TEMP%` (`editor-update-<tag>\` — the updater's own directory; the released
+  0.2.1 predates this and leaves its msi there). `Return="ignore"`, so a
+  locked or already-deleted exe never blocks the removal itself, and the sweep
+  keeps payloads younger than two minutes, because the update in flight *is*
+  one of them. A real uninstall still runs it; an upgrade does not, since the
+  new package writes the same associations and any payload left behind is
+  swept by the first launch of the new build. User data (`%APPDATA%\Editor`:
+  settings, session, crash reports) is deliberately kept.
 
   Build defines: `Version`, `PublishDir` (where `editor.exe` lives), `Icon`
   (`assets/icon.ico` — both shortcuts' and Add/Remove Programs' icon) and

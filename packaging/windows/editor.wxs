@@ -114,12 +114,12 @@
          A DoAction from the finish dialog is neither: it runs after
          `InstallFinalize` has completed (so no file is held during the
          transaction), it runs once per click, and it is the user's own act.
-         Silent (`/qn`) and passive (`/passive`) installs show no page and so
-         launch nothing — a deploy that opens windows on people's desktops is
-         not a deploy. The auto-updater never relies on this either: it stages
-         its own relaunch (`src/update.rs`) after `msiexec` returns, with
-         `REBOOT=ReallySuppress`, because the app it has to bring back is the
-         one whose window Windows Installer just closed. -->
+         A silent (`/qn`) install shows no page and launches nothing — a deploy
+         that opens windows on people's desktops is not a deploy. The updater's
+         `/passive` install is the other case, and it is served by the action
+         below, not by this one. The updater also stages its own relaunch
+         (`src/update.rs`) after `msiexec` returns; whichever of the two comes
+         second finds the app already running, hands off to it and exits. -->
     <CustomAction
         Id="LaunchEditor"
         FileRef="EditorExe"
@@ -127,9 +127,59 @@
         Execute="immediate"
         Impersonate="yes"
         Return="asyncNoWait" />
+    <!-- The same launch, for an unattended install that a user is watching:
+         `/passive` shows a progress bar but no dialogs, so the finish page
+         above never runs and nothing would open the app. That is exactly the
+         update path — `src/update.rs` runs `msiexec /i … /passive
+         REBOOT=ReallySuppress` and expects the new build to come up — and it
+         is also the one path where waiting for the staged batch is not enough:
+         the outgoing product's removal runs *its* uninstall step, which can
+         cost the update's batch its own script (see `clean_payloads` in
+         `src/update.rs`), and this action still runs because it belongs to the
+         new package. Scheduled after `InstallFinalize` so the files are final
+         and the process holds nothing the transaction needs.
+
+         `REBOOT=ReallySuppress` is the signal, and the *old* updaters already
+         pass it, so this also rescues the hop that installed this version.
+         `UILevel` is checked with `>= 3`, not `= 4`: an elevated install runs
+         its execute sequence in the service, where a `/passive` install logs
+         `UILevel = 3` (measured), so `= 4` never matched the path this exists
+         for — the action was skipped twice over. `>= 3` excludes `/qn`, which
+         logs `UILevel = 2`, so a silent deploy still opens nothing. A
+         second instance is harmless: the app hands off to the running one and
+         exits. -->
+    <!-- Two kinds of custom action the launch cannot use, both measured in
+         this package's own log rather than guessed:
+           * `FileRef` after `InstallFinalize` fails 2753, "the File
+             'EditorExe' is not marked for installation": the file costing is
+             over once the transaction commits.
+           * `Directory` fails 1631 for the same reason — the directory's
+             run-time state is gone with it.
+         What survives finalisation is the property holding the install path,
+         so the action sets that first and launches it by name. -->
+    <CustomAction
+        Id="LaunchTargetPath"
+        Property="EDITOR_LAUNCH"
+        Value="[INSTALLFOLDER]editor.exe"
+        Execute="immediate" />
+    <CustomAction
+        Id="LaunchEditorPassive"
+        Property="EDITOR_LAUNCH"
+        ExeCommand=""
+        Execute="immediate"
+        Impersonate="yes"
+        Return="asyncNoWait" />
     <InstallExecuteSequence>
       <RemoveExistingProducts After="InstallInitialize" />
-      <Custom Action="UnregisterOnUninstall" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <!-- NOT UPGRADINGPRODUCTCODE: a major upgrade removes the old product
+           inside the new one's transaction, and this step is what deleted the
+           update's own staging directory out from under the running batch
+           (see `clean_payloads` in `src/update.rs`). A real uninstall still
+           runs it; an upgrade does not need it, because the new package writes
+           the same associations and its first launch sweeps the payload. -->
+      <Custom Action="UnregisterOnUninstall" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="LaunchTargetPath" After="InstallFinalize" Condition="UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot;" />
+      <Custom Action="LaunchEditorPassive" After="LaunchTargetPath" Condition="UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot;" />
     </InstallExecuteSequence>
 
     <!-- Per-user preferred, stated rather than implied: ALLUSERS=2 with
@@ -271,7 +321,18 @@
     <Property Id="LAUNCHAPP" Value="1" />
     <UI Id="EditorOnePageUi">
       <TextStyle Id="EditorBody" FaceName="Segoe UI" Size="9" />
-      <Dialog Id="EditorWelcomeDlg" Width="370" Height="270" Title="Install Editor">
+      <!-- `NoMinimize`: WiX writes the Dialog table's Minimize attribute by
+           default (the stock progress bar wants it), and a dialog that carries
+           it is shown in the taskbar as a minimized window — the report
+           "install options starts minimized", which is this page. Both pages
+           the user actually interacts with say no; ErrorDlg/UserExit keep the
+           default. -->
+      <Dialog
+          Id="EditorWelcomeDlg"
+          Width="370"
+          Height="270"
+          Title="Install Editor"
+          NoMinimize="yes">
         <Control Id="AppIcon" Type="Icon" X="18" Y="10" Width="32" Height="32" Text="editor_setup.ico" />
         <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Install Editor" />
         <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Native viewer and editor for Markdown, JSON, CSV, logs and code." />
@@ -311,7 +372,12 @@
           <Publish Event="EndDialog" Value="Exit" />
         </Control>
       </Dialog>
-      <Dialog Id="EditorDoneDlg" Width="370" Height="270" Title="Editor Setup Complete">
+      <Dialog
+          Id="EditorDoneDlg"
+          Width="370"
+          Height="270"
+          Title="Editor Setup Complete"
+          NoMinimize="yes">
         <Control Id="AppIcon" Type="Icon" X="18" Y="10" Width="32" Height="32" Text="editor_setup.ico" />
         <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Setup complete" />
         <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Editor [ProductVersion] is installed for your account." />

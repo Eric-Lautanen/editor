@@ -1989,6 +1989,57 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   green.
 
 
+### Update hop round (Oct 2026) — the hop's own payload, and a wizard shown minimized
+- **Report**: two glitches after 0.2.11, both on a fresh Windows machine. An
+  in-app update from 0.2.10 again ended with the app not launched, and an
+  install straight from the downloaded msi opened with the "install options"
+  page minimized in the taskbar.
+- **What the machine said**: the updater's staged `install.bat` logged the
+  handoff and then nothing. A major upgrade removes the old product from
+  *inside* the new install's transaction, and the old package's uninstall step
+  runs `editor.exe --uninstall`, whose payload sweep deleted *every*
+  `%TEMP%\editor-update-*` directory — including the one the batch was running
+  out of. cmd re-reads a batch line by line, so the script vanished mid-run: no
+  msiexec exit code, no stamp wait, no relaunch. Reproduced on the 0.2.11 →
+  0.2.12 hop: payload directory gone, `/passive` install exit 0, no process.
+  The wizard side was in the package's own Dialog table: `EditorWelcomeDlg`
+  and `EditorDoneDlg` were written with `Attributes = 7`, which includes
+  MSI's *Minimize* bit (WiX writes it unless the dialog says `NoMinimize`).
+- **Fix**, in three parts:
+  * `clean_payloads` keeps payloads younger than `PAYLOAD_MIN_AGE`, because the
+    update in flight is one of them; the launch sweep already did.
+  * The uninstall action is conditioned `NOT UPGRADINGPRODUCTCODE`, so from
+    0.2.12 onwards an upgrade no longer runs the outgoing build's sweep at all.
+  * The package launches the app itself on the update path:
+    `LaunchEditorPassive`, immediate and `asyncNoWait`, after
+    `InstallFinalize`, conditioned `UILevel >= 3 AND REBOOT="ReallySuppress"` —
+    what an updater's `/passive` install passes and nothing else does, *including
+    updaters that shipped before the action*, so the hop into the first release
+    carrying it is rescued too. `UILevel` is `>= 3` rather than `= 4` because an
+    elevated `/passive` runs its execute sequence in the service, where the log
+    says `UILevel = 3`; `/qn` says 2 and still opens nothing. Both dialogs now
+    carry `NoMinimize`.
+- **Two placements measured and rejected** (recorded here so they are not
+  retried): naming a `FileRef` after `InstallFinalize` fails 2753 ("the File
+  'EditorExe' is not marked for installation") and turns the install's result
+  into an error; naming a `Directory` fails 1631 for the same reason — the
+  transaction takes the file costing and the directory's run-time state with
+  it. A property survives, so `LaunchTargetPath` sets `EDITOR_LAUNCH` to
+  `[INSTALLFOLDER]editor.exe` and the launch runs that.
+- **Verified**: built MSI decompiles to the two launch rows, the
+  `UPGRADINGPRODUCTCODE` condition and dialogs at `attr=3` (was 7). A real
+  0.2.11 → 0.2.12 `/passive` hop on this machine: the old sweep still eats the
+  payload (nothing an installed package can do about the build it replaces), the
+  log shows `LaunchTargetPath` setting `EDITOR_LAUNCH`, `LaunchEditorPassive`
+  returning 0, and an `editor` process from the installed path with a visible,
+  non-iconic `EditorWindow`. A `/qn` install launches nothing, and a
+  double-clicked wizard install has no `REBOOT=ReallySuppress` and so never
+  reaches the sequence launch — its only launch is the Finish box, as before.
+  The app also recovers from being started hidden, not just minimized: the
+  STARTF show state that made an installer-launched app open minimized can hide
+  it outright, and `is_iconic` alone missed that.
+
+
 ## Remaining responsiveness work
 
 The product is frozen, so what is left is making the window answer faster. The

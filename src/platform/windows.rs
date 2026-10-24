@@ -674,6 +674,8 @@ mod ffi {
         pub fn flash_window_ex(info: *mut FlashInfo) -> i32;
         #[link_name = "IsIconic"]
         pub fn is_iconic(hwnd: Hwnd) -> i32;
+        #[link_name = "IsWindowVisible"]
+        pub fn is_window_visible(hwnd: Hwnd) -> i32;
         #[link_name = "GetDC"]
         pub fn get_dc(hwnd: Hwnd) -> Hdc;
         #[link_name = "ReleaseDC"]
@@ -2485,14 +2487,19 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
         show_window(hwnd, if maximized { SW_MAXIMIZE } else { SW_SHOW });
         // …but that first call is *ignored* when the process was started with
         // `STARTF_USESHOWWINDOW` set: Windows uses the `STARTUPINFO`'s
-        // `wShowWindow` for it, not our argument. Windows Installer's restart
-        // action starts the app exactly that way (`SW_SHOWMINNOACTIVE`), so an
-        // update that relaunches Editor reopened it *minimized* while everything
-        // else about it looked right — the report this fixes. Every later
+        // `wShowWindow` for it, not our argument. An installer, a restart
+        // action, a shortcut marked "Minimized" and a scheduler task can all
+        // start a program that way, and the result is an app that is running
+        // with no window to show for it — the report behind this check (an
+        // update relaunched Editor *minimized*, and an install that "did not
+        // launch" it at all: the process was up, hidden). Every later
         // `ShowWindow` honours its argument, so recovering is just doing it
-        // again now that the flag's one free shot is spent.
+        // again now that the flag's one free shot is spent. Hidden and
+        // minimized are both wrong here and are both undone.
         if is_iconic(hwnd) != 0 {
             show_window(hwnd, SW_RESTORE);
+        }
+        if is_iconic(hwnd) != 0 || is_window_visible(hwnd) == 0 {
             show_window(hwnd, if maximized { SW_MAXIMIZE } else { SW_SHOW });
         }
         // Published before the first frame: an update prompt that is waiting for
