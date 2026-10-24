@@ -987,10 +987,17 @@ fn windows_install_script(
     result: &std::path::Path,
     log: &std::path::Path,
 ) -> String {
+    // Split by hand rather than with `Path::file_name`: the script is built on
+    // every host the tests run on, and `file_name` knows only that host's
+    // separators — on Linux the whole `C:\...\editor.exe` is one file name,
+    // so the process check below asked for an image nothing is called.
     let image = exe
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("editor.exe");
+        .to_string_lossy()
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("editor.exe")
+        .to_string();
     let mut s = String::new();
     s.push_str("@echo off\r\n");
     s.push_str("set /a waited=0\r\n");
@@ -1756,6 +1763,34 @@ mod tests {
             explorer_line < relaunch_log,
             "the relaunch is logged after it is attempted"
         );
+    }
+
+    /// The process check after the relaunch names the exe whatever separators
+    /// the path came with. The script is built on every host the suite runs
+    /// on, and `Path::file_name` knows only the host's own separators — on
+    /// Linux a `C:\...\editor.exe` was one file name, so the check asked for
+    /// an image that nothing is called.
+    #[test]
+    fn the_relaunch_check_names_the_exe_on_any_host() {
+        for exe in [
+            r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe",
+            "/home/me/.local/bin/editor",
+        ] {
+            let script = windows_install_script(
+                std::path::Path::new(
+                    r"C:\Users\me\AppData\Local\Temp\x\editor-v0.2.0-windows-x86_64.msi",
+                ),
+                std::path::Path::new(exe),
+                4321,
+                std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-install.txt"),
+                std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-update.log"),
+            );
+            let image = exe.rsplit(['\\', '/']).next().unwrap();
+            assert!(
+                script.contains(&format!("IMAGENAME eq {image}")),
+                "{exe}: the process check does not name {image}"
+            );
+        }
     }
 
     #[test]
