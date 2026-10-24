@@ -1857,14 +1857,45 @@ mod tests {
     }
 
     #[test]
-    fn the_package_launches_nothing_itself() {
-        // Regression, and the reason this file owns the relaunch: a deferred
-        // `asyncNoWait` action in the MSI fired on both passes of a major
-        // upgrade, so a second Editor came up and hung on the first one's
+    fn the_package_launches_only_from_its_finish_page() {
+        // Regression, and the reason this file owns an *update's* relaunch: a
+        // deferred `asyncNoWait` action in the MSI fired on both passes of a
+        // major upgrade, so a second Editor came up and hung on the first one's
         // single-instance mutex, and the process it left behind mid-transaction
         // pushed Windows Installer into scheduling a restart.
+        //
+        // A fresh install still has to end with the app open, so the package
+        // does launch — from the completion page, after `InstallFinalize`, once,
+        // and only when the user's checked box says so. That is the shape this
+        // pins; anything scheduled in the execute sequence is the old failure.
         let wxs = std::fs::read_to_string("packaging/windows/editor.wxs").expect("editor.wxs");
         assert!(!wxs.contains("Id=\"RestartEditor\""));
-        assert!(!wxs.contains("Return=\"asyncNoWait\""));
+        assert!(
+            !wxs.contains("<Custom Action=\"LaunchEditor\""),
+            "the launch must not be in the execute sequence"
+        );
+        let start = wxs
+            .find("Id=\"LaunchEditor\"")
+            .expect("the finish page's launch action");
+        let end = wxs[start..].find("/>").expect("the action element ends");
+        let action = &wxs[start..start + end];
+        assert!(
+            action.contains("Execute=\"immediate\""),
+            "only an immediate action runs after the transaction: {action}"
+        );
+        assert!(
+            action.contains("Return=\"asyncNoWait\""),
+            "the installer must not wait on the editor it just opened: {action}"
+        );
+        assert!(
+            wxs.contains(
+                "<Publish Event=\"DoAction\" Value=\"LaunchEditor\" Condition=\"LAUNCHAPP\""
+            ),
+            "Finish publishes the launch, gated on the checkbox"
+        );
+        assert!(
+            wxs.contains("Property=\"LAUNCHAPP\""),
+            "the completion page has the box that gates it"
+        );
     }
 }

@@ -1963,6 +1963,32 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   pane's line height, and doubles with a 2x zoom).
 
 
+### Installer launch round (Oct 2026) — a fresh install ends with the app open
+- **Report**: a fresh install from the MSI on a new machine installs fine and
+  opens nothing; the Start menu entry is the only way in.
+- **Why**: deliberate, and the reasoning was sound at the time. The package's
+  only launch action (`RestartEditor`, deferred `asyncNoWait` before
+  `InstallFinalize`) was removed after it fired twice during a major upgrade —
+  the second Editor hung on the first one's single-instance mutex — and left a
+  process holding the exe while the install finalised, which ended in a
+  scheduled restart (a real reboot, once). What replaced it, the updater's
+  staged relaunch, only covers in-app updates: nothing owned the first launch
+  of a fresh machine.
+- **Fix**: the completion page carries a checked-by-default **Launch Editor**
+  box, and Finish publishes `LaunchEditor` — an immediate, impersonated,
+  `asyncNoWait` action on the installed exe. A DoAction from the finish dialog
+  runs *after* `InstallFinalize`, once, as the user's own act, so neither old
+  failure can recur; silent (`/qn`) and passive (`/passive`) installs show no
+  page and launch nothing, and the updater still owns its own relaunch.
+- **Verified**: the built package decompiles to exactly that action, property,
+  checkbox and the Finish button's two Publish rows; a wizard install on this
+  machine logged `EditorDoneDlg` → `DoAction LaunchEditor` → `Action ended
+  LaunchEditor. Return value 0` → "Installation completed successfully", with an
+  `editor` process running from `%LOCALAPPDATA%\Programs\Editor` afterwards;
+  the same package installed `/qn` started nothing. 534 tests, clippy and fmt
+  green.
+
+
 ## Remaining responsiveness work
 
 The product is frozen, so what is left is making the window answer faster. The

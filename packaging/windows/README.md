@@ -7,7 +7,8 @@ Two supported shapes:
   a two-page wizard: a welcome page whose three checkboxes choose which
   file-type groups to associate (documents/configs, code/markup) and whether to
   put a shortcut on the Desktop, then the stock progress bar and a "Setup
-  complete" page whose Finish button closes the wizard. Every box is ticked by
+  complete" page whose checked-by-default **Launch Editor** box opens the app
+  when Finish is pressed. Every box is ticked by
   default and each one owns a feature — `DocumentTypes`, `CodeTypes`,
   `DesktopShortcutFeature` — so the state of a checkbox is the state of that
   group, and a silent run (from `editor --update` → `msiexec /passive`) runs no
@@ -54,8 +55,19 @@ Two supported shapes:
   can reboot the machine. Windows Installer alone does *not* relaunch anything:
   Restart Manager closes the window whose exe it must replace and leaves it
   closed (measured: a `/qn` install over a running Editor ended with no Editor
-  at all), which is why the updater does it. A manual wizard install and a
-  scripted `/qn` deploy install quietly and open nothing.
+  at all), which is why the updater does it. A scripted `/qn` or `/passive`
+  install shows no page and so opens nothing, which is what a deploy wants.
+
+  A **wizard** install does open the app, from the completion page: Finish
+  publishes `LaunchEditor` (an immediate, `asyncNoWait`, impersonated action on
+  the installed exe) when the **Launch Editor** box is ticked, and the action
+  runs *after* `InstallFinalize`, outside the transaction. That placement is
+  the whole point — the earlier `RestartEditor` action was deferred and fired
+  before finalize, which is what double-launched during a major upgrade and
+  left a process holding the file during finalisation. From the finish dialog
+  it is one user-pressed action on a finished install. If an Editor is somehow
+  already running, the new process finds its single-instance mutex, hands the
+  launch over and exits, so no second window appears.
   Argument-less is deliberate: the relaunched app restores the session it saved
   on the way out, which is the last file and the window place.
 

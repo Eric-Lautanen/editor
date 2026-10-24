@@ -97,10 +97,12 @@
         Execute="deferred"
         Impersonate="yes"
         Return="ignore" />
-    <!-- This package deliberately launches nothing. An earlier revision did,
-         from a deferred `asyncNoWait` custom action before `InstallFinalize`,
-         and that caused two failures that are worth writing down so the action
-         does not come back:
+    <!-- The completion page offers to open the app, and only the page does:
+         Finish publishes `LaunchEditor` (a checkbox property, checked by
+         default), which is the one place an install can start the product
+         without the two failures an earlier revision hit. That revision
+         launched from a deferred `asyncNoWait` action *before*
+         `InstallFinalize`, and it paid for both of them:
            1. A major upgrade runs the execute sequence more than once (the
               old product's removal and the new product's install), so the
               action fired twice. The second Editor found the first one's
@@ -109,12 +111,22 @@
               exe when the install finishes finalising; Windows Installer sees a
               file in use and schedules a restart. On this machine that ended in
               the box rebooting itself, which an app update must never do.
-         Restart Manager is not the answer either: it closes the app whose files
-         it replaces and does not reopen it. So the updater owns the relaunch —
-         `src/update.rs` runs msiexec and starts the new build in one `cmd` line
-         *after* the install exits, exactly once, with `REBOOT=ReallySuppress`
-         so no update can ever ask for a reboot. A wizard install and a scripted
-         `/qn` deploy install quietly and open nothing, which is what they want. -->
+         A DoAction from the finish dialog is neither: it runs after
+         `InstallFinalize` has completed (so no file is held during the
+         transaction), it runs once per click, and it is the user's own act.
+         Silent (`/qn`) and passive (`/passive`) installs show no page and so
+         launch nothing — a deploy that opens windows on people's desktops is
+         not a deploy. The auto-updater never relies on this either: it stages
+         its own relaunch (`src/update.rs`) after `msiexec` returns, with
+         `REBOOT=ReallySuppress`, because the app it has to bring back is the
+         one whose window Windows Installer just closed. -->
+    <CustomAction
+        Id="LaunchEditor"
+        FileRef="EditorExe"
+        ExeCommand=""
+        Execute="immediate"
+        Impersonate="yes"
+        Return="asyncNoWait" />
     <InstallExecuteSequence>
       <RemoveExistingProducts After="InstallInitialize" />
       <Custom Action="UnregisterOnUninstall" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
@@ -253,6 +265,10 @@
     <Property Id="DOCUMENT_TYPES" Value="1" />
     <Property Id="CODE_TYPES" Value="1" />
     <Property Id="DESKTOP_SHORTCUT" Value="1" />
+    <!-- Checked by default on the completion page: a fresh install should end
+         with the app open, not with the user hunting for the Start menu. A
+         silent install has no page, so this property changes nothing there. -->
+    <Property Id="LAUNCHAPP" Value="1" />
     <UI Id="EditorOnePageUi">
       <TextStyle Id="EditorBody" FaceName="Segoe UI" Size="9" />
       <Dialog Id="EditorWelcomeDlg" Width="370" Height="270" Title="Install Editor">
@@ -301,12 +317,16 @@
         <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Editor [ProductVersion] is installed for your account." />
         <Control Id="HeaderLine" Type="Line" X="0" Y="54" Width="370" Height="0" />
         <Control Id="Body" Type="Text" X="18" Y="68" Width="334" Height="40" Transparent="yes" NoPrefix="yes" Text="Open a file from the Open with menu, or drag it onto the Editor window. Editor is in the Start menu too." />
+        <Control Id="LaunchCheck" Type="CheckBox" X="18" Y="112" Width="334" Height="10" Property="LAUNCHAPP" CheckBoxValue="1" Text="Launch Editor" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="Back" />
-        <!-- The one event that matters: this is what the extension's page was
-             missing, so Finish now closes the wizard. -->
+        <!-- Finish is two events now: start the app if the box is ticked, then
+             close the wizard. The launch is first so it is queued before the
+             dialog goes away, and `asyncNoWait` keeps msiexec from waiting on
+             an editor that is meant to stay open. -->
         <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Finish">
-          <Publish Event="EndDialog" Value="Return" Order="1" />
+          <Publish Event="DoAction" Value="LaunchEditor" Condition="LAUNCHAPP" Order="1" />
+          <Publish Event="EndDialog" Value="Return" Order="2" />
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="Cancel" />
       </Dialog>
