@@ -83,8 +83,9 @@ ms, MB. Budgets: frame 20 ms, churn 6 MB, live 120–200 MB, pane ops 2 000
 
 ¹ First-touch artefact: a warm open of the same file is 4.8 ms read + 37.7 ms
 drain (1.1).
-² CSV has no plan, so `typing` is not measured at all — a gap in the gate, not a
-fast path.
+² CSV had no plan when this baseline was taken, so `typing` was not measured at
+all then. S1 gave it one, and since T3 the gate times the event too: 46 ms,
+the re-parse of the capped sheet (T6).
 
 Scroll frames are inside budget everywhere; only CSV (4.65 ms) and Markdown's
 band (4.30 ms) are close enough to matter, and the pump's per-tick cost during a
@@ -107,6 +108,13 @@ The pain is **typing (markdown, json, code)** and the **document-sized panes**
 | code highlight plan (292 201 rows) | 15.6 |
 | open, json: read + drain | 23.7 + 62.6 |
 | open, code (warm): read + drain | 4.8 + 37.7 |
+
+> The `typing` column above times the paint a keystroke dirties. Since T3
+> landed it times the whole trip — the event and its paint — because the
+> virtual JSON patches itself inside `on_event`, where a paint-only timer
+> could not see it. Numbers from a run after that change are not comparable
+> to the baseline's: log and code read higher because their edit-time work is
+> now included, and CSV is measured at all for the first time (46 ms).
 
 ---
 
@@ -133,7 +141,8 @@ document-sized work, just off the UI thread.
 **CSV is the last document-sized pane.** It has no plan: `layout::csv::layout`
 produces one list for the whole (capped at 2 000 rows) sheet — 17 011 ops — and
 every frame paints it, at 4.65 ms. It is also re-parsed and re-laid out on every
-edit and resize, and the gate does not measure that at all.
+edit and resize — a cost the baseline did not measure, and which T3's
+event-included timer now prices at 46 ms a keystroke (T6).
 
 **The streaming pump is unmeasured.** A window drains one 1 MB chunk per tick
 and rebuilds the band for the grown buffer; the gate opens headless, so the pump
@@ -444,15 +453,45 @@ guesses), then fix what it shows; the likely one is the slot/span move, which
 M2 would shrink. *Should buy:* under 30 ms. *Verify:* gate (both caret
 positions, G4) + the existing patch-equals-parse tests.
 >
-> **Status (Oct 2026 audit): still open.** The gate measures json at both
-> caret ends today: `type` 119 / `end` 119 ms on the sync-patched path — the
-> topics above were reworked by the patch rounds (`Doc::patch_node`'s slot
-> move went away with the virtualized tree's plan; `sync_dirty` starts at
-> T7's watermark), and the number stopped moving once T7 landed, so the
-> residual ~119 ms is `plan.slots`/spans maintenance the measurement cannot
-> name yet. The node may legitimately be smaller now; run the attribution
-> probe in `pipeline_breakdown` before touching anything — §9's recipe is
-> the rule, not the localhost numbers.
+> **Status (Oct 2026 audit): the 119 ms was stale, and the gate could not
+> see the patch.** The audit's number no longer reproduced: the gate read
+> `type` 1.7 ms because it started its timer *after* `Event::Text`, and a
+> virtual JSON tree patches itself at the edit (`patch_plan_for_edit`), inside
+> the event. Timing the whole trip — event + the paint it dirties, which is
+> what a user calls a keystroke — put json at 3.4 / 3.3 ms on this machine,
+> not 119, and left two whole-array passes as the only part that grew with the
+> document.
+>
+> **T3 landed (Oct 2026).** The probe is in `pipeline_breakdown`, and it
+> prices the patch by moving one character around the 8 MB fixture:
+>
+> | probe | before | after |
+> |---|---|---|
+> | `Doc::patch`, first record | 2.02 | **0.67** |
+> | `Doc::patch`, last record | 1.41 | **0.91** |
+> | whitespace insert (ranges only) | 0.80 | **0.57** |
+> | gate `type` / `end` (event + paint) | 3.4 / 3.3 | **2.2 / 2.8** |
+>
+> - `Doc::shift_spans` was a branch-per-range scan of every node, on every
+>   keystroke. Ranges are pre-order and sorted by start, so everything the
+>   edit moved whole is one suffix (binary search, then a branch-free pass),
+>   and the only ranges before it that straddle the edit are its ancestors —
+>   one step per level along the plan's parent chain.
+> - `ValuePlan::patch_node` walked every slot below the node to add `dy`, then
+>   tested four fields per slot. Neither the refs nor the ids move when no
+>   node or toggle id appears, and nothing moves at all when the node's row
+>   count is unchanged — the common keystroke. The top pass is now `dy != 0`
+>   only and branch-free; the refs pass only runs when they can change.
+> - What is left in the gate's number is not the patch: `end`'s extra ~1.5 ms
+>   is `sync_dirty` walking from T7's watermark to the caret (the trade T7
+>   recorded), and `type`'s ~1 ms is the buffer insert, the caret follow and
+>   the band install.
+>
+> Structural asserts unchanged (a keystroke patches, and never reaches the
+> worker); `patching_a_document_matches_a_rebuild` compares the patched tree,
+> ranges, plan and painted band against a full parse-and-plan of the edited
+> text, with a new case for an edit that changes the row count without adding
+> a node.
 
 **T4 · Count status facts incrementally.** (S)
 `log_counts` rescans 20 000 lines on every log keystroke and

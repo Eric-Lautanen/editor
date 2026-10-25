@@ -653,8 +653,13 @@ fn measure(kind: Kind) -> Cost {
             app.tabs[0].editor.caret = crate::core::buffer::Pos { line, col };
         }
         let before = app.plan_patches();
-        app.on_event(crate::ui::event::Event::Text("x".into()), &mut host);
+        // The keystroke is the whole trip, event included: a plan that patches
+        // itself inside `on_event` (the virtual JSON's does) would otherwise
+        // hand that work to a timer that starts after it and read as free.
+        // What the user calls a keystroke is press → first answer, so the
+        // number has to be event + the paint it dirties.
         let t = Instant::now();
+        app.on_event(crate::ui::event::Event::Text("x".into()), &mut host);
         Handler::paint(&mut app, &mut canvas);
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         assert!(
@@ -719,8 +724,8 @@ fn measure(kind: Kind) -> Cost {
             app.tabs[0].editor.caret = crate::core::buffer::Pos { line: last, col: 0 };
         }
         let before = app.plan_patches();
-        app.on_event(crate::ui::event::Event::Text("x".into()), &mut host);
         let t = Instant::now();
+        app.on_event(crate::ui::event::Event::Text("x".into()), &mut host);
         Handler::paint(&mut app, &mut canvas);
         let end_ms = t.elapsed().as_secs_f64() * 1000.0;
         assert!(
@@ -923,6 +928,57 @@ fn pipeline_breakdown() {
         t.elapsed().as_secs_f64() * 1000.0,
         band.ops.len()
     );
+
+    // T3 · The JSON keystroke, attributed. The gate times the whole trip now
+    // (event + paint), because the virtual tree patches itself inside
+    // `on_event`; this prices the patch alone by moving the same one-character
+    // edit around the document: into the first record's name, into the last
+    // record's name (where no range below the edit has to move), and a
+    // whitespace insert between tokens (a string is content, so the whole
+    // patch is its byte-range pass).
+    let mut buf = crate::core::buffer::Buffer::from_text(&json);
+    let mut doc = crate::layout::json_tree::Doc::parse(&json, &Default::default(), 1440.0, &ctx)
+        .expect("json");
+    let collapsed = std::collections::HashSet::new();
+    let name_line = |buf: &crate::core::buffer::Buffer, last: bool| {
+        let at = |i: usize| buf.line(i).contains("\"name\"");
+        let mut lines = 0..buf.line_count();
+        let found = if last {
+            lines.rev().find(|&i| at(i))
+        } else {
+            lines.find(|&i| at(i))
+        };
+        found.expect("the fixture has a name")
+    };
+    for what in ["top", "end"] {
+        let line = name_line(&buf, what == "end");
+        let col = buf.line(line).find("item-").expect("the name is a string") + 5;
+        buf.insert(crate::core::buffer::Pos { line, col }, "x");
+        let edits = buf.take_edits().expect("the edit");
+        let t = Instant::now();
+        let ok = doc.patch(&buf, &edits, &collapsed, 1440.0, &ctx);
+        println!(
+            "json patch {what:>4}    {:8.3} ms ({} spans) — one node re-measured",
+            t.elapsed().as_secs_f64() * 1000.0,
+            doc.spans.len()
+        );
+        assert!(ok, "the {what} patch was refused");
+    }
+    {
+        // Between two tokens: nothing re-measures, only the ranges move — so
+        // this is the byte-range pass with no slot patch beside it.
+        let line = name_line(&buf, false) - 1;
+        buf.insert(crate::core::buffer::Pos { line, col: 0 }, " ");
+        let edits = buf.take_edits().expect("the edit");
+        let t = Instant::now();
+        let ok = doc.patch(&buf, &edits, &collapsed, 1440.0, &ctx);
+        println!(
+            "json patch  space  {:8.3} ms ({} spans) — ranges only",
+            t.elapsed().as_secs_f64() * 1000.0,
+            doc.spans.len()
+        );
+        assert!(ok, "the whitespace patch was refused");
+    }
 
     let md = synthetic(Kind::Markdown, TARGET_BYTES);
     let t = Instant::now();

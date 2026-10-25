@@ -1326,20 +1326,32 @@ impl ValuePlan {
         self.slots.splice(start..end, fresh);
         self.ids = (self.ids as isize + delta_ids).max(0) as u32;
         let shift_ref = |v: u32, by: isize| (v as isize + by) as u32;
-        for s in &mut self.slots[start + new_len..] {
-            s.top += dy;
-            // A reference into or past the replaced block moves with it; one
-            // to an ancestor above it does not, which is why this is a
-            // comparison and not a blanket shift.
-            if s.parent != NONE && s.parent as usize >= end {
-                s.parent = shift_ref(s.parent, delta_nodes);
+        // A keystroke that keeps the node's row count (`dy == 0`) and adds no
+        // nodes or ids — a character typed into a name, the common case —
+        // moves none of the slots below it, and a document-sized pass is not
+        // worth entering to add zero. The two fields that can still need a
+        // shift are separated from the one that always needs it, so the pass
+        // below is branch-free whenever it runs.
+        if dy != 0.0 {
+            for s in &mut self.slots[start + new_len..] {
+                s.top += dy;
             }
-            if s.next != NONE && s.next as usize >= end {
-                s.next = shift_ref(s.next, delta_nodes);
-            }
-            s.first_id = shift_ref(s.first_id, delta_ids);
-            if s.id != NONE {
-                s.id = shift_ref(s.id, delta_ids);
+        }
+        if delta_nodes != 0 || delta_ids != 0 {
+            for s in &mut self.slots[start + new_len..] {
+                // A reference into or past the replaced block moves with it;
+                // one to an ancestor above it does not, which is why this is
+                // a comparison and not a blanket shift.
+                if s.parent != NONE && s.parent as usize >= end {
+                    s.parent = shift_ref(s.parent, delta_nodes);
+                }
+                if s.next != NONE && s.next as usize >= end {
+                    s.next = shift_ref(s.next, delta_nodes);
+                }
+                s.first_id = shift_ref(s.first_id, delta_ids);
+                if s.id != NONE {
+                    s.id = shift_ref(s.id, delta_ids);
+                }
             }
         }
         // The ancestors' blocks contain the replaced one, so their heights move
@@ -1838,7 +1850,7 @@ impl Doc {
                 .chars()
                 .all(char::is_whitespace)
         {
-            self.shift_spans(0, 0, e.at, removed, e.delta);
+            self.shift_spans(slot as u32, 0, e.at, removed, e.delta);
             return true;
         }
         let old_block = next as usize - slot;
@@ -1903,7 +1915,8 @@ impl Doc {
                         end: end as usize,
                     }],
                 );
-                self.shift_spans(slot, slot + 1, e.at, removed, e.delta);
+                let chain = self.plan.slots[slot].parent;
+                self.shift_spans(chain, slot + 1, e.at, removed, e.delta);
                 self.broken = Some(msg);
                 return true;
             }
@@ -1949,7 +1962,8 @@ impl Doc {
             return false;
         }
         self.spans.splice(slot..slot + old_block, fresh.drain(..));
-        self.shift_spans(slot, slot + new_block, e.at, removed, e.delta);
+        let chain = self.plan.slots[slot].parent;
+        self.shift_spans(chain, slot + new_block, e.at, removed, e.delta);
         true
     }
 
@@ -2029,24 +2043,39 @@ impl Doc {
         path
     }
 
-    /// Move every range outside `[lo, hi)` by the edit: the nodes that start at
-    /// or after it move whole, and the ancestors above it — which start before
-    /// it and end past it — grow or shrink at the end.
-    fn shift_spans(&mut self, lo: usize, hi: usize, at: usize, removed: usize, delta: isize) {
+    /// Move every range the edit moved: the ones that start at or after it move
+    /// whole, and the ancestors above it — which start before it and end past
+    /// it — grow or shrink at the end. `hi` is the first index past the block
+    /// that was just replaced (0 when only offsets moved); `chain` is the node
+    /// that grew, or the replaced block's parent when the block's own ranges
+    /// were re-cut and already carry their new end.
+    ///
+    /// Three facts make this a walk of the moved ranges rather than a scan of
+    /// the document. Ranges are pre-order and sorted by start, so everything
+    /// after the replaced block — every range whose start is past the edit —
+    /// is one suffix, found by binary search and moved by one branch-free
+    /// pass. Nothing else before the block moves its start (a pre-order range
+    /// before the edited node starts at or before it). And a range before the
+    /// block that ends past the edit is exactly an ancestor of the node it
+    /// landed in, which the plan's parent chain names one level at a time.
+    /// The scan this replaced branched on all 545k ranges of an 8 MB tree per
+    /// keystroke.
+    fn shift_spans(&mut self, chain: u32, hi: usize, at: usize, removed: usize, delta: isize) {
         if delta == 0 {
             return;
         }
         let shift = |v: usize| (v as isize + delta).max(0) as usize;
-        for (i, s) in self.spans.iter_mut().enumerate() {
-            if i >= lo && i < hi {
-                continue;
-            }
-            if s.start >= at + removed {
-                s.start = shift(s.start);
-                s.end = shift(s.end);
-            } else if s.end > at {
-                s.end = shift(s.end);
-            }
+        let bound = at + removed;
+        let p = hi + self.spans[hi..].partition_point(|s| s.start < bound);
+        for s in &mut self.spans[p..] {
+            s.start = shift(s.start);
+            s.end = shift(s.end);
+        }
+        let mut anc = chain;
+        while anc != NONE {
+            let i = anc as usize;
+            self.spans[i].end = shift(self.spans[i].end);
+            anc = self.plan.slots[i].parent;
         }
     }
 }
@@ -2805,6 +2834,15 @@ mod tests {
         edit!(
             "a character inside a string",
             buf.insert(Pos { line, col }, "X")
+        );
+        // The same kind of edit where the node's rows grow instead: the value
+        // is long enough to wrap, so the rows below it move (`dy != 0`) while
+        // no node and no toggle id appears.
+        let line = line_with(&buf, "long enough to wrap");
+        let col = buf.line(line).find("a value").unwrap() + 8;
+        edit!(
+            "a character that wraps a row",
+            buf.insert(Pos { line, col }, "wide ")
         );
         // A digit typed at the end of a number extends it, rather than making
         // the container around it the thing that changed.
