@@ -157,6 +157,13 @@ fn session_view(mode: u8) -> Mode {
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
+    // The update helper is a copy of this exe invoked with `--apply-update`
+    // (see src/update.rs). It has no window and no session; dispatching it
+    // before `parse` keeps it out of the flag table entirely, so the helper
+    // cannot be broken by a change to the ordinary CLI.
+    if args.first().is_some_and(|a| a == "--apply-update") {
+        return update::apply_update(&args[1..]);
+    }
     let o = parse(&args)?;
     if let Some(act) = o.immediate {
         return match act {
@@ -319,6 +326,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // behind. Read it here — after the headless exits above, so `--render` and
     // `--pretty` never consume a notice meant for the window.
     app.note_update_result();
+    // From here on an update closes the window through the normal quit path
+    // (persisting the session first) rather than exiting this process out
+    // from under it.
+    update::note_app_running();
     platform::run(app)
 }
 

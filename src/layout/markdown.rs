@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     gfx::{color::Color, font::FontSystem, geom::Rect},
-    parse::markdown::ast::{Align, Block, Document, Inline, ListItem},
+    parse::markdown::ast::{AlertKind, Align, Block, Document, Inline, ListItem},
 };
 
 /// Side padding (physical px) inside a code panel, and the indent a folded
@@ -45,6 +45,15 @@ fn truncate(fonts: &FontSystem, style: FontStyle, size: f32, text: &str, budget:
 
 /// A run of uniformly styled text inside a paragraph or cell.
 #[derive(Clone)]
+struct ImageSpan {
+    src: String,
+    alt: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    align: Option<Align>,
+}
+
+#[derive(Clone)]
 struct Span {
     text: String,
     style: FontStyle,
@@ -54,8 +63,17 @@ struct Span {
     code: bool,
     /// Hard line break (zero width, forces a row end).
     brk: bool,
-    /// Image placeholder: (src, alt). Always stands alone in its row.
-    image: Option<(String, String)>,
+    /// Image placeholder. Always stands alone in its row.
+    image: Option<ImageSpan>,
+    /// `<ins>` / `<u>`.
+    underline: bool,
+    /// `<mark>`: an accent wash behind the glyphs.
+    highlight: bool,
+    /// `<sup>` / `<sub>`: smaller glyphs on a shifted baseline.
+    sup: bool,
+    sub: bool,
+    /// `[^1]`: the note this marker jumps to, so the glyph gets a hit region.
+    footnote: Option<usize>,
 }
 
 impl Span {
@@ -69,7 +87,21 @@ impl Span {
             code: false,
             brk: false,
             image: None,
+            underline: false,
+            highlight: false,
+            sup: false,
+            sub: false,
+            footnote: None,
         }
+    }
+}
+
+/// `<sup>`/`<sub>` glyphs are 75% of the run's size, like the browser default.
+fn span_size(span: &Span, size: f32) -> f32 {
+    if span.sup || span.sub {
+        (size * 0.75).max(1.0)
+    } else {
+        size
     }
 }
 
@@ -126,18 +158,79 @@ fn spans_of(
                     s.strike = true;
                 }
             }
+            Inline::Underline(inner) => {
+                let before = out.len();
+                spans_of(inner, style, color, link, theme, out);
+                for s in &mut out[before..] {
+                    s.underline = true;
+                }
+            }
+            Inline::Highlight(inner) => {
+                let before = out.len();
+                spans_of(inner, style, color, link, theme, out);
+                for s in &mut out[before..] {
+                    s.highlight = true;
+                }
+            }
+            Inline::Sup(inner) => {
+                let before = out.len();
+                spans_of(inner, style, color, link, theme, out);
+                for s in &mut out[before..] {
+                    s.sup = true;
+                }
+            }
+            Inline::Sub(inner) => {
+                let before = out.len();
+                spans_of(inner, style, color, link, theme, out);
+                for s in &mut out[before..] {
+                    s.sub = true;
+                }
+            }
             Inline::Link { href, content } => {
                 spans_of(content, style, theme.accent, Some(href), theme, out)
             }
-            Inline::Image { src, alt } => out.push(Span {
+            // A footnote marker is a raised number, like GitHub's; a label
+            // with no definition has nothing to point at and stays as typed.
+            Inline::FootnoteRef { label, number } => {
+                if *number == 0 {
+                    let mut s = Span::text(format!("[^{label}]"), style, color);
+                    s.link = link.map(str::to_string);
+                    out.push(s);
+                } else {
+                    let mut s = Span::text(number.to_string(), style, theme.accent);
+                    s.sup = true;
+                    s.footnote = Some(*number);
+                    out.push(s);
+                }
+            }
+            Inline::Image {
+                src,
+                alt,
+                width,
+                height,
+                align,
+            } => out.push(Span {
                 text: String::new(),
                 style,
                 color,
-                link: None,
+                // A badge is `<a href><img></a>`: the image keeps the anchor's
+                // target so the whole card is clickable.
+                link: link.map(str::to_string),
                 strike: false,
                 code: false,
                 brk: false,
-                image: Some((src.clone(), alt.clone())),
+                image: Some(ImageSpan {
+                    src: src.clone(),
+                    alt: alt.clone(),
+                    width: *width,
+                    height: *height,
+                    align: *align,
+                }),
+                underline: false,
+                highlight: false,
+                sup: false,
+                sub: false,
+                footnote: None,
             }),
             Inline::SoftBreak => {
                 let mut s = Span::text(" ".into(), style, color);
@@ -153,6 +246,11 @@ fn spans_of(
                 code: false,
                 brk: true,
                 image: None,
+                underline: false,
+                highlight: false,
+                sup: false,
+                sub: false,
+                footnote: None,
             }),
         }
     }
@@ -164,6 +262,17 @@ struct Atom {
     off: usize,
     ch: char,
     w: f32,
+}
+
+/// Where a block of wrapped rows sits: `x` is the left edge, `first_x` the
+/// left edge of the first visual row only (list markers indent the rows that
+/// follow, not the one they label), and `max_w` the width an aligned container
+/// gives the row — see [`Md::emit_rows`].
+#[derive(Clone, Copy)]
+struct RowBox {
+    x: f32,
+    first_x: f32,
+    max_w: f32,
 }
 
 /// Greedy word-wrap over mixed-style spans. Returns visual rows of
@@ -191,6 +300,7 @@ fn wrap_spans(
         }
         let mut it = s.text.chars().peekable();
         let mut oi = 0;
+        let ssize = span_size(s, size);
         while let Some(ch) = it.next() {
             atoms.push(Atom {
                 span: si,
@@ -198,7 +308,7 @@ fn wrap_spans(
                 ch,
                 // Widths need the lookahead too, or a row holding an emoji
                 // would be laid out with the narrower text-form advance.
-                w: fonts.advance_at(s.style, ch, it.peek().copied(), size),
+                w: fonts.advance_at(s.style, ch, it.peek().copied(), ssize),
             });
             oi += 1;
         }
@@ -272,6 +382,16 @@ fn ranges_of(atoms: &[Atom], start: usize, end: usize) -> Vec<(usize, usize, usi
     out
 }
 
+/// One table row's column geometry: the leaf width of each column, where
+/// its text starts, its alignment, and the row's top. Grouped so the row
+/// painter takes the row and its geometry, not eight loose numbers.
+struct TableRow<'a> {
+    widths: &'a [f32],
+    col_x: &'a [f32],
+    align: &'a [Align],
+    top: f32,
+}
+
 struct Md<'a> {
     fonts: &'a FontSystem,
     theme: &'a Theme,
@@ -284,6 +404,9 @@ struct Md<'a> {
     /// block's trailing gap so items sit close together instead of reading as
     /// one-paragraph-per-bullet.
     last_gap: f32,
+    /// Alignment imposed by an enclosing `<div align>`, `<p align>` or
+    /// `<center>`: rows inside it are shifted within the column.
+    align: Option<Align>,
 }
 
 impl Md<'_> {
@@ -355,19 +478,36 @@ impl Md<'_> {
     }
 
     /// Emit pre-wrapped rows of spans. `first_x` offsets only the first visual
-    /// row (list markers); continuations start at `x`.
+    /// row (list markers); continuations start at `x`. `max_w` is the width an
+    /// aligned container gives the row: with `self.align` set, each row is
+    /// shifted inside it, which is how `<div align="center">` and
+    /// `<h1 align="center">` read as centered text rather than left-aligned
+    /// words in a centered box.
     fn emit_rows(
         &mut self,
         rows: &[Vec<(usize, usize, usize)>],
         spans: &[Span],
-        x: f32,
-        first_x: f32,
+        row_box: RowBox,
         size: f32,
         style: FontStyle,
     ) {
+        let RowBox { x, max_w, .. } = row_box;
         let lh = self.line_h(size);
         for (ri, row) in rows.iter().enumerate() {
-            let rx = if ri == 0 { first_x } else { x };
+            let row_w: f32 = row
+                .iter()
+                .map(|&(si, s, e)| {
+                    let sp = &spans[si];
+                    self.fonts
+                        .measure_range(sp.style, &sp.text, s, e, span_size(sp, size))
+                })
+                .sum();
+            let rx = match self.align {
+                Some(Align::Center) => x + ((max_w - row_w) / 2.0).max(0.0),
+                Some(Align::Right) => x + (max_w - row_w).max(0.0),
+                _ if ri == 0 => row_box.first_x,
+                _ => x,
+            };
             let baseline = self.baseline(self.y, style, size);
             let mut pen = rx;
             for &(si, s, e) in row {
@@ -376,7 +516,27 @@ impl Md<'_> {
                 if piece.is_empty() {
                     continue;
                 }
-                let w = self.fonts.measure(sp.style, &piece, size);
+                let ssize = span_size(sp, size);
+                let w = self.fonts.measure(sp.style, &piece, ssize);
+                let glyph_baseline = if sp.sup {
+                    baseline - size * 0.38
+                } else if sp.sub {
+                    baseline + size * 0.2
+                } else {
+                    baseline
+                };
+                if sp.highlight {
+                    let wash = Color::rgba(
+                        self.theme.accent.r,
+                        self.theme.accent.g,
+                        self.theme.accent.b,
+                        48,
+                    );
+                    self.ops.push(DrawOp::Rect {
+                        rect: Rect::new(pen - 1.0, self.y + 2.0, w + 2.0, lh - 3.0),
+                        color: wash,
+                    });
+                }
                 if sp.code {
                     self.ops.push(DrawOp::RoundedRect {
                         rect: Rect::new(pen - 3.0, self.y + 2.0, w + 6.0, lh - 3.0),
@@ -384,9 +544,9 @@ impl Md<'_> {
                         color: self.theme.code_bg,
                     });
                 }
-                self.text_op(pen, baseline, piece, sp.style, size, sp.color);
+                self.text_op(pen, glyph_baseline, piece, sp.style, ssize, sp.color);
                 if sp.strike {
-                    let mid = self.strike_y(baseline, sp.style, size);
+                    let mid = self.strike_y(glyph_baseline, sp.style, ssize);
                     self.ops.push(DrawOp::Line {
                         x0: pen,
                         y0: mid,
@@ -395,9 +555,10 @@ impl Md<'_> {
                         color: sp.color,
                     });
                 }
-                if sp.link.is_some() {
-                    // Underline affordance: links read as clickable, not just blue.
-                    let uy = self.underline_y(baseline, sp.style, size);
+                if sp.underline || sp.link.is_some() {
+                    // Underline affordance: links read as clickable, not just
+                    // blue, and `<ins>`/`<u>` are underlined in the source.
+                    let uy = self.underline_y(glyph_baseline, sp.style, ssize);
                     self.ops.push(DrawOp::Line {
                         x0: pen,
                         y0: uy,
@@ -412,6 +573,12 @@ impl Md<'_> {
                         action: HitAction::Link(href.clone()),
                     });
                 }
+                if let Some(note) = sp.footnote {
+                    self.hits.push(HitRegion {
+                        rect: Rect::new(pen, self.y, w.max(4.0), lh),
+                        action: HitAction::FootnoteRef(note),
+                    });
+                }
                 pen += w;
             }
             self.y += lh;
@@ -419,7 +586,9 @@ impl Md<'_> {
     }
 
     /// A paragraph that may contain image placeholders: split at images,
-    /// laying out text runs and panels in order.
+    /// laying out text runs and panels in order. Images separated only by
+    /// whitespace — `<img>` badges on consecutive lines of a centered `<p>` —
+    /// share a row, the way GitHub lays inline images out.
     fn render_inlines(
         &mut self,
         inlines: &[Inline],
@@ -431,47 +600,127 @@ impl Md<'_> {
         let mut spans = Vec::new();
         spans_of(inlines, style, self.theme.fg, None, self.theme, &mut spans);
         let mut run: Vec<Span> = Vec::new();
-        for span in spans {
-            if let Some((src, alt)) = span.image.clone() {
-                if !run.is_empty() {
-                    let rows = wrap_spans(self.fonts, &run, size, max_w);
-                    self.emit_rows(&rows, &run, x, x, size, style);
-                    run.clear();
+        let mut i = 0;
+        while i < spans.len() {
+            if spans[i].image.is_some() {
+                self.flush_run(&mut run, x, max_w, size, style);
+                let mut group = vec![i];
+                let mut next = i + 1;
+                loop {
+                    let mut k = next;
+                    while k < spans.len() && spans[k].image.is_none() {
+                        k += 1;
+                    }
+                    let whitespace = spans[next..k]
+                        .iter()
+                        .all(|s| s.image.is_none() && !s.brk && s.text.trim().is_empty());
+                    if k < spans.len() && whitespace {
+                        group.push(k);
+                        next = k + 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.render_image(x, max_w, &src, &alt);
+                if group.len() > 1 {
+                    let images: Vec<(ImageSpan, Option<String>)> = group
+                        .iter()
+                        .map(|&gi| {
+                            let span = &spans[gi];
+                            (
+                                span.image.clone().expect("grouped images"),
+                                span.link.clone(),
+                            )
+                        })
+                        .collect();
+                    self.render_image_row(&images, x, max_w);
+                } else {
+                    let image = spans[i].image.clone().expect("an image span");
+                    self.render_image(x, max_w, &image, spans[i].link.as_deref());
+                }
+                i = next;
             } else {
-                run.push(span);
+                run.push(spans[i].clone());
+                i += 1;
             }
         }
-        if !run.is_empty() {
-            let rows = wrap_spans(self.fonts, &run, size, max_w);
-            self.emit_rows(&rows, &run, x, x, size, style);
-        }
+        self.flush_run(&mut run, x, max_w, size, style);
     }
 
-    fn render_image(&mut self, x: f32, max_w: f32, src: &str, alt: &str) {
+    fn flush_run(&mut self, run: &mut Vec<Span>, x: f32, max_w: f32, size: f32, style: FontStyle) {
+        if run.is_empty() {
+            return;
+        }
+        let rows = wrap_spans(self.fonts, run, size, max_w);
+        self.emit_rows(
+            &rows,
+            run,
+            RowBox {
+                x,
+                first_x: x,
+                max_w,
+            },
+            size,
+            style,
+        );
+        run.clear();
+    }
+
+    /// A cell or image row's card width: the source's `width` clamped to the
+    /// space available, or `auto` when the source states none. `auto` is the
+    /// whole column for a standalone image and a thumbnail's width in a table
+    /// cell, where the card must share the column with its neighbours.
+    fn card_width(image: &ImageSpan, budget: f32, auto: f32) -> f32 {
+        image
+            .width
+            .map_or(auto.min(budget), |w| (w as f32).min(budget).max(80.0))
+    }
+
+    /// The height of an image's placeholder card, independent of its width.
+    /// `width`/`height` in the source describe the real image: the card grows
+    /// to at least the stated height, so a README's side-by-side screenshots
+    /// keep the proportions the author chose even though nothing is decoded.
+    fn image_card_h(&self, image: &ImageSpan) -> f32 {
         // PNG decoding is a v2 feature, so the placeholder has to earn its
         // space instead: a framed card naming the image and, when the source
-        // says one, the alt text. It used to be a bare labelled box with half
-        // its height empty.
+        // says one, the alt text.
         let pad = 12.0;
         let small = self.body * 0.8;
         let lh = self.line_h(self.body);
         let lh_small = self.line_h(small);
-        let show_src = !alt.is_empty();
-        let h = pad * 2.0 + lh_small + lh + if show_src { lh_small } else { 0.0 };
+        let show_src = !image.alt.is_empty();
+        let text_h = pad * 2.0 + lh_small + lh + if show_src { lh_small } else { 0.0 };
+        text_h.max(image.height.map_or(0.0, |h| (h as f32).min(480.0)))
+    }
+
+    /// Paint the card at `top` without moving the flow. A card that came from
+    /// an `<a href>` — the badge idiom — is a link in its whole area, because
+    /// GitHub's badge is one.
+    fn draw_image_card(
+        &mut self,
+        x: f32,
+        top: f32,
+        card_w: f32,
+        h: f32,
+        image: &ImageSpan,
+        link: Option<&str>,
+    ) {
         self.ops.push(DrawOp::RoundedRect {
-            rect: Rect::new(x, self.y, max_w, h),
+            rect: Rect::new(x, top, card_w, h),
             radius: 6.0,
             color: self.theme.rule,
         });
         self.ops.push(DrawOp::RoundedRect {
-            rect: Rect::new(x + 1.0, self.y + 1.0, (max_w - 2.0).max(1.0), h - 2.0),
+            rect: Rect::new(x + 1.0, top + 1.0, (card_w - 2.0).max(1.0), h - 2.0),
             radius: 5.0,
             color: self.theme.code_bg,
         });
-        let budget = (max_w - 2.0 * pad).max(20.0);
-        let mut cy = self.y + pad;
+        let pad = 12.0;
+        let small = self.body * 0.8;
+        let lh = self.line_h(self.body);
+        let lh_small = self.line_h(small);
+        let show_src = !image.alt.is_empty();
+        let budget = (card_w - 2.0 * pad).max(20.0);
+        let mut cy = top + pad;
         let caption = truncate(self.fonts, FontStyle::Regular, small, "image", budget);
         let baseline = self.baseline(cy, FontStyle::Regular, small);
         self.text_op(
@@ -483,7 +732,11 @@ impl Md<'_> {
             self.theme.muted,
         );
         cy += lh_small;
-        let title = if alt.is_empty() { src } else { alt };
+        let title = if image.alt.is_empty() {
+            &image.src
+        } else {
+            &image.alt
+        };
         let title = truncate(self.fonts, FontStyle::Regular, self.body, title, budget);
         let baseline = self.baseline(cy, FontStyle::Regular, self.body);
         self.text_op(
@@ -496,7 +749,7 @@ impl Md<'_> {
         );
         cy += lh;
         if show_src {
-            let path = truncate(self.fonts, FontStyle::Regular, small, src, budget);
+            let path = truncate(self.fonts, FontStyle::Regular, small, &image.src, budget);
             let baseline = self.baseline(cy, FontStyle::Regular, small);
             self.text_op(
                 x + pad,
@@ -507,7 +760,61 @@ impl Md<'_> {
                 self.theme.muted,
             );
         }
+        if let Some(href) = link {
+            self.hits.push(HitRegion {
+                rect: Rect::new(x, top, card_w, h),
+                action: HitAction::Link(href.to_string()),
+            });
+        }
+    }
+
+    fn render_image(&mut self, x: f32, max_w: f32, image: &ImageSpan, link: Option<&str>) {
+        let card_w = Self::card_width(image, max_w, max_w);
+        let h = self.image_card_h(image);
+        let lh = self.line_h(self.body);
+        let x = match image.align.or(self.align) {
+            Some(Align::Center) => x + ((max_w - card_w) / 2.0).max(0.0),
+            Some(Align::Right) => x + (max_w - card_w).max(0.0),
+            _ => x,
+        };
+        self.draw_image_card(x, self.y, card_w, h, image, link);
         self.y += h + (lh * 0.5).round();
+    }
+
+    /// Lay a run of adjacent images side by side — a README's row of badges —
+    /// shrinking them to fit the column. The cards stay placeholders; what
+    /// changes is that GitHub put them on one line, so this does too.
+    fn render_image_row(&mut self, images: &[(ImageSpan, Option<String>)], x: f32, max_w: f32) {
+        let gap = 8.0;
+        let count = images.len() as f32;
+        let mut widths: Vec<f32> = images
+            .iter()
+            .map(|(image, _)| Self::card_width(image, max_w, 240.0))
+            .collect();
+        let mut total: f32 = widths.iter().sum::<f32>() + gap * (count - 1.0);
+        if total > max_w {
+            let room = (max_w - gap * (count - 1.0)).max(40.0 * count);
+            let scale = room / widths.iter().sum::<f32>().max(1.0);
+            for w in &mut widths {
+                *w = (*w * scale).max(40.0);
+            }
+            total = widths.iter().sum::<f32>() + gap * (count - 1.0);
+        }
+        let heights: Vec<f32> = images
+            .iter()
+            .map(|(image, _)| self.image_card_h(image))
+            .collect();
+        let row_h = heights.iter().copied().fold(0.0, f32::max);
+        let mut cx = match self.align {
+            Some(Align::Center) => x + ((max_w - total) / 2.0).max(0.0),
+            Some(Align::Right) => x + (max_w - total).max(0.0),
+            _ => x,
+        };
+        for (i, (image, link)) in images.iter().enumerate() {
+            self.draw_image_card(cx, self.y, widths[i], heights[i], image, link.as_deref());
+            cx += widths[i] + gap;
+        }
+        self.y += row_h + (self.line_h(self.body) * 0.5).round();
     }
 
     fn render_blocks(&mut self, blocks: &[Block], x: f32, max_w: f32) {
@@ -637,6 +944,106 @@ impl Md<'_> {
                     );
                     self.gap(self.body, 0.55);
                 }
+                Block::Html { align, blocks } => {
+                    let previous = self.align;
+                    // A container without an `align` of its own — the
+                    // `<picture>` inside `<p align="center">` — inherits the
+                    // alignment it sits in rather than clearing it.
+                    self.align = align.or(previous);
+                    self.render_blocks(blocks, x, max_w);
+                    self.align = previous;
+                }
+                Block::Details { summary, blocks } => {
+                    let pad = 10.0;
+                    let top = self.y;
+                    let top_op = self.ops.len();
+                    let size = self.body * 0.95;
+                    let lh = self.line_h(size);
+                    self.y += pad;
+                    let baseline = self.baseline(self.y, FontStyle::Regular, size);
+                    self.text_op(
+                        x + pad,
+                        baseline,
+                        "▸".into(),
+                        FontStyle::Regular,
+                        size,
+                        self.theme.muted,
+                    );
+                    self.render_inlines(
+                        summary,
+                        x + pad * 2.0,
+                        (max_w - pad * 3.0).max(40.0),
+                        size,
+                        FontStyle::Bold,
+                    );
+                    let bottom = self.y + pad * 0.4;
+                    self.ops.insert(
+                        top_op,
+                        DrawOp::RoundedRect {
+                            rect: Rect::new(x, top, max_w, (bottom - top).max(lh)),
+                            radius: 6.0,
+                            color: self.theme.code_bg,
+                        },
+                    );
+                    self.y = bottom;
+                    self.gap(self.body, 0.3);
+                    self.render_blocks(blocks, x + 16.0, (max_w - 16.0).max(40.0));
+                    self.gap(self.body, 0.55);
+                }
+                Block::Alert { kind, blocks } => {
+                    let (bar, wash) = match kind {
+                        AlertKind::Warning | AlertKind::Caution => (
+                            self.theme.error,
+                            Color::rgba(
+                                self.theme.error.r,
+                                self.theme.error.g,
+                                self.theme.error.b,
+                                24,
+                            ),
+                        ),
+                        _ => (
+                            self.theme.accent,
+                            Color::rgba(
+                                self.theme.accent.r,
+                                self.theme.accent.g,
+                                self.theme.accent.b,
+                                24,
+                            ),
+                        ),
+                    };
+                    let top = self.y;
+                    let top_op = self.ops.len();
+                    let size = self.body * 0.9;
+                    let lh = self.line_h(size);
+                    self.y += 8.0;
+                    let baseline = self.baseline(self.y, FontStyle::Bold, size);
+                    self.text_op(
+                        x + 14.0,
+                        baseline,
+                        kind.label().to_string(),
+                        FontStyle::Bold,
+                        size,
+                        bar,
+                    );
+                    self.y += lh + 4.0;
+                    self.render_blocks(blocks, x + 14.0, (max_w - 14.0).max(40.0));
+                    let bottom = self.y - self.last_gap;
+                    self.ops.insert(
+                        top_op,
+                        DrawOp::Rect {
+                            rect: Rect::new(x, top, 3.0, (bottom - top).max(4.0)),
+                            color: bar,
+                        },
+                    );
+                    self.ops.insert(
+                        top_op,
+                        DrawOp::Rect {
+                            rect: Rect::new(x, top, max_w, (bottom - top).max(4.0)),
+                            color: wash,
+                        },
+                    );
+                    self.gap(self.body, 0.55);
+                }
                 Block::List {
                     ordered,
                     start,
@@ -656,6 +1063,14 @@ impl Md<'_> {
                     self.render_table(align, head, rows, x, max_w);
                     self.gap(self.body, 0.55);
                 }
+                Block::FootnoteRule => {
+                    self.gap(self.body, 0.55);
+                    self.rule(x, max_w);
+                    self.gap(self.body, 0.45);
+                }
+                Block::Footnote { number, blocks } => {
+                    self.render_footnote(*number, blocks, x, max_w);
+                }
                 Block::Rule => {
                     self.gap(self.body, 0.3);
                     self.rule(x, max_w);
@@ -663,6 +1078,96 @@ impl Md<'_> {
                 }
             }
         }
+    }
+    /// One numbered note: the marker, the definition's blocks indented past
+    /// it, and the return arrow GitHub prints at the end. Both the number and
+    /// the arrow jump back to the first reference.
+    fn render_footnote(&mut self, number: usize, blocks: &[Block], x: f32, max_w: f32) {
+        let size = self.body * 0.92;
+        let digits = number.to_string().len() as f32;
+        let indent = self.fonts.advance(FontStyle::Regular, '0', size).max(1.0) * (digits + 1.6);
+        let marker = format!("{number}.");
+        let mw = self.fonts.measure(FontStyle::Regular, &marker, size);
+        let lh = self.line_h(size);
+        let top = self.y;
+        let baseline = self.baseline(top, FontStyle::Regular, size);
+        self.text_op(
+            x + indent - mw,
+            baseline,
+            marker,
+            FontStyle::Regular,
+            size,
+            self.theme.muted,
+        );
+        self.hits.push(HitRegion {
+            rect: Rect::new(x + indent - mw, top, mw.max(8.0), lh),
+            action: HitAction::FootnoteBack(number),
+        });
+        let before = self.y;
+        let first_op = self.ops.len();
+        self.render_blocks(blocks, x + indent, (max_w - indent).max(40.0));
+        let arrow = "\u{21A9}";
+        let aw = self.fonts.measure(FontStyle::Regular, arrow, size);
+        // After the last line of prose when the note ends in a paragraph and
+        // the margin has room; a note ending in a panel or a table gets a row
+        // of its own, so the arrow never lands inside another block's box.
+        let prose = if matches!(blocks.last(), Some(Block::Paragraph(_))) {
+            self.last_text_end(first_op)
+        } else {
+            None
+        };
+        let (ax, ay) = match prose {
+            Some((right, ty, _)) if right + 6.0 + aw <= x + max_w => (right + 6.0, ty),
+            _ => {
+                // Close the block's trailing gap, then give the arrow a row.
+                if self.y > before {
+                    self.y -= self.last_gap;
+                    self.last_gap = 0.0;
+                }
+                let row = self.y;
+                self.y += lh;
+                (x + indent, self.baseline(row, FontStyle::Regular, size))
+            }
+        };
+        self.text_op(
+            ax,
+            ay,
+            arrow.into(),
+            FontStyle::Regular,
+            size,
+            self.theme.accent,
+        );
+        self.hits.push(HitRegion {
+            rect: Rect::new(ax - 2.0, ay - lh * 0.85, aw.max(8.0) + 4.0, lh),
+            action: HitAction::FootnoteBack(number),
+        });
+        // Notes sit as one group, like list items, rather than as a stack of
+        // paragraphs.
+        if self.y > before {
+            let trailing = self.last_gap;
+            let tight = (self.line_h(self.body) * 0.16).round();
+            self.y = self.y - trailing + tight;
+            self.last_gap = tight;
+        }
+    }
+
+    /// The right edge and baseline of the last text drawn since `from`, the
+    /// place a trailing marker can follow without a new row.
+    fn last_text_end(&self, from: usize) -> Option<(f32, f32, f32)> {
+        self.ops[from..]
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text {
+                    x,
+                    y,
+                    text,
+                    size,
+                    style,
+                    ..
+                } => Some((*x + self.fonts.measure(*style, text, *size), *y, *size)),
+                _ => None,
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
     }
 
     fn render_list_item(
@@ -718,28 +1223,30 @@ impl Md<'_> {
         x: f32,
         max_w: f32,
     ) {
-        let n = align.len().max(1);
+        // A layout table — the side-by-side screenshots idiom — has no `<th>`
+        // and therefore no header row; `align` and the rows still say how
+        // many columns there are.
+        let n = align
+            .len()
+            .max(head.len())
+            .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+            .max(1);
         let size = self.body * 0.92;
         let lh = self.line_h(size);
         let adv = self.fonts.advance(FontStyle::Mono, '0', size).max(1.0);
         let cell_pad = adv * 1.5;
-        // Natural single-line widths.
+        // Natural single-line widths: the cell's text, or the width of the
+        // image it holds. An image column that stated no width gets a
+        // thumbnail's share rather than a zero-width column.
         let mut widths = vec![0.0f32; n];
-        let cell_width = |cell: &[Inline], style: FontStyle| -> f32 {
-            let mut spans = Vec::new();
-            spans_of(cell, style, self.theme.fg, None, self.theme, &mut spans);
-            spans
-                .iter()
-                .filter(|s| s.image.is_none() && !s.brk)
-                .map(|s| self.fonts.measure(s.style, &s.text, size))
-                .sum()
-        };
         for (ci, cell) in head.iter().enumerate().take(n) {
-            widths[ci] = widths[ci].max(cell_width(cell, FontStyle::Bold));
+            let spans = cell_spans(cell, FontStyle::Bold, self.theme);
+            self.measure_cell(&spans, ci, size, max_w, &mut widths);
         }
         for row in rows {
             for (ci, cell) in row.iter().enumerate().take(n) {
-                widths[ci] = widths[ci].max(cell_width(cell, FontStyle::Regular));
+                let spans = cell_spans(cell, FontStyle::Regular, self.theme);
+                self.measure_cell(&spans, ci, size, max_w, &mut widths);
             }
         }
         let natural: f32 = widths.iter().sum::<f32>() + cell_pad * 2.0 * n as f32;
@@ -755,95 +1262,201 @@ impl Md<'_> {
             col_x.push(cx);
             cx += w + cell_pad * 2.0;
         }
-        let render_row = |md: &mut Md, cells: &[Vec<Inline>], style: FontStyle| {
-            for (ci, cell) in cells.iter().enumerate().take(n) {
-                let mut spans = Vec::new();
-                spans_of(cell, style, md.theme.fg, None, md.theme, &mut spans);
-                let budget = widths[ci];
-                let text_w: f32 = spans
-                    .iter()
-                    .filter(|s| s.image.is_none() && !s.brk)
-                    .map(|s| md.fonts.measure(s.style, &s.text, size))
-                    .sum();
-                let truncated = text_w > budget;
-                let avail = if truncated {
-                    budget - md.fonts.measure(style, "…", size)
-                } else {
-                    budget
-                };
-                // Lay out one visual row, then clip/truncate pieces to budget.
-                let wrapped = wrap_spans(md.fonts, &spans, size, avail);
-                let first = wrapped.into_iter().next().unwrap_or_default();
-                let used: f32 = first
-                    .iter()
-                    .map(|&(si, s, e)| {
-                        md.fonts
-                            .measure_range(spans[si].style, &spans[si].text, s, e, size)
-                    })
-                    .sum();
-                let mut ox = match align.get(ci).copied().unwrap_or(Align::None) {
-                    Align::Right => col_x[ci] + cell_pad + (budget - used).max(0.0),
-                    Align::Center => col_x[ci] + cell_pad + ((budget - used).max(0.0) / 2.0),
-                    Align::None | Align::Left => col_x[ci] + cell_pad,
-                };
-                let baseline = md.baseline(md.y, style, size);
-                for &(si, s, e) in &first {
-                    let sp = &spans[si];
-                    let piece: String = sp.text.chars().skip(s).take(e - s).collect();
-                    if piece.is_empty() {
-                        continue;
-                    }
-                    let w = md.fonts.measure(sp.style, &piece, size);
-                    md.text_op(ox, baseline, piece, sp.style, size, sp.color);
-                    if sp.link.is_some() {
-                        let uy = md.underline_y(baseline, sp.style, size);
-                        md.ops.push(DrawOp::Line {
-                            x0: ox,
-                            y0: uy,
-                            x1: ox + w,
-                            y1: uy,
-                            color: sp.color,
-                        });
-                    }
-                    if let Some(href) = &sp.link {
-                        md.hits.push(HitRegion {
-                            rect: Rect::new(ox, md.y, w.max(4.0), lh),
-                            action: HitAction::Link(href.clone()),
-                        });
-                    }
-                    ox += w;
-                }
-                if truncated {
-                    md.text_op(ox, baseline, "…".into(), style, size, md.theme.muted);
-                }
-            }
-            md.y += lh;
-        };
-        // Header band: the head row reads as a header, not just bold text.
         let table_w = max_w.min(natural);
-        self.ops.push(DrawOp::Rect {
-            rect: Rect::new(x, self.y, table_w, lh),
-            color: self.theme.code_bg,
-        });
-        render_row(self, head, FontStyle::Bold);
-        self.rule(x, table_w);
+        let mut top = self.y;
+        // Header band: the head row reads as a header, not just bold text.
+        if !head.is_empty() {
+            let h = self.table_row_h(head, FontStyle::Bold, lh);
+            self.ops.push(DrawOp::Rect {
+                rect: Rect::new(x, top, table_w, h),
+                color: self.theme.code_bg,
+            });
+            self.render_row(
+                head,
+                FontStyle::Bold,
+                size,
+                lh,
+                TableRow {
+                    widths: &widths,
+                    col_x: &col_x,
+                    align,
+                    top,
+                },
+            );
+            top += h;
+            self.y = top;
+            self.rule(x, table_w);
+        }
         // Alternate body rows get a barely-there tint: with columns measured
         // rather than ruled, a reader's eye otherwise slides sideways across a
         // wide row. The header band stays the strongest fill.
         let zebra = Color::rgba(self.theme.fg.r, self.theme.fg.g, self.theme.fg.b, 8);
         for (ri, row) in rows.iter().enumerate() {
-            if ri % 2 == 1 {
-                self.ops.push(DrawOp::Rect {
-                    rect: Rect::new(x, self.y, table_w, lh),
-                    color: zebra,
-                });
-            }
             // Pad short rows with empty cells.
             let mut full = row.clone();
             full.resize_with(n, Default::default);
-            render_row(self, &full, FontStyle::Regular);
+            let h = self.table_row_h(&full, FontStyle::Regular, lh);
+            if ri % 2 == 1 {
+                self.ops.push(DrawOp::Rect {
+                    rect: Rect::new(x, top, table_w, h),
+                    color: zebra,
+                });
+            }
+            self.render_row(
+                &full,
+                FontStyle::Regular,
+                size,
+                lh,
+                TableRow {
+                    widths: &widths,
+                    col_x: &col_x,
+                    align,
+                    top,
+                },
+            );
+            top += h;
+        }
+        self.y = top;
+    }
+
+    /// A cell's contribution to its column's natural width.
+    fn measure_cell(&self, spans: &[Span], ci: usize, size: f32, max_w: f32, widths: &mut [f32]) {
+        let text: f32 = spans
+            .iter()
+            .filter(|s| s.image.is_none() && !s.brk)
+            .map(|s| self.fonts.measure(s.style, &s.text, size))
+            .sum();
+        widths[ci] = widths[ci].max(text);
+        for image in spans.iter().filter_map(|s| s.image.as_ref()) {
+            widths[ci] = widths[ci].max(Self::card_width(image, max_w, 240.0));
         }
     }
+
+    /// A row's height: one text line, or an image cell's card (plus the text
+    /// line beside it), whichever is taller.
+    fn table_row_h(&self, cells: &[Vec<Inline>], style: FontStyle, lh: f32) -> f32 {
+        let mut h = lh;
+        for cell in cells {
+            let spans = cell_spans(cell, style, self.theme);
+            let mut cards = 0.0;
+            let mut text = false;
+            for span in &spans {
+                match &span.image {
+                    Some(image) => cards += self.image_card_h(image),
+                    None if !span.text.trim().is_empty() => text = true,
+                    None => {}
+                }
+            }
+            h = h.max(cards + if text { lh } else { 0.0 });
+        }
+        h
+    }
+
+    /// Paint one table row with its top at `top`. Images draw as their
+    /// placeholder cards — a screenshot cell is an image and nothing else —
+    /// and a cell's text follows them on its own line.
+    fn render_row(
+        &mut self,
+        cells: &[Vec<Inline>],
+        style: FontStyle,
+        size: f32,
+        lh: f32,
+        row: TableRow<'_>,
+    ) {
+        let TableRow {
+            widths,
+            col_x,
+            align,
+            top,
+        } = row;
+        let n = widths.len();
+        let cell_pad = self.fonts.advance(FontStyle::Mono, '0', size).max(1.0) * 1.5;
+        for (ci, cell) in cells.iter().enumerate().take(n) {
+            let spans = cell_spans(cell, style, self.theme);
+            let budget = widths[ci];
+            let cell_align = align.get(ci).copied().unwrap_or(Align::None);
+            let mut cy = top;
+            for span in spans.iter().filter(|s| s.image.is_some()) {
+                let image = span.image.as_ref().expect("an image span");
+                let w = Self::card_width(image, budget, budget.min(240.0));
+                let h = self.image_card_h(image);
+                let ix = match cell_align {
+                    Align::Right => col_x[ci] + cell_pad + (budget - w).max(0.0),
+                    Align::Center => col_x[ci] + cell_pad + ((budget - w).max(0.0) / 2.0),
+                    Align::None | Align::Left => col_x[ci] + cell_pad,
+                };
+                self.draw_image_card(ix, cy, w, h, image, span.link.as_deref());
+                cy += h;
+            }
+            let text: Vec<Span> = spans.into_iter().filter(|s| s.image.is_none()).collect();
+            if text.iter().all(|s| s.text.trim().is_empty()) {
+                continue;
+            }
+            let text_w: f32 = text
+                .iter()
+                .filter(|s| !s.brk)
+                .map(|s| self.fonts.measure(s.style, &s.text, size))
+                .sum();
+            let truncated = text_w > budget;
+            let avail = if truncated {
+                budget - self.fonts.measure(style, "…", size)
+            } else {
+                budget
+            };
+            // Lay out one visual row, then clip/truncate pieces to budget.
+            let wrapped = wrap_spans(self.fonts, &text, size, avail);
+            let first = wrapped.into_iter().next().unwrap_or_default();
+            let used: f32 = first
+                .iter()
+                .map(|&(si, s, e)| {
+                    self.fonts
+                        .measure_range(text[si].style, &text[si].text, s, e, size)
+                })
+                .sum();
+            let mut ox = match cell_align {
+                Align::Right => col_x[ci] + cell_pad + (budget - used).max(0.0),
+                Align::Center => col_x[ci] + cell_pad + ((budget - used).max(0.0) / 2.0),
+                Align::None | Align::Left => col_x[ci] + cell_pad,
+            };
+            let baseline = self.baseline(cy, style, size);
+            for &(si, s, e) in &first {
+                let sp = &text[si];
+                let piece: String = sp.text.chars().skip(s).take(e - s).collect();
+                if piece.is_empty() {
+                    continue;
+                }
+                let w = self.fonts.measure(sp.style, &piece, size);
+                self.text_op(ox, baseline, piece, sp.style, size, sp.color);
+                if sp.link.is_some() {
+                    let uy = self.underline_y(baseline, sp.style, size);
+                    self.ops.push(DrawOp::Line {
+                        x0: ox,
+                        y0: uy,
+                        x1: ox + w,
+                        y1: uy,
+                        color: sp.color,
+                    });
+                }
+                if let Some(href) = &sp.link {
+                    self.hits.push(HitRegion {
+                        rect: Rect::new(ox, cy, w.max(4.0), lh),
+                        action: HitAction::Link(href.clone()),
+                    });
+                }
+                ox += w;
+            }
+            if truncated {
+                self.text_op(ox, baseline, "…".into(), style, size, self.theme.muted);
+            }
+        }
+    }
+}
+
+/// One table cell's spans, styled like the rest of the table.
+fn cell_spans(cell: &[Inline], style: FontStyle, theme: &Theme) -> Vec<Span> {
+    let mut spans = Vec::new();
+    spans_of(cell, style, theme.fg, None, theme, &mut spans);
+    spans
 }
 
 /// A Markdown document as a plan: one entry per top-level block.
@@ -883,6 +1496,7 @@ pub fn plan(doc: &Document, width: f32, ctx: &Ctx) -> MdPlan {
             hits: Vec::new(),
             y: 0.0,
             last_gap,
+            align: None,
         };
         md.render_blocks(std::slice::from_ref(block), x0, col_w);
         y += md.y;
@@ -961,6 +1575,7 @@ impl MdPlan {
                 hits: Vec::new(),
                 y: 0.0,
                 last_gap,
+                align: None,
             };
             md.render_blocks(std::slice::from_ref(block), x0, col_w);
             heights.push(md.y);
@@ -1002,6 +1617,7 @@ pub fn layout_band(
         hits: Vec::new(),
         y: 0.0,
         last_gap: 0.0,
+        align: None,
     };
     for i in plan.rows.band(top, bottom) {
         md.y = plan.rows.top(i);
@@ -1027,6 +1643,7 @@ pub fn layout(doc: &Document, width: f32, ctx: &Ctx) -> DisplayList {
         hits: Vec::new(),
         y: pad,
         last_gap: 0.0,
+        align: None,
     };
     md.render_blocks(&doc.blocks, x0, col_w);
     let height = md.y + pad;
@@ -1418,6 +2035,364 @@ mod tests {
         assert!(!list.hits.is_empty(), "sample link has no hit region");
         assert!(list.height > 400.0);
     }
+
+    #[test]
+    fn html_alignment_shifts_rows_within_the_column() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let (col_w, x0) = crate::layout::column(800.0, &c);
+        let list = layout(&doc("<div align=\"center\">\nshort\n</div>\n"), 800.0, &c);
+        let (x, text) = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::Text { x, text, .. } if text == "short" => Some((*x, text.clone())),
+                _ => None,
+            })
+            .expect("the centered text was laid out");
+        let w = f.measure(FontStyle::Regular, &text, c.body_size());
+        let want = x0 + (col_w - w) / 2.0;
+        assert!(
+            (x - want).abs() <= 1.0,
+            "centered text at {x}, want {want} (column {x0}..{})",
+            x0 + col_w
+        );
+    }
+
+    #[test]
+    fn ins_mark_and_sup_render_their_decorations() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(&doc("<ins>u</ins> <mark>m</mark> x<sup>2</sup>"), 800.0, &c);
+        assert!(
+            list.ops.iter().any(|op| matches!(op, DrawOp::Line { .. })),
+            "the <ins> rule is missing"
+        );
+        assert!(
+            list.ops.iter().any(|op| matches!(op, DrawOp::Rect { .. })),
+            "the <mark> wash is missing"
+        );
+        // The superscript is drawn smaller than the body text beside it.
+        let sizes: Vec<f32> = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, size, .. } if text == "2" => Some(*size),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes.len(), 1, "superscript text missing");
+        assert!(sizes[0] < c.body_size());
+    }
+
+    #[test]
+    fn an_image_honours_width_and_container_alignment() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let (col_w, x0) = crate::layout::column(800.0, &c);
+        let list = layout(
+            &doc("<p align=\"center\"><img src=\"a.png\" width=\"200\"></p>"),
+            800.0,
+            &c,
+        );
+        let card = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::RoundedRect { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("the image card");
+        assert_eq!(card.w, 200.0, "the source width was ignored");
+        let want = x0 + (col_w - 200.0) / 2.0;
+        assert!(
+            (card.x - want).abs() <= 1.0,
+            "centered card at {}, want {want}",
+            card.x
+        );
+    }
+
+    #[test]
+    fn details_and_alerts_render_their_labels_and_bodies() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("<details><summary>More</summary>\n\nBody\n\n</details>"),
+            800.0,
+            &c,
+        );
+        let text = text_of(&list);
+        assert!(text.contains("More"), "summary missing: {text}");
+        assert!(text.contains("Body"), "details body missing: {text}");
+        assert!(
+            list.ops
+                .iter()
+                .any(|op| matches!(op, DrawOp::RoundedRect { .. })),
+            "summary bar missing"
+        );
+
+        let list = layout(&doc("> [!NOTE]\n> body text"), 800.0, &c);
+        let text = text_of(&list);
+        assert!(text.contains("Note"), "alert label missing: {text}");
+        assert!(text.contains("body text"), "alert body missing: {text}");
+    }
+
+    #[test]
+    fn footnotes_render_numbers_and_a_list_after_the_prose() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("Prose[^b] more[^a].\n\n[^a]: A note.\n[^b]: B note.\n\n[^unused]: Hidden.\n"),
+            800.0,
+            &c,
+        );
+        let text = text_of(&list);
+        assert!(!text.contains("[^b]"), "reference kept its source: {text}");
+        assert!(text.contains("B note") && text.contains("A note"), "{text}");
+        assert!(
+            !text.contains("Hidden"),
+            "unreferenced note printed: {text}"
+        );
+        assert!(
+            text.contains("1.") && text.contains("2."),
+            "markers: {text}"
+        );
+        // Reference numbers are raised and smaller, like the `<sup>` they are.
+        let raised = list.ops.iter().any(|op| {
+            matches!(op, DrawOp::Text { text, size, .. } if text == "1" && *size < c.body_size())
+        });
+        assert!(raised, "the reference number was not a superscript: {text}");
+        // The section is separated from the prose and sits below it.
+        let prose_y = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::Text { y, text, .. } if text.starts_with("Prose") => Some(*y),
+                _ => None,
+            })
+            .expect("prose");
+        let note_y = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::Text { y, text, .. } if text.contains("B note") => Some(*y),
+                _ => None,
+            })
+            .expect("note body");
+        assert!(note_y > prose_y, "notes at {note_y}, prose at {prose_y}");
+        assert!(
+            list.ops.iter().any(|op| matches!(op, DrawOp::Line { .. })),
+            "the separator rule is missing"
+        );
+    }
+
+    #[test]
+    fn footnote_markers_and_notes_carry_jump_hits() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(&doc("Claim[^a].\n\n[^a]: A note.\n"), 800.0, &c);
+        let refs: Vec<Rect> = list
+            .hits
+            .iter()
+            .filter_map(|h| match h.action {
+                HitAction::FootnoteRef(1) => Some(h.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs.len(), 1, "the marker is one hit region");
+        let backs: Vec<Rect> = list
+            .hits
+            .iter()
+            .filter_map(|h| match h.action {
+                HitAction::FootnoteBack(1) => Some(h.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(backs.len(), 2, "the number and the arrow both go back");
+        assert!(
+            backs[0].x < backs[1].x,
+            "the number sits in the margin, the arrow after the note"
+        );
+        assert!(backs[0].y > refs[0].y, "the note sits below its marker");
+        // The arrow follows the note's last line of prose instead of taking a
+        // row of its own.
+        let (note_y, note_x) = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::Text { x, y, text, .. } if text == "A note." => Some((*y, *x)),
+                _ => None,
+            })
+            .expect("note body");
+        let (arrow_y, arrow_x) = list
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DrawOp::Text { x, y, text, .. } if text == "\u{21A9}" => Some((*y, *x)),
+                _ => None,
+            })
+            .expect("return arrow");
+        assert!(
+            (arrow_y - note_y).abs() < 0.5,
+            "the arrow left the note row"
+        );
+        assert!(arrow_x > note_x, "the arrow did not follow the text");
+    }
+
+    #[test]
+    fn an_html_table_lays_out_like_a_markdown_one() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("<table>\n<tr><th>Head</th><th>Other</th></tr>\n<tr><td>1</td><td>2</td></tr>\n</table>"),
+            800.0,
+            &c,
+        );
+        let text = text_of(&list);
+        for want in ["Head", "Other", "1", "2"] {
+            assert!(text.contains(want), "cell {want} missing: {text}");
+        }
+        assert!(
+            list.ops.iter().any(|op| matches!(op, DrawOp::Line { .. })),
+            "table rule missing"
+        );
+    }
+
+    fn text_of(list: &DisplayList) -> String {
+        list.ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// The outer frame of each image card, in paint order.
+    fn image_cards(list: &DisplayList, width: f32) -> Vec<Rect> {
+        list.ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::RoundedRect { rect, .. } if (rect.w - width).abs() < 0.5 => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_html_layout_table_puts_its_images_side_by_side() {
+        // The README idiom this round exists for: two screenshots in an HTML
+        // table, each `<img width="300">`. The cards used to vanish because
+        // table cells only laid out text, and the image row was taken for a
+        // header because no row names its cells `<th>`.
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("<table>\n<tr>\n<td><img src=\"light.png\" width=\"300\" alt=\"light\"></td>\n<td><img src=\"dark.png\" width=\"300\" alt=\"dark\"></td>\n</tr>\n<tr>\n<td align=\"center\">Light</td>\n<td align=\"center\">Dark</td>\n</tr>\n</table>"),
+            800.0,
+            &c,
+        );
+        let cards = image_cards(&list, 300.0);
+        assert_eq!(cards.len(), 2, "both screenshots must draw a card");
+        assert_eq!(cards[0].y, cards[1].y, "the cards share a row");
+        assert!(
+            cards[1].x >= cards[0].right(),
+            "the second card starts before the first ends: {:?}",
+            cards
+        );
+        let text = text_of(&list);
+        assert!(text.contains("Light") && text.contains("Dark"), "{text}");
+    }
+
+    #[test]
+    fn a_markdown_table_cell_can_hold_an_image() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("| Left | Right |\n|:-----|------:|\n| ![light](light.png) | ![dark](dark.png) |\n| 1 | 2 |"),
+            800.0,
+            &c,
+        );
+        let cards = image_cards(&list, 240.0);
+        assert_eq!(cards.len(), 2, "the image row rendered as a blank line");
+        assert_eq!(cards[0].y, cards[1].y, "the cards share a row");
+        let text = text_of(&list);
+        assert!(
+            text.contains("1") && text.contains("2"),
+            "body lost: {text}"
+        );
+    }
+
+    #[test]
+    fn adjacent_badges_share_a_row_and_stay_links() {
+        // `<p align="center">` with one badge `<a><img></a>` per line: GitHub
+        // lays them out as one row, and each badge is its link.
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("<p align=\"center\">\n<a href=\"https://e.com/a\"><img src=\"a.png\" width=\"96\" alt=\"a\"></a>\n<a href=\"https://e.com/b\"><img src=\"b.png\" width=\"96\" alt=\"b\"></a>\n</p>"),
+            800.0,
+            &c,
+        );
+        let cards = image_cards(&list, 96.0);
+        assert_eq!(cards.len(), 2, "badges did not become two cards");
+        assert_eq!(
+            cards[0].y, cards[1].y,
+            "badges stacked instead of sharing a row"
+        );
+        for href in ["https://e.com/a", "https://e.com/b"] {
+            assert!(
+                list.hits
+                    .iter()
+                    .any(|h| matches!(&h.action, HitAction::Link(l) if l == href)),
+                "the badge for {href} is not clickable"
+            );
+        }
+        // The row is centred as a whole, like GitHub's centred badge line.
+        let (col_w, x0) = crate::layout::column(800.0, &c);
+        let left = cards[0].x - x0;
+        let right = x0 + col_w - cards[1].right();
+        assert!(
+            (left - right).abs() <= 2.0,
+            "badge row is not centred: {left} left, {right} right"
+        );
+    }
+
+    #[test]
+    fn a_picture_stays_centered_like_the_paragraph_around_it() {
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let list = layout(
+            &doc("<p align=\"center\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"d.png\">\n    <img src=\"l.png\" width=\"180\" alt=\"Logo\">\n  </picture>\n</p>"),
+            800.0,
+            &c,
+        );
+        let cards = image_cards(&list, 180.0);
+        assert_eq!(cards.len(), 1, "the fallback image did not render");
+        let (col_w, x0) = crate::layout::column(800.0, &c);
+        let want = x0 + (col_w - 180.0) / 2.0;
+        assert!(
+            (cards[0].x - want).abs() <= 1.0,
+            "the logo is not centred: {} vs {want}",
+            cards[0].x
+        );
+        assert!(
+            !text_of(&list).contains("source"),
+            "the <source> tag leaked into the preview"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1448,6 +2423,16 @@ mod band_tests {
             s.push_str("- one\n- two\n  - deeper\n\n");
             s.push_str(&format!("```rust\nfn f{i}() -> u32 {{ {} }}\n```\n\n", i));
             s.push_str("| a | b |\n|---|---|\n| 1 | 2 |\n\n");
+            // Every block kind the plan has to measure on its own: a
+            // container, a details body, an alert and an image table (which
+            // draws cards instead of a text line).
+            s.push_str("<div align=\"center\">\n\ncentred **text**\n\n</div>\n\n");
+            s.push_str("<details>\n<summary>More</summary>\n\nHidden\n\n</details>\n\n");
+            s.push_str("> [!NOTE]\n> alert body\n\n");
+            s.push_str(
+                "<table>\n<tr><td><img src=\"a.png\" width=\"120\"></td>\
+                 <td><img src=\"b.png\" width=\"120\"></td></tr>\n</table>\n\n",
+            );
             s.push_str("> quoted text\n\n");
             s.push_str("---\n\n");
         }

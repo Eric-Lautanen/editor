@@ -13,9 +13,9 @@
 //!
 //! | OS | Asset | Install |
 //! |---|---|---|
-//! | Windows | `editor-<tag>-windows-x86_64.msi` | a staged `install.bat`: wait for this process to exit, `msiexec /i <msi> /passive REBOOT=ReallySuppress`, wait for the installed exe's file stamp to change, then reopen it through Explorer — verified, retried, `start /max` as the last resort. The per-user MSI replaces the old build; the package itself launches nothing (see `packaging/windows/editor.wxs` for why that matters) |
-//! | Linux | `editor-<tag>-linux-x86_64.tar.gz` | unpack, rename the fresh binary over the running one (legal while it runs on Linux), relaunch |
-//! | macOS | `editor-<tag>-macos.zip` | unpack to a staging dir, remove the old `Editor.app`, move the new one into place, relaunch |
+//! | Windows | `editor-<tag>-windows-x86_64.msi` | a staged self-copy helper (`editor --apply-update`): wait for the old process to exit and leave its approval token, `msiexec /i <msi> /passive REBOOT=ReallySuppress MSIDISABLERMRESTART=1 MSIRESTARTMANAGERCONTROL=Disable EDITOR_SKIP_LAUNCH=1`, wait for the installed exe's stamp to change, then relaunch with an explicit visible show state. The per-user MSI replaces the old build; the package itself launches nothing (see `packaging/windows/editor.wxs` for why that matters) |
+//! | Linux | `editor-<tag>-linux-x86_64.tar.gz` | unpack, rename the fresh binary over the running one (legal while it runs on Linux); the window saves its session and the new build starts from that same tick |
+//! | macOS | `editor-<tag>-macos.zip` | unpack to a staging dir, remove the old `Editor.app`, move the new one into place; the window saves and the new build starts from that same tick |
 //!
 //! When no official asset exists for the running platform/arch (macOS on
 //! Intel, Linux on arm…) the check still works and says there is nothing to
@@ -37,6 +37,99 @@
 use crate::error::{Error, Result};
 use crate::net;
 use crate::platform::print_line;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The UI mirrors its dirtiest tab here, because the install sequence runs on
+/// its own thread and has no `App` to ask. An update closes the editor; closing
+/// over unsaved edits is data loss, and there is no recovery buffer to fall
+/// back on, so the install refuses instead.
+static UNSAVED_EDITS: AtomicBool = AtomicBool::new(false);
+/// Whether a window owns this process. `--update` has none: it may exit on its
+/// own once the helper is spawned. A GUI update asks [`App`] to save its
+/// session and leave, so the relaunched build restores the same window.
+static APP_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Set by the install thread, consumed by the UI tick.
+static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Where the helper's permission tokens live: the install result path, agreed
+/// on by the install thread (which names it for the helper) and the UI (which
+/// writes the approval next to it). Empty until an install is set up.
+#[cfg(windows)]
+static RESTART_TOKENS: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+/// Linux/macOS have no installer helper to wait for this process, so the new
+/// build is started by the tick that leaves: it has just written the session
+/// the new window restores. Empty on Windows, where the helper launches it.
+static PENDING_RELAUNCH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Called from the UI tick. Cheap enough to do every frame: it is one bool.
+pub fn note_unsaved(edits: bool) {
+    UNSAVED_EDITS.store(edits, Ordering::Relaxed);
+}
+
+pub fn has_unsaved_edits() -> bool {
+    UNSAVED_EDITS.load(Ordering::Relaxed)
+}
+
+/// `cli::run` calls this once the windowed app exists, before the platform
+/// loop. Until then, the only update path is `--update`, which owns the
+/// process.
+pub fn note_app_running() {
+    APP_RUNNING.store(true, Ordering::Relaxed);
+}
+
+/// The UI tick takes the hand-off: persist the session, then quit normally.
+pub fn take_restart_request() -> bool {
+    RESTART_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
+/// Arm the hand-off around `result` (the file the helper reports msiexec's exit
+/// code in). Called by the install thread *before* it spawns the helper, so a
+/// UI that decides to stay can still stop it.
+#[cfg(windows)]
+fn arm_restart(result: &std::path::Path) {
+    if let Ok(mut slot) = RESTART_TOKENS.lock() {
+        *slot = Some(result.to_path_buf());
+    }
+}
+
+#[cfg(windows)]
+fn token_anchor() -> Option<std::path::PathBuf> {
+    RESTART_TOKENS.lock().ok().and_then(|slot| slot.clone())
+}
+/// The UI's last act before leaving for an update: write the token the helper
+/// is waiting for (Windows), then start the installed build where there is no
+/// helper (Linux, macOS). `false` means neither could be done, and then the
+/// caller must not quit — an exit nothing can act on would leave no window.
+pub fn approve_restart() -> bool {
+    #[cfg(windows)]
+    if !token_anchor().is_some_and(|result| write_approval(&result).is_ok()) {
+        return false;
+    }
+    let pending = PENDING_RELAUNCH
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    match pending {
+        Some(exe) => start(&exe),
+        None => true,
+    }
+}
+
+/// The UI stays after all (an edit landed during the download): stop the
+/// waiting helper instead of letting it install once the wait runs out, and
+/// drop the build it was told to start.
+pub fn cancel_restart() {
+    if let Ok(mut slot) = PENDING_RELAUNCH.lock() {
+        *slot = None;
+    }
+    #[cfg(windows)]
+    {
+        let Some(result) = token_anchor() else {
+            return;
+        };
+        let _ = std::fs::write(cancel_path(&result), format!("{}\r\n", std::process::id()));
+        let _ = log_step("the update was cancelled by the editor");
+    }
+}
 
 const REPO: &str = "Eric-Lautanen/editor";
 const API_LATEST: &str = "https://api.github.com/repos/Eric-Lautanen/editor/releases/latest";
@@ -490,14 +583,11 @@ pub fn sweep_stale_payloads() -> usize {
 /// removes the old product inside the new one's transaction, and this
 /// package's uninstall step runs the *old* exe with `--uninstall` to do it. If
 /// that call swept the staging directory with no age limit, it deleted the
-/// very payload the update was installing from — the staged `install.bat` and
-/// its msi — while the batch was still running out of it. cmd re-reads a batch
-/// line by line, so a deleted script stops executing mid-way: no `msiexec`
-/// exit code, no relaunch, no log line after the handoff. (Measured: an update
-/// from 0.2.10 to 0.2.11 ended with the payload directory gone, the installed
-/// exe untouched and the log stopping at "install.bat staged in …".) A
-/// payload younger than [`PAYLOAD_MIN_AGE`] is therefore left for the next
-/// launch's sweep, which is where cleanup belongs.
+/// very payload the update was installing from — the msi the helper was about
+/// to hand to msiexec. (Measured: an update from 0.2.10 to 0.2.11 ended with
+/// the payload directory gone, the installed exe untouched and the log
+/// stopping at the hand-off.) A payload younger than [`PAYLOAD_MIN_AGE`] is
+/// therefore left for the next launch's sweep, which is where cleanup belongs.
 ///
 /// Settings, session state and crash reports live in the config dir and are
 /// deliberately *not* touched — they are the user's, and a reinstall should
@@ -539,6 +629,11 @@ impl Release {
 fn install(r: &Release) -> Result<()> {
     rotate_update_log();
     let _ = log_step(&format!("install requested for {}", r.tag));
+    // An install ends this process. Without a save/recovery path, the only
+    // honest answer to a dirty buffer is "not now".
+    if has_unsaved_edits() {
+        return refuse_unsaved_edits("install refused: the editor has unsaved edits");
+    }
     let file = match r.download() {
         Ok(f) => {
             let _ = log_step(&format!("downloaded {}", f.display()));
@@ -558,8 +653,21 @@ fn install(r: &Release) -> Result<()> {
             return Err(e);
         }
     }
+    // A download takes time, and the user can type the moment it starts. This
+    // is the last chance to notice before a helper is staged for a window that
+    // has nowhere to put the edits; the UI checks once more at the hand-off
+    // itself, because even this is a race.
+    if has_unsaved_edits() {
+        return refuse_unsaved_edits(
+            "install refused after the download: the editor has unsaved edits",
+        );
+    }
     let _ = log_step("handing over to the platform installer");
     let outcome = match std::env::consts::OS {
+        // The MSI path has no meaning on a host that cannot run it (and does
+        // not compile its helper); `clippy -D warnings` treats those items as
+        // dead there, so the arm goes with them.
+        #[cfg(windows)]
         "windows" => install_windows(&file, &r.tag),
         "linux" => install_linux(&file, &r.tag),
         "macos" => install_macos(&file, &r.tag),
@@ -572,6 +680,35 @@ fn install(r: &Release) -> Result<()> {
         let _ = log_step(&format!("install failed: {e}"));
     }
     outcome
+}
+
+/// A refusal has to be visible even on the silent background path, or "Install"
+/// appears to do nothing at all.
+#[cfg(all(
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
+))]
+fn tell_install_refused(message: &str) {
+    win_dialog(message, "Editor update", false);
+}
+
+#[cfg(not(all(
+    any(target_os = "windows", editor_check_win),
+    not(editor_check_linux),
+    not(editor_check_macos)
+)))]
+fn tell_install_refused(message: &str) {
+    print_line(message);
+}
+
+/// The one answer to unsaved edits, from either check: say so, log where the
+/// log is, and hand the caller an error so a worker never reports success.
+fn refuse_unsaved_edits(step: &str) -> Result<()> {
+    let message = "Editor has unsaved changes. Save them, then check for updates again.";
+    let _ = log_step(step);
+    tell_install_refused(message);
+    Err(Error::Platform(message.into()))
 }
 
 /// Compares the downloaded asset's SHA-256 with the one the release's
@@ -794,32 +931,38 @@ mod sha256 {
 //
 // Every step also appends a timestamped line to the config dir's
 // `last-update.log`, one attempt per file with the previous attempt kept as
-// `last-update.1.log`, and the install batch script keeps logging after this
-// process exits (msiexec's exit code, the wait timeout, the relaunch). An
-// update that silently died somewhere between "closed the app" and "editor
-// back on screen" is diagnosable from those files afterwards.
+// `last-update.1.log`, and the update helper keeps logging after this process
+// exits (msiexec's exit code, the wait outcome, the relaunch). An update that
+// silently died somewhere between "closed the app" and "editor back on
+// screen" is diagnosable from those files afterwards.
 
 /// Windows: run the per-user MSI. `/passive` shows a progress bar but asks no
 /// questions, and a *newer* version installs over the old via the MSI's
 /// major-upgrade, all without a UAC prompt (per-user MSI).
 ///
-/// Restart Manager closes the running app when the exe has to be replaced, but
-/// it does not reopen it, so the relaunch is ours: the staged batch waits for
-/// this process to leave, installs, waits for the installed exe to be the new
-/// one, and only then opens it (see [`windows_install_script`]) — so the window
-/// comes back *after* the install has finished, and exactly once. Neither part
-/// is optional. Launching from inside the package (a deferred custom action,
-/// which this used to do) fires on every pass of the upgrade's execute
-/// sequence: two Editors came up, the second hung on the first one's
-/// single-instance mutex, and a process started mid-transaction can still hold
-/// a file the install wants to replace — which is how Windows Installer ends
-/// up scheduling a restart, i.e. rebooting the machine.
-/// `REBOOT=ReallySuppress` closes that door for good: an update may close and
-/// reopen the app, never restart the computer.
+/// The hand-off is a copy of this exe running [`apply_update`], not a batch
+/// file. It waits for this process to leave *and* for its approval token, then
+/// installs, waits for the installed exe to change, and only then opens it — so
+/// the window comes back *after* the install has finished, and exactly once.
+/// The token is what keeps an update from outliving the window that asked for
+/// it: a user who closes the editor while the download runs, or types after it,
+/// leaves no token, and the helper exits without touching anything.
+/// Launching from inside the package (a deferred custom action, which this
+/// used to do) fires on every pass of the upgrade's execute sequence: two
+/// Editors came up, the second hung on the first one's single-instance mutex,
+/// and a process started mid-transaction can still hold a file the install
+/// wants to replace — which is how Windows Installer ends up scheduling a
+/// restart, i.e. rebooting the machine. `REBOOT=ReallySuppress`,
+/// `MSIDISABLERMRESTART=1` and `MSIRESTARTMANAGERCONTROL=Disable` close that
+/// door for good: an update may close and reopen the app, never restart the
+/// computer.
 ///
 /// The relaunched app is argument-less on purpose: it restores the session it
-/// saved on the way out, so the last file and the window place come back.
-/// This process ends here: the `cmd` was spawned detached and survives it.
+/// saved on the way out, so the last file and the window place come back. With
+/// a window open, the UI tick performs that save, writes the approval token and
+/// quits through the normal path; `--update` has no session and approves the
+/// hand-off on its way out.
+#[cfg(windows)]
 fn install_windows(file: &std::path::Path, tag: &str) -> Result<()> {
     let dir = parent_dir(file)?;
     // Where the installer's own exit code is left for the next launch: the
@@ -831,38 +974,428 @@ fn install_windows(file: &std::path::Path, tag: &str) -> Result<()> {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(&result);
+    // Tokens from an earlier attempt: a stale approval would let a helper
+    // install without this process ever agreeing, and a stale cancellation
+    // would stop the attempt being set up right now.
+    let _ = std::fs::remove_file(approval_path(&result));
+    let _ = std::fs::remove_file(cancel_path(&result));
+    arm_restart(&result);
     let log_path = update_log_path(&dir);
-    let script = windows_install_script(
+    // The hand-off used to be a generated `install.bat`. Batch meant a second
+    // command language, quoting rules that differ from every other API on the
+    // machine, `find.exe` shadowed by Git's GNU find, and a hidden console
+    // whose `STARTUPINFO` show state every later `start` inherited — the
+    // relaunch came up invisible. A copy of this exe running
+    // `--apply-update` has none of those: arguments arrive in `argv`, paths
+    // are passed as data rather than interpolated into a script, and the
+    // relaunch can set its own show state.
+    //
+    // The name is unique per attempt so a helper still waiting from an earlier
+    // one (a window that stayed open) cannot block staging this one; the
+    // payload sweep removes it with the directory on a later launch.
+    let helper = dir.join(format!("editor-update-apply-{}.exe", std::process::id()));
+    let me = std::env::current_exe()
+        .map_err(|e| Error::Platform(format!("could not resolve the running exe: {e}")))?;
+    let _ = std::fs::remove_file(&helper);
+    std::fs::copy(&me, &helper).map_err(|e| {
+        Error::Platform(format!(
+            "could not stage the update helper in {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let mut cmd = std::process::Command::new(&helper);
+    cmd.args(helper_arguments(
         file,
         &installed_exe(),
         std::process::id(),
         &result,
         &log_path,
-    );
-    let bat = dir.join("install.bat");
-    std::fs::write(&bat, script)?;
+    ))
+    .current_dir(&dir)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| Error::Platform(format!("the update helper could not start: {e}")))?;
     let _ = log_step(&format!(
-        "install.bat staged in {}; this process exits so the msiexec inside it can replace the exe",
-        dir.display()
+        "update helper {} spawned as pid {}",
+        helper.display(),
+        child.id()
     ));
     print_line(&format!("launching the installer for {tag}…"));
-    // The script waits for this process to leave the process table before it
-    // runs msiexec, so nothing here holds a handle the upgrade wants.
-    windows_hidden_cmd(&format!("\"{}\"", bat.display()))
-        .map_err(|e| Error::Platform(format!("msiexec could not start: {e}")))?;
+    if APP_RUNNING.load(Ordering::Relaxed) {
+        // The UI tick persists the session and leaves through the normal quit
+        // path — and writes the approval token there. Until it does, the helper
+        // only waits, so a refused hand-off costs nothing.
+        RESTART_REQUESTED.store(true, Ordering::Relaxed);
+        let _ = log_step("waiting for the editor to save its session and leave");
+        return Ok(());
+    }
+    // A console `--update` has no window to ask: this process *is* the
+    // departure, so it approves it here and leaves at once.
+    if let Err(e) = write_approval(&result) {
+        return Err(Error::Platform(format!(
+            "could not approve the update: {e}"
+        )));
+    }
     std::process::exit(0);
 }
 
-/// The file the installer's exit code is written to (see
-/// [`windows_install_script`]). The config directory survives the payload
-/// sweep that deletes the staged MSI on the next launch; a payload directory
-/// is only the fallback for an account with no config directory at all.
+/// The helper's argv. Separate arguments, not a command line and not a batch
+/// script: a path with spaces, an ampersand or a non-ASCII character arrives
+/// intact because no shell ever re-parses it. The approval token is derived
+/// from the result path rather than passed, so the helper's contract stays five
+/// arguments.
+#[cfg(windows)]
+fn helper_arguments(
+    msi: &std::path::Path,
+    exe: &std::path::Path,
+    pid: u32,
+    result: &std::path::Path,
+    log: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        "--apply-update".into(),
+        msi.to_string_lossy().into_owned(),
+        exe.to_string_lossy().into_owned(),
+        pid.to_string(),
+        result.to_string_lossy().into_owned(),
+        log.to_string_lossy().into_owned(),
+    ]
+}
+
+#[cfg(windows)]
+struct HelperArgs {
+    msi: std::path::PathBuf,
+    exe: std::path::PathBuf,
+    pid: u32,
+    result: std::path::PathBuf,
+    log: std::path::PathBuf,
+}
+
+/// `cli::run` strips the leading flag before calling [`apply_update`], so the
+/// five remaining arguments are the contract.
+#[cfg(windows)]
+fn parse_helper_args(args: &[String]) -> Result<HelperArgs> {
+    if args.len() != 5 {
+        return Err(Error::Platform(
+            "--apply-update takes MSI, EXE, PID, RESULT and LOG".into(),
+        ));
+    }
+    Ok(HelperArgs {
+        msi: std::path::PathBuf::from(&args[0]),
+        exe: std::path::PathBuf::from(&args[1]),
+        pid: args[2]
+            .parse()
+            .map_err(|_| Error::Platform(format!("bad parent PID {:?}", args[2])))?,
+        result: std::path::PathBuf::from(&args[3]),
+        log: std::path::PathBuf::from(&args[4]),
+    })
+}
+
+/// The installer invocation. Every switch here answers a failure mode:
+/// `/passive` needs no input, `REBOOT=ReallySuppress` may never reboot the
+/// machine, the two Restart Manager properties stop it closing or reopening
+/// anything behind our back, and `EDITOR_SKIP_LAUNCH` keeps the package's own
+/// launch action out of the update's way.
+#[cfg(windows)]
+fn msiexec_arguments(msi: &std::path::Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "/i".into(),
+        msi.into(),
+        "/passive".into(),
+        "REBOOT=ReallySuppress".into(),
+        "MSIDISABLERMRESTART=1".into(),
+        "MSIRESTARTMANAGERCONTROL=Disable".into(),
+        "EDITOR_SKIP_LAUNCH=1".into(),
+    ]
+}
+
+/// How long the helper waits for the old editor to leave. Nothing is installed
+/// when the wait runs out: an editor still alive is an editor that still owns
+/// its exe (and its buffers), so the update is simply not ready yet. A UI that
+/// stayed on purpose cancels in a second instead of waiting this out.
+#[cfg(windows)]
+const WAIT_SECS: u32 = 120;
+
+/// How long the helper waits for the installer to put a new exe on disk.
+#[cfg(windows)]
+const SETTLE_SECS: u32 = 120;
+
+/// The helper's own entry point: `editor --apply-update <msi> <exe> <pid>
+/// <result> <log>`. `cli::run` dispatches to it before parsing the ordinary
+/// flags, so a helper invocation never opens a window or restores a session.
+#[cfg(windows)]
+pub fn apply_update(args: &[String]) -> Result<()> {
+    let outcome = apply_update_inner(args);
+    if let Err(e) = &outcome {
+        let _ = log_step(&format!("update helper failed: {e}"));
+        // Through the one surface that exists in every build of this module:
+        // `win_dialog` is gated on the Win32 *backend*, and a helper compiled
+        // into an `editor_check_*` build of another backend has none.
+        tell_install_refused(&format!(
+            "Editor could not finish the update:\n\n{e}\n\nDownload the installer from github.com/{REPO}/releases/latest."
+        ));
+    }
+    outcome
+}
+
+#[cfg(not(windows))]
+pub fn apply_update(_args: &[String]) -> Result<()> {
+    Err(Error::Platform("the update helper is Windows-only".into()))
+}
+
+#[cfg(windows)]
+fn apply_update_inner(args: &[String]) -> Result<()> {
+    let HelperArgs {
+        msi,
+        exe,
+        pid,
+        result,
+        log,
+    } = parse_helper_args(args)?;
+    let msi = msi.as_path();
+    let exe = exe.as_path();
+    let result = result.as_path();
+    let log = log.as_path();
+    let trail = |step: &str| {
+        let _ = append_log(log, step);
+    };
+    let approval = approval_path(result);
+    let cancellation = cancel_path(result);
+    trail(&format!("update helper started for {}", msi.display()));
+
+    // The old editor has to be gone (Windows cannot replace a running image),
+    // and it has to have left *for this update*: the approval token is written
+    // in the same tick the window quits, so a window the user closed on their
+    // own — or one that stayed open over unsaved edits — leaves none.
+    if !wait_for_process(pid, &cancellation, WAIT_SECS) {
+        if cancellation.exists() {
+            trail("the editor cancelled the update; nothing was installed");
+        } else {
+            trail("the editor was still running after the wait; nothing was installed");
+        }
+        return Ok(());
+    }
+    // Removing the token is also the claim on it: of two helpers racing over
+    // the same update, exactly one installs.
+    if std::fs::remove_file(&approval).is_err() {
+        trail("the editor left without approving the update; nothing was installed");
+        return Ok(());
+    }
+    trail("the old editor exited and approved the update");
+
+    // The before picture: msiexec returning is not proof that the new build is
+    // on disk (an elevated or handed-off pass can return first). Only the
+    // installed exe's own stamp is evidence.
+    let before = file_stamp(exe);
+    let status = std::process::Command::new("msiexec.exe")
+        .args(msiexec_arguments(msi))
+        .status();
+    let code = match status {
+        Ok(s) => s.code().unwrap_or(-1),
+        Err(e) => {
+            trail(&format!("msiexec could not start: {e}"));
+            return Err(Error::Platform(format!("msiexec could not start: {e}")));
+        }
+    };
+    if let Some(parent) = result.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(result, format!("{code}\r\n"));
+    trail(&format!("msiexec exit {code}"));
+
+    if matches!(code, 0 | 3010 | 1641) {
+        if wait_for_stamp(exe, before.as_ref(), SETTLE_SECS) {
+            trail("the installed exe changed; the new build is on disk");
+        } else {
+            trail("the installer returned success but the exe stamp did not change");
+        }
+    } else {
+        trail("the installer refused the update; reopening what is installed");
+    }
+
+    // Always bring a window back: a refused install leaves the old build on
+    // screen and the About box names the exit code next launch, which is far
+    // better than a closed app and an empty desktop.
+    relaunch_windows(exe, &trail)?;
+    trail("the editor was relaunched");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn append_log(path: &std::path::Path, step: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let line = format!("{} {step}\r\n", now_secs());
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())
+}
+
+#[cfg(windows)]
+fn file_stamp(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Wait for `pid` to leave, in one-second slices so a reused PID cannot pin
+/// the helper for ever. A process that is already gone is success. While it
+/// waits, `cancellation` is polled too: a UI that decided to stay (an edit
+/// landed, the approval could not be written) ends the wait instead of being
+/// installed over the moment its own `quit` finally lands.
+#[cfg(windows)]
+fn wait_for_process(pid: u32, cancellation: &std::path::Path, seconds: u32) -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return true;
+        }
+        let mut waited = 0;
+        let gone = loop {
+            match WaitForSingleObject(handle, 1000) {
+                WAIT_OBJECT_0 => break true,
+                _ if cancellation.exists() => break false,
+                WAIT_TIMEOUT if waited + 1 >= seconds => break false,
+                WAIT_TIMEOUT => waited += 1,
+                _ => break false,
+            }
+        };
+        CloseHandle(handle);
+        gone
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_stamp(
+    exe: &std::path::Path,
+    before: Option<&std::time::SystemTime>,
+    seconds: u32,
+) -> bool {
+    for _ in 0..seconds {
+        let now = file_stamp(exe);
+        if now.is_some() && now.as_ref() != before {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    false
+}
+
+/// Start the new build with an explicit, visible show state. `ShellExecuteW`
+/// is the shell's own launch path, so it does not inherit this GUI helper's
+/// `STARTUPINFO` and cannot come up hidden; `SW_SHOWNORMAL` is passed for the
+/// same reason. Direct `Command::spawn` is only the fallback when the shell
+/// refuses (a bare account with no shell association, for instance), and the
+/// window backend also re-shows itself if anything upstream still handed it a
+/// hidden startup state.
+#[cfg(windows)]
+fn relaunch_windows(exe: &std::path::Path, trail: &impl Fn(&str)) -> Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            op: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> *mut c_void;
+    }
+    const SW_SHOWNORMAL: i32 = 1;
+    let wide = |s: &std::ffi::OsStr| {
+        s.encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let file = wide(exe.as_os_str());
+    let op = wide(std::ffi::OsStr::new("open"));
+    let dir = exe.parent().map(|p| wide(p.as_os_str()));
+    let dir_ptr = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
+    for attempt in 1..=3 {
+        let started = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                dir_ptr,
+                SW_SHOWNORMAL,
+            )
+        };
+        if started as usize > 32 {
+            return Ok(());
+        }
+        trail(&format!(
+            "relaunch attempt {attempt}: ShellExecuteW returned {}",
+            started as usize
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(750));
+    }
+    trail("ShellExecuteW refused every attempt; spawning the exe directly");
+    std::process::Command::new(exe)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| Error::Platform(format!("the new build did not start: {e}")))
+}
+
+/// The file the installer's exit code is written to (see [`apply_update`]).
+/// The config directory survives the payload sweep that deletes the staged MSI
+/// on the next launch; a payload directory is only the fallback for an account
+/// with no config directory at all.
 const INSTALL_RESULT: &str = "last-install.txt";
 
+#[cfg(windows)]
 fn install_result_path(payload_dir: &std::path::Path) -> std::path::PathBuf {
     crate::settings::config_dir()
         .map(|d| d.join(INSTALL_RESULT))
         .unwrap_or_else(|| payload_dir.join(INSTALL_RESULT))
+}
+
+/// The helper's permission slip, written beside the result file in the same
+/// tick the window leaves (or by `--update` on its way out). It exists only
+/// for a departure that was an update: a helper that finds no token — a window
+/// the user closed themselves, a refusal over unsaved edits — installs nothing.
+#[cfg(windows)]
+const APPROVAL: &str = "last-install.approve";
+/// The editor's "never mind": the waiting helper stops the moment this appears,
+/// so a refused update leaves neither a second editor nor a busy payload behind.
+#[cfg(windows)]
+const CANCELLED: &str = "last-install.cancel";
+
+#[cfg(windows)]
+fn approval_path(result: &std::path::Path) -> std::path::PathBuf {
+    result.with_file_name(APPROVAL)
+}
+
+#[cfg(windows)]
+fn cancel_path(result: &std::path::Path) -> std::path::PathBuf {
+    result.with_file_name(CANCELLED)
+}
+
+/// Write the permission slip. The helper *removes* it before installing, which
+/// is also the claim: two helpers racing over one update cannot both succeed.
+#[cfg(windows)]
+fn write_approval(result: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(approval_path(result), format!("{}\r\n", std::process::id()))
 }
 
 /// msiexec's exit code from the last Windows install attempt, read *and
@@ -912,6 +1445,7 @@ fn log_step(step: &str) -> std::io::Result<()> {
 /// Each batch script line the trail needs lives in the one place the batch
 /// can find it. The script runs after this process has exited, so no
 /// Rust-side logging can see the msiexec outcome — the batch writes it.
+#[cfg(windows)]
 fn update_log_path(payload_dir: &std::path::Path) -> std::path::PathBuf {
     crate::settings::config_dir()
         .map(|d| d.join(UPDATE_LOG))
@@ -943,202 +1477,11 @@ pub fn note_install_result(status: &Status) {
     );
 }
 
-/// How many one-second ticks the install script waits for this process to
-/// leave the process table before installing anyway.
-const WAIT_TICKS: u32 = 120;
-
-/// How many one-second ticks the install script waits for the installer to put
-/// the new exe on disk before reopening whatever is there.
-const SETTLE_TICKS: u32 = 120;
-
-/// How many times the relaunch asks Explorer to start the app before falling
-/// back to `start`.
-const LAUNCH_TRIES: u32 = 3;
-
-/// The batch file a Windows update runs. A file, not a `cmd /c` one-liner:
-/// the waits need `goto`, and the exit code has to be read *after* msiexec
-/// runs — a one-liner expands `%errorlevel%` before anything starts.
-///
-/// Four things it has to get right, each one a failed update:
-///
-/// * **Wait for this process to exit.** An upgrade removes the old files, and
-///   `editor.exe` is one of them; deleting an executable a live process still
-///   maps is how an update ended in msiexec 1603 with no window and no new
-///   version.
-/// * **Record the installer's exit code**, where the next launch reads it. A
-///   refused install and a successful one used to look identical.
-/// * **Reopen the new build, not the old one.** msiexec returning is not the
-///   same thing as the new exe being on disk: the install can still be
-///   finishing in a pass the batch did not start (elevation is one way that
-///   happens), and reopening too early starts the old build, which Windows
-///   Installer then closes when it replaces the file. The update ends with the
-///   app gone and nothing on screen: no window, no new version in front of the
-///   user, and the exit code saying success. So the script takes the installed
-///   exe's file stamp before the install and waits for it to change before
-///   opening anything. The wait is bounded, and it gives up as soon as no
-///   msiexec is left, so a refused install reopens what is there instead of
-///   hanging.
-/// * **Open it visibly, and check that it opened.** This console is created
-///   hidden (`CREATE_NO_WINDOW`), and `start` passes its show state on, which
-///   opened the new build invisibly — then its single-instance lock kept the
-///   next double-click from showing a window either. Explorer does not, so
-///   Explorer is the first choice; but a shell hand-off reports nothing when
-///   it fails, so each attempt looks for the process and retries, and
-///   `start /max` — an explicit show state, so it cannot come up hidden — is
-///   the last resort. Every attempt reaches the log.
-///
-/// Two details are load-bearing and easy to lose in a tidy-up:
-///
-/// * `find.exe` is named by full path. Git for Windows ships a GNU `find` and
-///   puts its `bin` on `PATH`; a bare `find` in that environment resolves to
-///   it, which fails on a bare number, so the loop decided on its first tick
-///   that this process was already gone — the wait was a no-op. The same path
-///   is used for the process check after the relaunch.
-/// * Both waits are bounded. A PID that never leaves the table (the number was
-///   reused by something else) must not leave the update spinning for ever
-///   with no window, no new version and nothing to report.
-///
-/// Kept as a plain string so all of it can be asserted without an installer.
-fn windows_install_script(
-    msi: &std::path::Path,
-    exe: &std::path::Path,
-    pid: u32,
-    result: &std::path::Path,
-    log: &std::path::Path,
-) -> String {
-    // Split by hand rather than with `Path::file_name`: the script is built on
-    // every host the tests run on, and `file_name` knows only that host's
-    // separators — on Linux the whole `C:\...\editor.exe` is one file name,
-    // so the process check below asked for an image nothing is called.
-    let image = exe
-        .to_string_lossy()
-        .rsplit(['\\', '/'])
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("editor.exe")
-        .to_string();
-    let mut s = String::new();
-    s.push_str("@echo off\r\n");
-    s.push_str("set /a waited=0\r\n");
-    s.push_str(":wait\r\n");
-    s.push_str(&format!(
-        "tasklist /FI \"PID eq {pid}\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" \"{pid}\" >nul\r\n"
-    ));
-    s.push_str("if errorlevel 1 goto install\r\n");
-    // The timeout install-anyway is worth knowing about later: it is how a
-    // wait race becomes a 1603 with no window (see the comment above).
-    s.push_str(&format!(
-        "if %waited% geq {WAIT_TICKS} >>\"{}\" echo the app was still running after {WAIT_TICKS}s, installing anyway\r\n",
-        log.display()
-    ));
-    s.push_str(&format!("if %waited% geq {WAIT_TICKS} goto install\r\n"));
-    s.push_str("set /a waited+=1\r\n");
-    s.push_str("ping -n 2 127.0.0.1 >nul\r\n");
-    s.push_str("goto wait\r\n");
-    s.push_str(":install\r\n");
-    // The before picture the relaunch waits on: the installed exe's own file
-    // stamp. Nothing else on this side of the install is trustworthy evidence
-    // that the new build has landed (see the comment above).
-    s.push_str(&format!(
-        "set \"stamp=\"\r\nfor %%f in (\"{}\") do set \"stamp=%%~tf\"\r\n",
-        exe.display()
-    ));
-    s.push_str(&format!(
-        "msiexec /i \"{}\" /passive REBOOT=ReallySuppress\r\n",
-        msi.display()
-    ));
-    // The redirection comes first on purpose: `echo %errorlevel%>file` becomes
-    // `echo 1603>file`, and cmd reads the digit before `>` as a stream number,
-    // so a `0` exit wrote the code nowhere at all.
-    s.push_str(&format!(">\"{}\" echo %errorlevel%\r\n", result.display()));
-    // Same code into the log: last-install.txt is removed when its notice
-    // shows; the log is the historical copy.
-    s.push_str(&format!(
-        ">>\"{}\" echo msiexec exit %errorlevel%\r\n",
-        log.display()
-    ));
-    s.push_str("set /a settled=0\r\n");
-    s.push_str(":settle\r\n");
-    s.push_str(&format!(
-        "for %%f in (\"{}\") do if not \"%%~tf\"==\"%stamp%\" goto launch\r\n",
-        exe.display()
-    ));
-    // An installer that is gone without touching the exe was refused: reopen
-    // what is installed (the About box names the exit code next launch) rather
-    // than sit out the timeout with no window on screen.
-    //
-    // Scoped to this session on purpose. `msiexec.exe` is not only the install
-    // pass: the Windows Installer *service* is a permanent session-0 msiexec
-    // that outlives every install, so an unfiltered image-name match answers
-    // "an installer is still running" for the whole 120-tick timeout even
-    // after the msi came back and changed nothing — two minutes of no window
-    // for an install that already knows it failed. The pass this wait is about
-    // runs in the session that started it, so match that.
-    s.push_str(
-        "tasklist /FI \"IMAGENAME eq msiexec.exe\" /FI \"SESSIONNAME eq %SESSIONNAME%\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" /i \"msiexec.exe\" >nul\r\n",
-    );
-    s.push_str(&format!(
-        "if errorlevel 1 >>\"{}\" echo the installer left the exe alone; opening what is installed\r\n",
-        log.display()
-    ));
-    s.push_str("if errorlevel 1 goto launch\r\n");
-    s.push_str(&format!(
-        "if %settled% geq {SETTLE_TICKS} >>\"{}\" echo the installer was still running after {SETTLE_TICKS}s; opening the app anyway\r\n",
-        log.display()
-    ));
-    s.push_str(&format!("if %settled% geq {SETTLE_TICKS} goto launch\r\n"));
-    s.push_str("set /a settled+=1\r\n");
-    s.push_str("ping -n 2 127.0.0.1 >nul\r\n");
-    s.push_str("goto settle\r\n");
-    s.push_str(":launch\r\n");
-    // One beat first: the stamp changes when the file starts landing, and a
-    // launch that beats the copy earns an Explorer error instead of a window.
-    s.push_str("ping -n 3 127.0.0.1 >nul\r\n");
-    s.push_str("set /a tried=0\r\n");
-    s.push_str(":attempt\r\n");
-    s.push_str(&format!("explorer.exe \"{}\"\r\n", exe.display()));
-    s.push_str("set /a tried+=1\r\n");
-    s.push_str(&format!(
-        ">>\"{}\" echo relaunch attempt %tried%: explorer {}\r\n",
-        log.display(),
-        exe.display()
-    ));
-    // Long enough for a cold start to show up in the process table; the check
-    // is what turns "explorer was asked" into "the app is running".
-    s.push_str("ping -n 4 127.0.0.1 >nul\r\n");
-    s.push_str(&format!(
-        "tasklist /FI \"IMAGENAME eq {image}\" 2>nul | \"%SystemRoot%\\System32\\find.exe\" /i \"{image}\" >nul\r\n"
-    ));
-    s.push_str(&format!(
-        "if not errorlevel 1 >>\"{}\" echo relaunch: {image} is running\r\n",
-        log.display()
-    ));
-    s.push_str("if not errorlevel 1 goto end\r\n");
-    s.push_str(&format!(
-        ">>\"{}\" echo relaunch attempt %tried% started nothing\r\n",
-        log.display()
-    ));
-    s.push_str(&format!("if %tried% geq {LAUNCH_TRIES} goto fallback\r\n"));
-    s.push_str("goto attempt\r\n");
-    s.push_str(":fallback\r\n");
-    // The last resort: `start` would pass this hidden console's show state on,
-    // but with `/max` the app is opened with an explicit one, so a maximized
-    // window beats no window. The session's own place is not consulted here,
-    // and the log says the fallback was the route that worked.
-    s.push_str(&format!("start \"\" /max \"{}\"\r\n", exe.display()));
-    s.push_str(&format!(
-        ">>\"{}\" echo relaunch fallback: start /max {}\r\n",
-        log.display(),
-        exe.display()
-    ));
-    s.push_str(":end\r\n");
-    s
-}
-
 /// `%LOCALAPPDATA%\Programs\Editor\editor.exe` — where `editor.wxs` puts the
 /// per-user install (`PerUserProgramFilesFolder` + the `Editor` folder). Falls
 /// back to this exe in an environment with no `LOCALAPPDATA`, which only a
 /// stripped account has.
+#[cfg(windows)]
 fn installed_exe() -> std::path::PathBuf {
     match std::env::var_os("LOCALAPPDATA") {
         Some(local) => std::path::PathBuf::from(local)
@@ -1147,24 +1490,6 @@ fn installed_exe() -> std::path::PathBuf {
             .join("editor.exe"),
         None => std::env::current_exe().unwrap_or_default(),
     }
-}
-
-/// Run the install script with no console of its own: this is a GUI process, so
-/// a `cmd` window would flash in front of the user for the length of an install.
-#[cfg(windows)]
-fn windows_hidden_cmd(script: &str) -> std::io::Result<std::process::Child> {
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new("cmd.exe")
-        .raw_arg(format!("/c {script}"))
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .spawn()
-}
-
-#[cfg(not(windows))]
-fn windows_hidden_cmd(_script: &str) -> std::io::Result<std::process::Child> {
-    Err(std::io::Error::other(
-        "the MSI install path is Windows-only",
-    ))
 }
 
 /// The directory a staged download lives in. Every caller unpacks *next to*
@@ -1178,9 +1503,9 @@ fn parent_dir(file: &std::path::Path) -> Result<std::path::PathBuf> {
 }
 
 /// Linux: unpack and rename the fresh binary over the running one. POSIX
-/// `rename` replaces an open executable in place, so this instance finishes
-/// serving files on the old image while the next launch (desktop entry,
-/// terminal) runs the new build.
+/// `rename` replaces an open executable in place, so this instance keeps
+/// serving files from the old image for the moment it takes the window to
+/// save and close; the build started from the last tick runs the new one.
 fn install_linux(file: &std::path::Path, tag: &str) -> Result<()> {
     let dir = parent_dir(file)?;
     run_unpack("tar", &["-xzf".into()], file, &dir)?;
@@ -1206,9 +1531,7 @@ fn install_linux(file: &std::path::Path, tag: &str) -> Result<()> {
             // them before the handoff (nothing else will: this is the only
             // process that knows the directory).
             let _ = std::fs::remove_dir_all(&dir);
-            // `relaunch` ends the process on success; reaching the `Ok(())`
-            // only happens when it stayed alive on a failed heroics path.
-            relaunch(&me, tag);
+            hand_off(&me, tag);
             Ok(())
         }
         Err(e) => Err(Error::Platform(format!(
@@ -1245,7 +1568,7 @@ fn install_macos(file: &std::path::Path, tag: &str) -> Result<()> {
     std::fs::rename(&fresh, &bundle)?;
     // The zip and any unpacking leftovers: nothing else removes them.
     let _ = std::fs::remove_dir_all(&dir);
-    relaunch(&bundle.join("Contents/MacOS/editor"), tag);
+    hand_off(&bundle.join("Contents/MacOS/editor"), tag);
     Ok(())
 }
 
@@ -1275,16 +1598,38 @@ fn run_unpack(
     Ok(())
 }
 
-/// Spawn the fresh binary with no args (the session restore in `cli::run`
-/// puts the window where it belongs) and exit this instance. If the spawn
-/// fails the flow reports and stays alive — the user still has a working
-/// (old) app, the install just shows its results by hand next time.
-fn relaunch(exe: &std::path::Path, tag: &str) {
+/// Hand the freshly installed binary the job of running this one's successor.
+///
+/// With a window open the UI owns the departure: it saves the session on its
+/// next tick, and only then starts the new build, so the window that comes
+/// back is the same one. Starting it here instead would race the session write
+/// (and, on a dirty buffer, a departure that is not going to happen). A console
+/// `--update` has no session to save and starts it at once.
+fn hand_off(exe: &std::path::Path, tag: &str) {
+    if APP_RUNNING.load(Ordering::Relaxed) {
+        if let Ok(mut slot) = PENDING_RELAUNCH.lock() {
+            *slot = Some(exe.to_path_buf());
+        }
+        RESTART_REQUESTED.store(true, Ordering::Relaxed);
+        let _ = log_step("waiting for the editor to save its session and leave");
+        return;
+    }
+    if start(exe) {
+        std::process::exit(0);
+    }
+    print_line(&format!("{tag} installed; start it from your launcher"));
+}
+
+/// Start the installed build, visibly. The failure is logged and reported to
+/// the caller, which keeps the current window alive rather than closing for
+/// nothing.
+fn start(exe: &std::path::Path) -> bool {
     match std::process::Command::new(exe).spawn() {
-        Ok(_) => std::process::exit(0),
-        Err(e) => print_line(&format!(
-            "{tag} installed; start the new one from your launcher (auto-restart failed: {e})"
-        )),
+        Ok(_) => true,
+        Err(e) => {
+            let _ = log_step(&format!("the new build did not start: {e}"));
+            false
+        }
     }
 }
 
@@ -1669,164 +2014,120 @@ mod tests {
     }
 
     #[test]
-    fn windows_install_waits_then_installs_then_relaunches() {
-        let msi =
-            r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi";
-        let exe = r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe";
-        let result = r"C:\Users\me\AppData\Roaming\Editor\last-install.txt";
-        let log = r"C:\Users\me\AppData\Roaming\Editor\last-update.log";
-        let script = windows_install_script(
-            std::path::Path::new(msi),
-            std::path::Path::new(exe),
+    #[cfg(windows)]
+    fn windows_update_handoff_is_data_not_a_script() {
+        let args = helper_arguments(
+            std::path::Path::new(
+                r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi",
+            ),
+            std::path::Path::new(r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe"),
             4321,
-            std::path::Path::new(result),
-            std::path::Path::new(log),
+            std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-install.txt"),
+            std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-update.log"),
         );
-        // The installer must install, then open the app once it is the new
-        // build — never before, or the window it opens is the one the upgrade
-        // is about to close.
-        let install = script.find("msiexec /i \"").expect("installer line");
-        let launch = script.find(":launch\r\n").expect("the launch stage");
-        let explorer_line = script
-            .find(&format!("explorer.exe \"{exe}\""))
-            .expect("relaunch line");
-        assert!(install < launch, "both present, install first");
-        assert!(launch < explorer_line, "and the launch stage opens the app");
-        assert_eq!(script.matches("msiexec /i ").count(), 1);
-        // An update may close and reopen the app; it may never restart the box.
-        assert!(script.contains("/passive"));
-        assert!(script.contains("REBOOT=ReallySuppress"));
-        assert!(!script.contains("EDITOR_RESTART"));
-
-        // The upgrade removes the old exe, so it must wait for this process to
-        // leave the process table first — that race is what produced 1603.
-        assert!(script.contains("PID eq 4321"), "waits on this process");
-        assert!(script.contains("goto wait"), "and keeps waiting");
-        assert!(
-            script.find("goto wait").unwrap() < install,
-            "the wait comes before the install"
-        );
-        // A bare `find` is whatever `PATH` says it is — on a machine with Git
-        // for Windows that is GNU find, which rejects a bare number and made
-        // the wait end on its first tick.
-        assert!(
-            script.contains(r#""%SystemRoot%\System32\find.exe""#),
-            "the Windows find is named by full path"
-        );
-        // A timed-out wait says so instead of installing silently: that is
-        // how a wait race becomes a no-window 1603, and the log is the only
-        // way to see it after the fact.
-        assert!(
-            script.contains("still running after 120s, installing anyway"),
-            "the timeout is logged, not just tolerated"
-        );
-        // Bounded, so a reused PID cannot spin here for ever.
-        let cap = script.find("if %waited% geq").expect("a bound on the wait");
-        assert!(cap < install, "and it is checked before the install");
-        assert!(script.contains("set /a waited=0"), "ticked from zero");
-
-        // The exit code has to be captured *after* msiexec, which a batch file
-        // does and a `/c` one-liner does not (it expands at parse time).
-        let echo = script
-            .find("echo %errorlevel%")
-            .expect("records the result");
-        assert!(echo > install, "after the installer runs");
-        // `echo %errorlevel%>file` turns into `echo 0>file` on success, and cmd
-        // reads that `0` as a stream number — the result went missing.
-        assert!(
-            script.contains(&format!(">\"{result}\" echo")),
-            "redirection first, so the code cannot be read as a stream number"
-        );
-
-        // msiexec exiting is not the new build being on disk: the script takes
-        // the installed exe's stamp before the install and waits for it to
-        // change, which is what an early-returning (elevated, handed-off)
-        // install leaves behind.
-        let stamp = script
-            .find(&format!("for %%f in (\"{exe}\") do set \"stamp=%%~tf\""))
-            .expect("captures the installed exe's stamp");
-        assert!(stamp < install, "the stamp is the before picture");
-        assert!(
-            script.contains(&format!(
-                "for %%f in (\"{exe}\") do if not \"%%~tf\"==\"%stamp%\" goto launch"
-            )),
-            "the new build is waited for, not assumed"
-        );
-        // And the wait cannot outlive an installer that is already gone: a
-        // refused install opens what is installed and leaves the code to the
-        // next launch's notice instead of leaving the screen empty.
-        assert!(script.contains("IMAGENAME eq msiexec.exe"));
-        // Matching the image name alone would find the Windows Installer
-        // service, which runs in session 0 and never goes away, so the escape
-        // below would never fire.
-        assert!(script.contains("/FI \"SESSIONNAME eq %SESSIONNAME%\""));
-        assert!(script.contains("left the exe alone; opening what is installed"));
-        assert!(script.contains("still running after 120s; opening the app anyway"));
-
-        // A shell hand-off reports nothing when it fails, so each attempt is
-        // verified against the process table and retried; `start` is the last
-        // resort, and `/max` gives it an explicit show state.
-        assert!(script.contains("IMAGENAME eq editor.exe"));
-        assert!(script.contains("if not errorlevel 1 goto end"));
-        assert!(script.contains(&format!("if %tried% geq {LAUNCH_TRIES} goto fallback")));
-        assert!(script.contains(&format!("start \"\" /max \"{exe}\"")));
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[0], "--apply-update");
+        // Each path is one argument and keeps its spaces. No shell ever
+        // re-parses it, so there are no quotes to get wrong, no batch `%`
+        // expansion, and no `find.exe` resolved through PATH.
         assert_eq!(
-            script.matches("start \"\"").count(),
-            1,
-            "start is the last resort, never the first choice"
+            args[1],
+            r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi"
         );
-
-        // The batch outlives this process, so it writes the trail itself, and
-        // every path through the tail of the update says what it did.
-        for line in [
-            "echo msiexec exit %errorlevel%",
-            "echo relaunch attempt %tried%: explorer",
-            "echo relaunch: editor.exe is running",
-            "echo relaunch attempt %tried% started nothing",
-            "echo relaunch fallback: start /max",
-        ] {
-            assert!(
-                script.contains(&format!(">>\"{log}\" {line}")),
-                "missing from the trail: {line}"
-            );
-        }
-        let relaunch_log = script
-            .find("echo relaunch attempt")
-            .expect("logs the attempt");
+        assert_eq!(
+            args[2],
+            r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe"
+        );
+        assert_eq!(args[3], "4321");
+        let parsed = parse_helper_args(&args[1..]).expect("the helper accepts its argv");
+        assert_eq!(parsed.pid, 4321);
+        assert_eq!(parsed.exe.to_string_lossy(), args[2]);
+        // The approval token is derived from the result path instead of being
+        // another argument: the two always sit together, so a helper can never
+        // be pointed at a result it will write and a token it will not read.
+        let approval = approval_path(&parsed.result);
+        assert_eq!(approval.parent(), parsed.result.parent());
+        assert_eq!(approval.file_name().unwrap(), APPROVAL);
+        assert_eq!(cancel_path(&parsed.result).parent(), parsed.result.parent());
         assert!(
-            explorer_line < relaunch_log,
-            "the relaunch is logged after it is attempted"
+            parse_helper_args(&args[1..4]).is_err(),
+            "a partial hand-off is refused instead of guessing"
         );
     }
 
-    /// The process check after the relaunch names the exe whatever separators
-    /// the path came with. The script is built on every host the suite runs
-    /// on, and `Path::file_name` knows only the host's own separators — on
-    /// Linux a `C:\...\editor.exe` was one file name, so the check asked for
-    /// an image that nothing is called.
     #[test]
-    fn the_relaunch_check_names_the_exe_on_any_host() {
-        for exe in [
-            r"C:\Users\me\AppData\Local\Programs\Editor\editor.exe",
-            "/home/me/.local/bin/editor",
+    #[cfg(windows)]
+    fn the_installer_is_silent_bounded_and_cannot_restart_anything() {
+        let msi = std::path::Path::new(
+            r"C:\Users\me\AppData\Local\Temp\editor-update-v0.2.0\editor-v0.2.0-windows-x86_64.msi",
+        );
+        let args: Vec<String> = msiexec_arguments(msi)
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.iter().filter(|a| a.as_str() == "/i").count(), 1);
+        assert!(
+            args.contains(&msi.to_string_lossy().into_owned()),
+            "the package is passed as data: {args:?}"
+        );
+        for want in [
+            "/passive",
+            "REBOOT=ReallySuppress",
+            "MSIDISABLERMRESTART=1",
+            "MSIRESTARTMANAGERCONTROL=Disable",
+            "EDITOR_SKIP_LAUNCH=1",
         ] {
-            let script = windows_install_script(
-                std::path::Path::new(
-                    r"C:\Users\me\AppData\Local\Temp\x\editor-v0.2.0-windows-x86_64.msi",
-                ),
-                std::path::Path::new(exe),
-                4321,
-                std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-install.txt"),
-                std::path::Path::new(r"C:\Users\me\AppData\Roaming\Editor\last-update.log"),
-            );
-            let image = exe.rsplit(['\\', '/']).next().unwrap();
-            assert!(
-                script.contains(&format!("IMAGENAME eq {image}")),
-                "{exe}: the process check does not name {image}"
-            );
+            assert!(args.iter().any(|a| a == want), "missing {want}: {args:?}");
         }
+        // The package's own launch is disabled by the property the WiX
+        // condition names; the helper's relaunch is the only one.
+        assert!(!args.iter().any(|a| a.contains("EDITOR_RESTART")));
     }
 
+    #[test]
+    fn unsaved_edits_are_visible_to_the_install_thread() {
+        note_unsaved(true);
+        assert!(
+            has_unsaved_edits(),
+            "the UI's dirty flag must reach install"
+        );
+        note_unsaved(false);
+        assert!(!has_unsaved_edits());
+        // The UI tick consumes a restart request exactly once.
+        assert!(!take_restart_request(), "nothing asked for a restart");
+    }
+
+    /// The install only ever runs for an editor that left through its own
+    /// approval path: a window closed by the user, or one that stayed on
+    /// purpose, leaves no token and the helper installs nothing.
+    #[test]
+    #[cfg(windows)]
+    fn the_helper_installs_only_for_an_approved_hand_off() {
+        let dir = crate::testing::temp_dir().join("editor-approval-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = dir.join(INSTALL_RESULT);
+        arm_restart(&result);
+        let approval = approval_path(&result);
+        let cancellation = cancel_path(&result);
+        assert_eq!(approval.parent(), Some(dir.as_path()));
+        assert!(!approval.exists(), "nothing is approved yet");
+        assert!(!cancellation.exists());
+
+        assert!(approve_restart(), "the armed path is writable");
+        assert!(approval.exists());
+        std::fs::remove_file(&approval).unwrap();
+        assert!(
+            std::fs::remove_file(&approval).is_err(),
+            "the claim is the removal: two helpers cannot both install"
+        );
+
+        // Staying writes the cancellation instead, and never the approval.
+        cancel_restart();
+        assert!(cancellation.exists());
+        assert!(!approval.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn a_failed_install_is_reported_once_and_success_is_not() {
         let dir = crate::settings::config_dir().expect("test config dir");
@@ -1951,7 +2252,8 @@ mod tests {
         assert!(
             wxs.contains(
                 "<Custom Action=\"LaunchTargetPath\" After=\"InstallFinalize\" \
-                 Condition=\"UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot;\""
+                 Condition=\"UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot; \
+                 AND NOT EDITOR_SKIP_LAUNCH\""
             ),
             "passive installs launched by the updater relaunch, silent deploys do not"
         );

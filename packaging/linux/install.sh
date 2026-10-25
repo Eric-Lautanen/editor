@@ -95,7 +95,7 @@ fi
 
 update-mime-database "$HOME/.local/share/mime" || true
 update-desktop-database "$HOME/.local/share/applications" || true
-for t in text/markdown application/json application/x-ndjson text/plain text/csv text/x-yaml application/toml; do
+for t in text/markdown application/json application/x-ndjson text/plain text/csv text/x-yaml application/toml text/x-editor-dotfile; do
     xdg-mime default editor.desktop "$t" || true
 done
 

@@ -294,12 +294,35 @@ impl App {
     /// identical four-line block; whatever changes scroll-on-(re)install —
     /// the editor band, the streaming pump's probe, any band work — changes
     /// it here, once.
+    ///
+    /// A re-install of the *same* document at the *same* place — the editor
+    /// band crossing the rows it covers during a flick, a paint that rebuilds
+    /// a pane mid-ride — is not an input, so it must not end the ride: the
+    /// coast and a glide's target carry over. This used to go through
+    /// `scroll_by(0.0)`, which is `ScrollState`'s way of saying "the pointer
+    /// took over", and it killed both: since T1 made the editor pane a band,
+    /// every coast long enough to matter leaves the band within about a
+    /// screen, so a touch flick stopped dead in Edit (and stuttered in Split,
+    /// where the editor half is a band too). Preview kept its whole list for
+    /// a small file, never rebuilt, and was the one pane that felt right.
+    /// Only a document whose height (or the view's place in it) changed under
+    /// the ride ends it, because its pixel offsets no longer mean those rows.
     pub(super) fn install_scroll_geometry(&mut self, content: f32, view_h: f32, ratio: f32) {
         let tab = &mut self.tabs[self.active];
+        let same_document = (tab.scroll.content_height - content).abs() < 0.5;
         tab.scroll.content_height = content;
         tab.scroll.viewport_height = view_h;
-        tab.scroll.offset = ratio * content;
-        tab.scroll.scroll_by(0.0);
+        let offset = (ratio * content).clamp(0.0, tab.scroll.max());
+        let same_place = (offset - tab.scroll.offset).abs() < 0.5;
+        tab.scroll.offset = offset;
+        if same_document && same_place {
+            // Both rides are measured in this document's pixels, so they
+            // carry over; the destination only has to stay in range.
+            tab.scroll.target = tab.scroll.target.clamp(0.0, tab.scroll.max());
+        } else {
+            tab.scroll.coast = 0.0;
+            tab.scroll.target = offset;
+        }
     }
 
     /// Install a done layout: the editor half if this mode has one, the pane's

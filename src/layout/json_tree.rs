@@ -2301,7 +2301,7 @@ mod tests {
         // every toggle) stays drawn, so hit count is unchanged and ids stable.
         let array_id = match &open.hits[1].action {
             HitAction::ToggleNode(id) => *id,
-            HitAction::Link(href) => panic!("expected toggle, got link {href}"),
+            other => panic!("expected toggle, got {other:?}"),
         };
         let mut collapsed = HashSet::new();
         collapsed.insert(array_id);
@@ -2311,7 +2311,7 @@ mod tests {
         // Collapsing the root hides the whole subtree including inner toggles.
         let root_id = match &open.hits[0].action {
             HitAction::ToggleNode(id) => *id,
-            HitAction::Link(href) => panic!("expected toggle, got link {href}"),
+            other => panic!("expected toggle, got {other:?}"),
         };
         let mut shut_root = HashSet::new();
         shut_root.insert(root_id);
@@ -2413,7 +2413,7 @@ mod tests {
         assert!(!shown.contains('▶'), "collapsed glyph while open: {shown}");
         let root = match &open.hits[0].action {
             HitAction::ToggleNode(id) => *id,
-            HitAction::Link(href) => panic!("expected a toggle, got link {href}"),
+            other => panic!("expected a toggle, got {other:?}"),
         };
         let mut collapsed = HashSet::new();
         collapsed.insert(root);
@@ -3373,7 +3373,7 @@ mod tests {
             .iter()
             .filter_map(|h| match &h.action {
                 HitAction::ToggleNode(id) => Some(*id),
-                HitAction::Link(_) => None,
+                _ => None,
             })
             .collect();
         ids.sort_unstable();

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use super::ast::*;
 use super::decode_entities;
+use super::html::{self, Tag, TagKind};
 use super::inline::parse_inlines_with;
 
 /// Leading tabs count as 4 columns for indent measurement; the tab itself is
@@ -102,7 +103,8 @@ fn parse_ref_def(line: &str) -> Option<(String, String)> {
     }
     let close = t.find(']')?;
     let label = t[1..close].trim();
-    if label.is_empty() || label.contains('[') || label.contains(']') {
+    // `[^x]: …` is a footnote definition, not a link target.
+    if label.is_empty() || label.starts_with('^') || label.contains('[') || label.contains(']') {
         return None;
     }
     let rest = t[close + 1..].trim_start();
@@ -143,33 +145,267 @@ fn is_ref_def(line: &str) -> bool {
 fn collect_ref_defs(lines: &[String]) -> HashMap<String, String> {
     let mut defs = HashMap::new();
     let mut fence: Option<Fence> = None;
-    let mut html = false;
-    for line in lines {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
         if let Some(open) = &fence {
             if is_close_fence(line, open) {
                 fence = None;
             }
-            continue;
-        }
-        if html {
-            if is_blank(line) {
-                html = false;
-            }
+            i += 1;
             continue;
         }
         if let Some(open) = open_fence(line) {
             fence = Some(open);
+            i += 1;
             continue;
         }
-        if is_html_block_start(line) || indent_of(line) >= 4 {
-            html = is_html_block_start(line);
+        if starts_html_block(line) {
+            i = skip_html_block(lines, i);
+            continue;
+        }
+        if indent_of(line) >= 4 {
+            i += 1;
             continue;
         }
         if let Some((label, href)) = parse_ref_def(line) {
             defs.entry(label).or_insert(href);
         }
+        i += 1;
     }
     defs
+}
+
+/// Parse a footnote definition line (`[^label]: first line of the body`).
+/// Returns (label, body remainder). Up to 3 leading spaces, like a link
+/// definition; a deeper indent is code, not a definition.
+fn footnote_def(line: &str) -> Option<(String, String)> {
+    if indent_of(line) > 3 {
+        return None;
+    }
+    let t = line.trim_start();
+    let rest = t.strip_prefix("[^")?;
+    let close = rest.find(']')?;
+    let label = &rest[..close];
+    if label.is_empty() || label.contains('[') || label.contains('\n') {
+        return None;
+    }
+    let after = rest[close + 1..].strip_prefix(':')?;
+    Some((label.to_string(), after.trim_start().to_string()))
+}
+
+/// One collected definition, before numbering decides whether it prints.
+struct FootnoteItem {
+    label: String,
+    blocks: Vec<Block>,
+}
+
+/// Lift footnote definitions out of the text before the block parse.
+///
+/// GitHub collects these and prints the referenced ones as a numbered list at
+/// the end, so the definition lines themselves must not render where they
+/// were written. Definitions are taken at the top level, which is where a
+/// README writes them. Each definition runs until the next
+/// non-blank line that is not indented four spaces; the consumed lines are
+/// blanked rather than removed, which keeps every later block's line numbers
+/// (and therefore the splice bookkeeping) intact.
+fn collect_footnotes(lines: &mut [String], defs: &HashMap<String, String>) -> Vec<FootnoteItem> {
+    let mut found: Vec<(usize, usize, String, String)> = Vec::new();
+    let mut fence: Option<Fence> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        if let Some(open) = &fence {
+            if is_close_fence(line, open) {
+                fence = None;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(open) = open_fence(line) {
+            fence = Some(open);
+            i += 1;
+            continue;
+        }
+        if starts_html_block(line) {
+            i = skip_html_block(lines, i);
+            continue;
+        }
+        if indent_of(line) >= 4 {
+            i += 1;
+            continue;
+        }
+        let Some((label, first)) = footnote_def(line) else {
+            i += 1;
+            continue;
+        };
+        let mut body = vec![first];
+        let mut j = i + 1;
+        while j < lines.len() {
+            let body_line = &lines[j];
+            if is_blank(body_line) {
+                // A blank belongs to the body only when indented text follows
+                // it; otherwise it separates the definition from the next
+                // block.
+                let mut k = j + 1;
+                while k < lines.len() && is_blank(&lines[k]) {
+                    k += 1;
+                }
+                if k < lines.len() && indent_of(&lines[k]) >= 4 {
+                    body.push(String::new());
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if indent_of(body_line) >= 4 {
+                body.push(body_line[4.min(body_line.len())..].to_string());
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        found.push((i, j, label, body.join("\n")));
+        i = j;
+    }
+    for (start, end, ..) in &found {
+        for line in &mut lines[*start..*end] {
+            line.clear();
+        }
+    }
+    // First definition of a label wins; a duplicate is still consumed.
+    let mut items: Vec<FootnoteItem> = Vec::new();
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for (_, _, label, body) in found {
+        if seen.insert(norm_label(&label), ()).is_some() {
+            continue;
+        }
+        items.push(FootnoteItem {
+            label,
+            blocks: parse_blocks_with_defs(&body, defs).blocks,
+        });
+    }
+    items
+}
+
+/// Number the references and hand back the notes that print, in order.
+///
+/// A reference takes the next number the first time its label is seen, so the
+/// numbers follow the text, not the order the definitions were written in.
+/// References inside a definition are numbered after the reference that led
+/// to it. Definitions nobody references are dropped, as are their numbers.
+fn resolve_footnotes(
+    blocks: &mut [Block],
+    mut items: Vec<FootnoteItem>,
+) -> Vec<(usize, Vec<Block>)> {
+    let mut def_index: HashMap<String, usize> = HashMap::new();
+    for (i, item) in items.iter().enumerate() {
+        def_index.entry(norm_label(&item.label)).or_insert(i);
+    }
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut order: Vec<usize> = Vec::new();
+    fn record(
+        inline: &mut Inline,
+        def_index: &HashMap<String, usize>,
+        seen: &mut HashMap<String, usize>,
+        order: &mut Vec<usize>,
+    ) {
+        let Inline::FootnoteRef { label, .. } = inline else {
+            return;
+        };
+        let key = norm_label(label);
+        let Some(&idx) = def_index.get(&key) else {
+            return;
+        };
+        if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
+            e.insert(order.len());
+            order.push(idx);
+        }
+    }
+    walk_blocks(blocks, &mut |inline| {
+        record(inline, &def_index, &mut seen, &mut order)
+    });
+    // Notes can reference each other: walk the bodies in the order they were
+    // numbered, so a note discovered this way takes the next number.
+    let mut k = 0;
+    while k < order.len() {
+        let idx = order[k];
+        walk_blocks(&mut items[idx].blocks, &mut |inline| {
+            record(inline, &def_index, &mut seen, &mut order)
+        });
+        k += 1;
+    }
+    walk_blocks(blocks, &mut |inline| {
+        if let Inline::FootnoteRef { label, number } = inline {
+            *number = seen.get(&norm_label(label)).map_or(0, |p| p + 1);
+        }
+    });
+    for item in items.iter_mut() {
+        walk_blocks(&mut item.blocks, &mut |inline| {
+            if let Inline::FootnoteRef { label, number } = inline {
+                *number = seen.get(&norm_label(label)).map_or(0, |p| p + 1);
+            }
+        });
+    }
+    let mut numbered: Vec<(usize, Vec<Block>)> = items
+        .into_iter()
+        .filter_map(|item| {
+            let number = seen.get(&norm_label(&item.label))? + 1;
+            Some((number, item.blocks))
+        })
+        .collect();
+    numbered.sort_by_key(|(number, _)| *number);
+    numbered
+}
+
+/// Visit every inline in the block tree, in reading order.
+fn walk_blocks(blocks: &mut [Block], f: &mut impl FnMut(&mut Inline)) {
+    for block in blocks {
+        match block {
+            Block::Heading { content, .. } | Block::Paragraph(content) => walk_inlines(content, f),
+            Block::Quote(inner)
+            | Block::Html { blocks: inner, .. }
+            | Block::Alert { blocks: inner, .. } => walk_blocks(inner, f),
+            Block::Details { summary, blocks } => {
+                walk_inlines(summary, f);
+                walk_blocks(blocks, f);
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    walk_blocks(&mut item.blocks, f);
+                }
+            }
+            Block::Table { head, rows, .. } => {
+                for cell in head {
+                    walk_inlines(cell, f);
+                }
+                for row in rows {
+                    for cell in row {
+                        walk_inlines(cell, f);
+                    }
+                }
+            }
+            Block::Footnote { blocks, .. } => walk_blocks(blocks, f),
+            Block::FootnoteRule | Block::Code { .. } | Block::Rule => {}
+        }
+    }
+}
+
+fn walk_inlines(inlines: &mut [Inline], f: &mut impl FnMut(&mut Inline)) {
+    for inline in inlines {
+        f(inline);
+        match inline {
+            Inline::Emph(v)
+            | Inline::Strong(v)
+            | Inline::Strike(v)
+            | Inline::Underline(v)
+            | Inline::Highlight(v)
+            | Inline::Sup(v)
+            | Inline::Sub(v) => walk_inlines(v, f),
+            Inline::Link { content, .. } => walk_inlines(content, f),
+            _ => {}
+        }
+    }
 }
 
 /// `---`/`***`/`___` thematic break (spaces allowed between markers).
@@ -278,6 +514,25 @@ fn quote_prefix(line: &str) -> Option<usize> {
     }
 }
 
+/// GitHub's alert marker (`[!NOTE]`, `[!WARNING]`, …) as the quote's first
+/// non-blank line. The marker line is removed; the rest of the quote becomes
+/// the callout body.
+fn take_alert(lines: &mut Vec<String>) -> Option<AlertKind> {
+    let idx = lines.iter().position(|l| !l.trim().is_empty())?;
+    let t = lines[idx].trim();
+    let name = t.strip_prefix("[!")?.strip_suffix(']')?;
+    let kind = match name.to_ascii_uppercase().as_str() {
+        "NOTE" => AlertKind::Note,
+        "TIP" => AlertKind::Tip,
+        "IMPORTANT" => AlertKind::Important,
+        "WARNING" => AlertKind::Warning,
+        "CAUTION" => AlertKind::Caution,
+        _ => return None,
+    };
+    lines.remove(idx);
+    Some(kind)
+}
+
 struct ListMarker {
     ordered: bool,
     delim: char,
@@ -361,17 +616,206 @@ fn list_marker(line: &str) -> Option<ListMarker> {
     })
 }
 
-/// Block HTML that we skip wholesale (until a blank line): a `<` tag opener.
-fn is_html_block_start(line: &str) -> bool {
-    let t = line.trim_start();
-    if indent_of(line) > 3 || !t.starts_with('<') {
-        return false;
-    }
-    let inner = &t[1..];
+/// An HTML construct at the start of a line that the block parser handles.
+/// Unknown tags never reach here: a line of `<span>text</span>` is a
+/// paragraph, and the inline parser drops the tags inside it.
+enum HtmlStart {
+    /// `<!-- … -->` or a `<!doctype …>` declaration; dropped with contents.
+    Skip,
+    /// A block-level tag, with its attribute set already parsed.
+    Tag { tag: Tag },
+}
+
+/// Tags whose interior is a block of its own rather than inline text.
+fn is_block_tag(name: &str) -> bool {
     matches!(
-        inner.chars().next(),
-        Some(c) if c.is_ascii_alphabetic() || c == '/' || c == '!' || c == '?'
+        name,
+        "div"
+            | "center"
+            | "p"
+            | "section"
+            | "figure"
+            | "figcaption"
+            | "picture"
+            | "article"
+            | "main"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "blockquote"
+            | "details"
+            | "summary"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "ul"
+            | "ol"
+            | "li"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "pre"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "hr"
     )
+}
+
+fn html_start(line: &str) -> Option<HtmlStart> {
+    if indent_of(line) > 3 {
+        return None;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let at = chars.iter().position(|c| *c == '<')?;
+    if at > 3 || chars.get(at + 1) == Some(&'!') {
+        if at > 3 {
+            return None;
+        }
+        return Some(HtmlStart::Skip);
+    }
+    let tag = html::tag_at(&chars, at)?;
+    if tag.kind != TagKind::Open || !(is_block_tag(&tag.name) || html::is_dangerous(&tag.name)) {
+        return None;
+    }
+    Some(HtmlStart::Tag { tag })
+}
+
+/// A line that ends a paragraph: a comment, a dangerous element, or a
+/// structural tag. Inline-only tags do not.
+fn starts_html_block(line: &str) -> bool {
+    match html_start(line) {
+        Some(HtmlStart::Skip) => true,
+        Some(HtmlStart::Tag { tag, .. }) => {
+            html::is_dangerous(&tag.name) || is_block_tag(&tag.name)
+        }
+        None => false,
+    }
+}
+
+/// The interior of a block element opened at `line` just past `after`, and
+/// where its matching close tag sits. `close` is `None` when the element is
+/// never closed; the caller then consumes only the opener line.
+struct HtmlRegion {
+    inner: Vec<String>,
+    close: Option<usize>,
+}
+
+fn html_region(lines: &[String], line: usize, after: usize, name: &str) -> HtmlRegion {
+    let mut inner = Vec::new();
+    let mut depth = 0usize;
+    let mut li = line;
+    let mut ci = after;
+    loop {
+        let Some(raw) = lines.get(li) else {
+            return HtmlRegion { inner, close: None };
+        };
+        let chars: Vec<char> = raw.chars().collect();
+        let mut j = ci;
+        let mut found = None;
+        while j < chars.len() {
+            if chars[j] == '<' {
+                if let Some(tag) = html::tag_at(&chars, j) {
+                    if tag.name == name && !tag.self_closing {
+                        match tag.kind {
+                            TagKind::Close if depth == 0 => {
+                                found = Some(j);
+                                break;
+                            }
+                            TagKind::Close => depth -= 1,
+                            TagKind::Open => depth += 1,
+                        }
+                    }
+                    j = tag.end;
+                    continue;
+                }
+            }
+            j += 1;
+        }
+        match found {
+            Some(j) => {
+                let tail: String = chars[ci.min(j)..j].iter().collect();
+                if !tail.trim().is_empty() || inner.is_empty() {
+                    inner.push(tail);
+                }
+                return HtmlRegion {
+                    inner,
+                    close: Some(li),
+                };
+            }
+            None => {
+                inner.push(chars[ci..].iter().collect());
+            }
+        }
+        li += 1;
+        ci = 0;
+    }
+}
+
+fn trim_blank_edges(lines: &mut Vec<String>) {
+    while lines.first().is_some_and(|l| is_blank(l)) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|l| is_blank(l)) {
+        lines.pop();
+    }
+}
+
+/// Remove the indentation an author used to lay out nested HTML tags. Inside
+/// an HTML container that indentation is formatting, not Markdown: without
+/// this, the four-space-indented `<img>` of the `<picture>` idiom parsed as an
+/// indented code block and the logo appeared as source text.
+fn dedent(lines: &mut [String]) {
+    let min = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.chars().take_while(|c| *c == ' ').count())
+        .min()
+        .unwrap_or(0);
+    if min == 0 {
+        return;
+    }
+    for line in lines.iter_mut() {
+        let cut = line.chars().take_while(|c| *c == ' ').count().min(min);
+        line.drain(..cut);
+    }
+}
+
+/// The line after the HTML construct starting at `i`. Comments run to `-->`;
+/// an element runs to its close tag, or to the end of the opener line when it
+/// never closes (the parser does not claim content it cannot delimit).
+fn skip_html_block(lines: &[String], i: usize) -> usize {
+    match html_start(&lines[i]) {
+        Some(HtmlStart::Skip) => {
+            if !lines[i].trim_start().starts_with("<!--") {
+                return i + 1;
+            }
+            let mut j = i;
+            while j < lines.len() {
+                if lines[j].contains("-->") {
+                    return j + 1;
+                }
+                j += 1;
+            }
+            lines.len()
+        }
+        Some(HtmlStart::Tag { tag }) => {
+            if tag.self_closing || tag.name == "hr" {
+                return i + 1;
+            }
+            let region = html_region(lines, i, tag.end, &tag.name);
+            region.close.map_or(i + 1, |line| line + 1)
+        }
+        None => i + 1,
+    }
 }
 
 /// Split a table row on unescaped pipes; strips one outer pipe pair.
@@ -441,6 +885,26 @@ struct Parser {
     defs: HashMap<String, String>,
 }
 
+/// What a line that looks like HTML produced.
+enum HtmlOut {
+    /// A rendered block (container, heading, table, details, rule, code).
+    One(Block),
+    /// A comment, dangerous element, or an empty tag: consumed, not painted.
+    Skipped,
+    /// Not block HTML at all; the paragraph path owns the line.
+    NotHtml,
+}
+
+fn is_empty_block(block: &Block) -> bool {
+    match block {
+        Block::Paragraph(content) => content.is_empty(),
+        Block::Html { blocks, .. } => blocks.iter().all(is_empty_block),
+        Block::Details { blocks, .. } => blocks.iter().all(is_empty_block),
+        Block::Footnote { blocks, .. } => blocks.iter().all(is_empty_block),
+        _ => false,
+    }
+}
+
 impl Parser {
     fn inlines(&self, s: &str) -> Vec<super::ast::Inline> {
         parse_inlines_with(s, &self.defs)
@@ -465,7 +929,7 @@ impl Parser {
         if open_fence(line).is_some() || atx_heading(line).is_some() {
             return true;
         }
-        if quote_prefix(line).is_some() || is_html_block_start(line) {
+        if quote_prefix(line).is_some() || starts_html_block(line) {
             return true;
         }
         if is_rule(line) {
@@ -501,20 +965,30 @@ impl Parser {
             // ref defs and skipped HTML blocks belong to no block.
             let start = self.pos as u32;
             let before = blocks.len();
-            if let Some(b) = self.parse_fence() {
-                blocks.push(b);
+            let block = if let Some(b) = self.parse_fence() {
+                Some(b)
             } else if let Some(b) = self.parse_atx() {
-                blocks.push(b);
+                Some(b)
             } else if let Some(b) = self.parse_quote() {
-                blocks.push(b);
+                Some(b)
             } else if let Some(b) = self.parse_list() {
-                blocks.push(b);
-            } else if self.parse_html_skip() {
-                // Ignored per plan.
-            } else if let Some(b) = self.parse_indented_code() {
-                blocks.push(b);
+                Some(b)
             } else {
-                blocks.extend(self.parse_paragraph_or_table());
+                match self.parse_html() {
+                    HtmlOut::One(b) => Some(b),
+                    HtmlOut::Skipped => None,
+                    HtmlOut::NotHtml => {
+                        if let Some(b) = self.parse_indented_code() {
+                            Some(b)
+                        } else {
+                            blocks.extend(self.parse_paragraph_or_table());
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(b) = block {
+                blocks.push(b);
             }
             let pushed = blocks.len() - before;
             if pushed > 0 {
@@ -601,16 +1075,12 @@ impl Parser {
         while self.pos < self.lines.len() {
             let line = self.lines[self.pos].clone();
             if is_blank(&line) {
-                // A blank line ends the quote unless a quote line follows.
-                let mut j = self.pos + 1;
-                while j < self.lines.len() && is_blank(&self.lines[j]) {
-                    j += 1;
-                }
-                if j < self.lines.len() && quote_prefix(&self.lines[j]).is_some() {
-                    inner.push(String::new());
-                    self.pos += 1;
-                    continue;
-                }
+                // A blank line ends the quote, as CommonMark and GitHub have
+                // it. Continuing across one merged `> first` and `> second`
+                // into a single block, which turned a second alert
+                // (`> [!WARNING]`) into literal text inside the first. A
+                // quoted blank line (`>` alone) is not blank, and keeps the
+                // quote going.
                 break;
             }
             match quote_prefix(&line) {
@@ -621,9 +1091,12 @@ impl Parser {
             }
             self.pos += 1;
         }
-        Some(Block::Quote(
-            parse_blocks_with_defs(&inner.join("\n"), &self.defs).blocks,
-        ))
+        let kind = take_alert(&mut inner);
+        let blocks = parse_blocks_with_defs(&inner.join("\n"), &self.defs).blocks;
+        Some(match kind {
+            Some(kind) => Block::Alert { kind, blocks },
+            None => Block::Quote(blocks),
+        })
     }
 
     fn parse_list(&mut self) -> Option<Block> {
@@ -696,14 +1169,245 @@ impl Parser {
         })
     }
 
-    fn parse_html_skip(&mut self) -> bool {
-        if !is_html_block_start(self.peek().unwrap_or("")) {
-            return false;
+    fn parse_html(&mut self) -> HtmlOut {
+        let Some(line) = self.peek().map(str::to_string) else {
+            return HtmlOut::NotHtml;
+        };
+        let Some(start) = html_start(&line) else {
+            return HtmlOut::NotHtml;
+        };
+        let tag = match start {
+            HtmlStart::Skip => {
+                self.pos = skip_html_block(&self.lines, self.pos);
+                return HtmlOut::Skipped;
+            }
+            HtmlStart::Tag { tag } => tag,
+        };
+        if html::is_dangerous(&tag.name) {
+            self.pos = skip_html_block(&self.lines, self.pos);
+            return HtmlOut::Skipped;
         }
-        while self.pos < self.lines.len() && !is_blank(&self.lines[self.pos]) {
+        if tag.name == "hr" {
             self.pos += 1;
+            return HtmlOut::One(Block::Rule);
         }
-        true
+        let region = html_region(&self.lines, self.pos, tag.end, &tag.name);
+        let Some(close_line) = region.close else {
+            // Never closed: consume the opener line and render what it holds
+            // as inline content (`<img>` on its own line, stray `<div>` tags).
+            self.pos += 1;
+            let content = self.inlines(&line);
+            return if content.is_empty() {
+                HtmlOut::Skipped
+            } else {
+                HtmlOut::One(Block::Paragraph(content))
+            };
+        };
+        let mut inner = region.inner;
+        trim_blank_edges(&mut inner);
+        self.pos = close_line + 1;
+        let joined = inner.join("\n");
+        let block = match tag.name.as_str() {
+            "details" => self.details_block(&joined),
+            "table" => self.table_block(&joined),
+            "ul" | "ol" => self.list_block(tag.name == "ol", &joined),
+            "pre" => Some(Block::Code {
+                lang: None,
+                text: decode_entities(&joined).into_owned(),
+            }),
+            name if name.len() == 2
+                && name.starts_with('h')
+                && name.ends_with(['1', '2', '3', '4', '5', '6']) =>
+            {
+                let level = name.as_bytes()[1] - b'0';
+                let content = self.inlines(&inner.join(" "));
+                let heading = Block::Heading { level, content };
+                Some(match tag.attrs.align {
+                    Some(align) => Block::Html {
+                        align: Some(align),
+                        blocks: vec![heading],
+                    },
+                    None => heading,
+                })
+            }
+            _ => {
+                let align = if tag.name == "center" {
+                    Some(Align::Center)
+                } else {
+                    tag.attrs.align
+                };
+                dedent(&mut inner);
+                let blocks = parse_blocks_with_defs(&inner.join("\n"), &self.defs).blocks;
+                Some(Block::Html { align, blocks })
+            }
+        };
+        match block {
+            Some(b) if !is_empty_block(&b) => HtmlOut::One(b),
+            _ => HtmlOut::Skipped,
+        }
+    }
+
+    fn details_block(&self, inner: &str) -> Option<Block> {
+        let tags = html::tags_in(inner);
+        // (open tag start, content start)
+        let mut summary: Option<(usize, usize)> = None;
+        let mut depth = 0usize;
+        for (start, tag, end) in &tags {
+            if tag.name != "summary" {
+                continue;
+            }
+            match tag.kind {
+                TagKind::Open => {
+                    if depth == 0 {
+                        summary = Some((*start, *end));
+                    }
+                    depth += 1;
+                }
+                TagKind::Close if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some((open_start, body_start)) = summary {
+                            let text = &inner[body_start..*start];
+                            let body = format!("{}\n{}", &inner[..open_start], &inner[*end..]);
+                            let mut body: Vec<String> = body.lines().map(str::to_string).collect();
+                            dedent(&mut body);
+                            let content = self.inlines(text.trim());
+                            return Some(Block::Details {
+                                summary: if content.is_empty() {
+                                    vec![Inline::Text("Details".into())]
+                                } else {
+                                    content
+                                },
+                                blocks: parse_blocks_with_defs(&body.join("\n"), &self.defs).blocks,
+                            });
+                        }
+                    }
+                }
+                TagKind::Close => {}
+            }
+        }
+        // No `<summary>`: the body is still worth showing.
+        let mut lines: Vec<String> = inner.lines().map(str::to_string).collect();
+        dedent(&mut lines);
+        Some(Block::Details {
+            summary: vec![Inline::Text("Details".into())],
+            blocks: parse_blocks_with_defs(&lines.join("\n"), &self.defs).blocks,
+        })
+    }
+
+    fn table_block(&self, inner: &str) -> Option<Block> {
+        let tags = html::tags_in(inner);
+        let mut rows: Vec<Vec<(bool, String, Option<Align>)>> = Vec::new();
+        let mut row: Option<Vec<(bool, String, Option<Align>)>> = None;
+        let mut cell: Option<(bool, usize, Option<Align>)> = None;
+        for (start, tag, end) in &tags {
+            match tag.name.as_str() {
+                "tr" => match tag.kind {
+                    TagKind::Open => row = Some(Vec::new()),
+                    TagKind::Close => {
+                        if let Some(r) = row.take() {
+                            rows.push(r);
+                        }
+                    }
+                },
+                "td" | "th" => match tag.kind {
+                    TagKind::Open => cell = Some((tag.name == "th", *end, tag.attrs.align)),
+                    TagKind::Close => {
+                        if let (Some((head, s, align)), Some(r)) = (cell.take(), row.as_mut()) {
+                            r.push((head, inner[s..*start].to_string(), align));
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+        if let Some(r) = row.take() {
+            if !r.is_empty() {
+                rows.push(r);
+            }
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+        if n == 0 {
+            return None;
+        }
+        let mut align = vec![Align::None; n];
+        for row in &rows {
+            for (ci, (_, _, a)) in row.iter().enumerate() {
+                if let (Some(a), true) = (a, ci < n) {
+                    align[ci] = *a;
+                }
+            }
+        }
+        // The header is the first row that names its cells `<th>`. A layout
+        // table (the side-by-side screenshots README idiom) has none, and
+        // GitHub draws it without a header band — so an empty head here is
+        // meaningful, not a missing first row.
+        let mut head: Vec<Vec<Inline>> = Vec::new();
+        if let Some(head_idx) = rows.iter().position(|r| r.iter().any(|(th, _, _)| *th)) {
+            let head_row = rows.remove(head_idx);
+            head = head_row
+                .iter()
+                .map(|(_, text, _)| self.inlines(text.trim()))
+                .collect();
+            head.resize_with(n, Vec::new);
+        }
+        let body = rows
+            .iter()
+            .map(|r| {
+                let mut cells: Vec<Vec<Inline>> = r
+                    .iter()
+                    .map(|(_, text, _)| self.inlines(text.trim()))
+                    .collect();
+                cells.resize_with(n, Vec::new);
+                cells
+            })
+            .collect();
+        Some(Block::Table {
+            align,
+            head,
+            rows: body,
+        })
+    }
+
+    fn list_block(&self, ordered: bool, inner: &str) -> Option<Block> {
+        let tags = html::tags_in(inner);
+        let mut items = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (byte, tag, end) in &tags {
+            if tag.name != "li" {
+                continue;
+            }
+            match tag.kind {
+                TagKind::Open => {
+                    if depth == 0 {
+                        start = *end;
+                    }
+                    depth += 1;
+                }
+                TagKind::Close if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        items.push(ListItem {
+                            checked: None,
+                            blocks: parse_blocks_with_defs(&inner[start..*byte], &self.defs).blocks,
+                        });
+                    }
+                }
+                TagKind::Close => {}
+            }
+        }
+        if items.is_empty() {
+            return None;
+        }
+        Some(Block::List {
+            ordered,
+            start: 1,
+            items,
+        })
     }
 
     /// Paragraph with setext-heading and GFM-table promotion. Returns a
@@ -814,11 +1518,31 @@ fn parse_lines(mut lines: Vec<String>) -> (Document, u32) {
     }
     let lead = strip_frontmatter(&mut lines);
     let defs = collect_ref_defs(&lines);
+    // Footnote definitions are lifted out before the block parse and printed
+    // as one section at the end; the blanked lines keep the line count.
+    let items = collect_footnotes(&mut lines, &defs);
+    let has_footnotes = !items.is_empty();
+    let end = u32::try_from(lines.len()).unwrap_or(u32::MAX);
     // The lines are already split and tab-expanded; joining them only to split
     // them again (and rescanning for definitions) was two full copies of the
     // document on every parse.
+    let mut doc = parse_top_lines(lines, defs);
+    doc.has_footnotes = has_footnotes;
+    if has_footnotes {
+        let notes = resolve_footnotes(&mut doc.blocks, items);
+        // A definition nobody references prints nothing at all — not even
+        // the section rule.
+        if !notes.is_empty() {
+            doc.blocks.push(Block::FootnoteRule);
+            doc.spans.push((end, end));
+            for (number, blocks) in notes {
+                doc.blocks.push(Block::Footnote { number, blocks });
+                doc.spans.push((end, end));
+            }
+        }
+    }
     let lead = u32::try_from(lead).unwrap_or(u32::MAX);
-    (parse_top_lines(lines, defs), lead)
+    (doc, lead)
 }
 
 fn parse_blocks_with_defs(src: &str, outer: &HashMap<String, String>) -> Document {
@@ -843,6 +1567,7 @@ fn parse_top_lines(lines: Vec<String>, defs: HashMap<String, String>) -> Documen
         blocks,
         spans,
         lead: 0,
+        has_footnotes: false,
         defs: p.defs,
     }
 }
@@ -898,6 +1623,14 @@ pub fn patch_document(
         .unwrap_or(0)
         .min(n);
     if lo_b >= hi_b {
+        return (old, None);
+    }
+    // Footnotes are whole-document state: definitions are lifted out before
+    // the parse and the numbering follows the text's reference order, so a
+    // re-parse of one slice can rebuild neither. Any text that carries a
+    // definition goes whole, and an edit that could introduce the syntax is
+    // refused by the same check on the lines it touched.
+    if old.has_footnotes || (lo_b..hi_b).any(|i| buf.line(i).contains("[^")) {
         return (old, None);
     }
     let lead = old.lead as usize;
@@ -1145,7 +1878,12 @@ fn block_carries_link(b: &Block) -> bool {
             content.iter().any(inline_carries_link)
         }
         Block::Code { .. } | Block::Rule => false,
-        Block::Quote(blocks) => blocks.iter().any(block_carries_link),
+        Block::Quote(blocks) | Block::Html { blocks, .. } | Block::Alert { blocks, .. } => {
+            blocks.iter().any(block_carries_link)
+        }
+        Block::Details { summary, blocks } => {
+            summary.iter().any(inline_carries_link) || blocks.iter().any(block_carries_link)
+        }
         Block::List { items, .. } => items
             .iter()
             .any(|item| item.blocks.iter().any(block_carries_link)),
@@ -1154,16 +1892,26 @@ fn block_carries_link(b: &Block) -> bool {
             .chain(rows.iter().flatten())
             .flatten()
             .any(inline_carries_link),
+        Block::Footnote { blocks, .. } => blocks.iter().any(block_carries_link),
+        Block::FootnoteRule => false,
     }
 }
 
 fn inline_carries_link(i: &Inline) -> bool {
     match i {
         Inline::Link { .. } | Inline::Image { .. } => true,
-        Inline::Text(_) | Inline::Code(_) | Inline::SoftBreak | Inline::HardBreak => false,
-        Inline::Emph(v) | Inline::Strong(v) | Inline::Strike(v) => {
-            v.iter().any(inline_carries_link)
-        }
+        Inline::Text(_)
+        | Inline::Code(_)
+        | Inline::FootnoteRef { .. }
+        | Inline::SoftBreak
+        | Inline::HardBreak => false,
+        Inline::Emph(v)
+        | Inline::Strong(v)
+        | Inline::Strike(v)
+        | Inline::Underline(v)
+        | Inline::Highlight(v)
+        | Inline::Sup(v)
+        | Inline::Sub(v) => v.iter().any(inline_carries_link),
     }
 }
 
@@ -1281,10 +2029,333 @@ mod tests {
     }
 
     #[test]
-    fn html_ignored() {
-        let d = parse_blocks("<div>\nskipped\n</div>\n\nkept");
-        assert_eq!(d.blocks.len(), 1);
-        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+    fn html_containers_render_their_content() {
+        // A container tag is structure, not a reason to lose the paragraph
+        // inside it: GitHub renders the text and drops the tags.
+        let d = parse_blocks("<div>\nkept\n</div>\n\nafter");
+        assert_eq!(d.blocks.len(), 2, "content lost: {d:?}");
+        assert!(
+            matches!(&d.blocks[0], Block::Html { blocks, .. }
+                if matches!(&blocks[0], Block::Paragraph(v)
+                    if v == &[Inline::Text("kept".into())])),
+            "the container's content is missing: {d:?}"
+        );
+        assert!(matches!(&d.blocks[1], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn alignment_survives_as_a_container_property() {
+        let d = parse_blocks("<div align=center>\n![a](a.png)\n</div>");
+        match &d.blocks[0] {
+            Block::Html { align, blocks } => {
+                assert_eq!(*align, Some(Align::Center));
+                assert!(matches!(&blocks[0], Block::Paragraph(_)));
+            }
+            other => panic!("expected an aligned container, got {other:?}"),
+        }
+        // `<center>` is the old spelling of the same thing.
+        let d = parse_blocks("<center>hi</center>");
+        assert!(matches!(
+            &d.blocks[0],
+            Block::Html {
+                align: Some(Align::Center),
+                ..
+            }
+        ));
+        // A heading keeps its size and gains the alignment.
+        let d = parse_blocks("<h1 align=\"center\">Title</h1>");
+        match &d.blocks[0] {
+            Block::Html { align, blocks } => {
+                assert_eq!(*align, Some(Align::Center));
+                assert!(matches!(
+                    &blocks[0],
+                    Block::Heading { level: 1, content } if content == &[Inline::Text("Title".into())]
+                ));
+            }
+            other => panic!("expected an aligned heading, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn details_render_expanded_with_their_summary() {
+        let d = parse_blocks(
+            "<details>\n<summary>More</summary>\n\nHidden **body**\n\n</details>\n\nafter",
+        );
+        match &d.blocks[0] {
+            Block::Details { summary, blocks } => {
+                assert_eq!(summary, &[Inline::Text("More".into())]);
+                assert!(
+                    matches!(&blocks[0], Block::Paragraph(v)
+                        if v.iter().any(|n| matches!(n, Inline::Strong(_)))),
+                    "body lost: {blocks:?}"
+                );
+            }
+            other => panic!("expected details, got {other:?}"),
+        }
+        assert_eq!(d.blocks.len(), 2);
+        // No summary: a default label, not a blank bar.
+        let d = parse_blocks("<details>\nbody\n</details>");
+        assert!(matches!(
+            &d.blocks[0],
+            Block::Details { summary, .. } if !summary.is_empty()
+        ));
+    }
+
+    #[test]
+    fn html_tables_map_onto_the_markdown_table_shape() {
+        let d = parse_blocks(
+            "<table>\n<tr><th align=\"left\">Name</th><th align=\"right\">Size</th></tr>\n\
+             <tr><td>a</td><td>1</td></tr>\n</table>",
+        );
+        match &d.blocks[0] {
+            Block::Table { align, head, rows } => {
+                assert_eq!(align, &[Align::Left, Align::Right]);
+                assert_eq!(head[0], vec![Inline::Text("Name".into())]);
+                assert_eq!(rows[0][1], vec![Inline::Text("1".into())]);
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_lists_become_real_lists() {
+        let d = parse_blocks("<ul>\n<li>one</li>\n<li>two</li>\n</ul>");
+        match &d.blocks[0] {
+            Block::List {
+                ordered: false,
+                items,
+                ..
+            } => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(&items[0].blocks[0], Block::Paragraph(v)
+                    if v == &[Inline::Text("one".into())]));
+            }
+            other => panic!("expected a list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alerts_replace_the_anonymous_quote_bar() {
+        let d = parse_blocks("> [!WARNING]\n> hot\n\nplain\n\n> quote");
+        match &d.blocks[0] {
+            Block::Alert { kind, blocks } => {
+                assert_eq!(*kind, crate::parse::markdown::ast::AlertKind::Warning);
+                assert!(matches!(&blocks[0], Block::Paragraph(_)));
+            }
+            other => panic!("expected an alert, got {other:?}"),
+        }
+        assert!(matches!(&d.blocks[2], Block::Quote(_)));
+    }
+
+    #[test]
+    fn a_blank_line_keeps_two_quotes_apart() {
+        // The blank line between the quotes used to be folded into the first,
+        // so a second alert rendered as literal `[!WARNING]` text inside the
+        // first instead of its own callout.
+        let d = parse_blocks("> [!NOTE]\n> first\n\n> [!WARNING]\n> second");
+        assert_eq!(d.blocks.len(), 2, "quotes merged: {d:?}");
+        assert!(matches!(
+            &d.blocks[0],
+            Block::Alert {
+                kind: AlertKind::Note,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &d.blocks[1],
+            Block::Alert {
+                kind: AlertKind::Warning,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_html_layout_table_has_no_header_row() {
+        // A screenshot table names no `<th>`; inventing a header out of its
+        // first image row styled the images as a heading band and dropped
+        // them, so the header is empty instead.
+        let d = parse_blocks("<table>\n<tr><td>a</td><td>b</td></tr>\n</table>");
+        match &d.blocks[0] {
+            Block::Table { head, rows, .. } => {
+                assert!(head.is_empty(), "invented a header row: {d:?}");
+                assert_eq!(rows.len(), 1);
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+        // A `<th>` row is still the header.
+        let d = parse_blocks("<table>\n<tr><th>H</th></tr>\n<tr><td>a</td></tr>\n</table>");
+        assert!(
+            matches!(&d.blocks[0], Block::Table { head, .. } if head.len() == 1),
+            "the <th> row stopped being the header: {d:?}"
+        );
+    }
+
+    #[test]
+    fn a_picture_renders_its_fallback_image() {
+        // `<picture>` with a dark-mode `<source>` is how READMEs do a theme
+        // logo. Its four-space-indented `<img>` used to parse as an indented
+        // code block, so the preview showed the tag as source text.
+        let d = parse_blocks(
+            "<p align=\"center\">\n  <picture>\n    <source media=\"(prefers-color-scheme: dark)\" srcset=\"d.png\">\n    <img src=\"l.png\" width=\"180\" alt=\"Logo\">\n  </picture>\n</p>",
+        );
+        let text = format!("{d:?}");
+        assert!(!text.contains("Block::Code"), "picture became code: {text}");
+        assert!(
+            text.contains("l.png"),
+            "the fallback image is missing: {text}"
+        );
+        assert!(!text.contains("d.png"), "the dark source leaked in: {text}");
+    }
+
+    #[test]
+    fn dangerous_html_and_comments_are_dropped_with_their_content() {
+        let d = parse_blocks("a\n\n<script>\nalert(1)\n</script>\n\n<!-- secret -->\n\nafter");
+        let text = format!("{d:?}");
+        assert!(!text.contains("alert"), "script body rendered: {text}");
+        assert!(!text.contains("secret"), "comment rendered: {text}");
+        assert_eq!(d.blocks.len(), 2, "blocks: {d:?}");
+    }
+
+    /// The body blocks of the note numbered `number`.
+    fn note(d: &Document, number: usize) -> &[Block] {
+        let i = d
+            .footnote_block(number)
+            .unwrap_or_else(|| panic!("note {number} is missing: {:#?}", d.blocks));
+        match &d.blocks[i] {
+            Block::Footnote { blocks, .. } => blocks,
+            other => panic!("block {i} is not a note: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footnotes_collect_into_one_numbered_section() {
+        let d = parse_blocks(
+            "First[^b] then[^a], and again[^b].\n\n[^a]: The A note.\n[^b]: The B note.\n",
+        );
+        // The definitions do not render where they were written: the prose,
+        // the section rule, then two notes.
+        assert_eq!(d.blocks.len(), 4, "{:#?}", d.blocks);
+        assert!(matches!(d.blocks[1], Block::FootnoteRule));
+        // The list follows the text's reference order, not the order the
+        // definitions were written in.
+        assert!(matches!(
+            &note(&d, 1)[0],
+            Block::Paragraph(v) if v == &vec![Inline::Text("The B note.".into())]
+        ));
+        assert!(matches!(
+            &note(&d, 2)[0],
+            Block::Paragraph(v) if v == &vec![Inline::Text("The A note.".into())]
+        ));
+        // The same reference twice keeps its number, and the next new label
+        // takes the next one.
+        let numbers: Vec<usize> = match &d.blocks[0] {
+            Block::Paragraph(inlines) => inlines
+                .iter()
+                .filter_map(|i| match i {
+                    Inline::FootnoteRef { number, .. } => Some(*number),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected a paragraph, got {other:?}"),
+        };
+        assert_eq!(numbers, vec![1, 2, 1]);
+        // The jump targets the pane uses: the first reference's block, and
+        // each note's own block.
+        assert_eq!(d.footnote_reference_block(1), Some(0));
+        assert_eq!(d.footnote_reference_block(2), Some(0));
+    }
+
+    #[test]
+    fn a_footnote_can_hold_several_blocks() {
+        let d = parse_blocks(
+            "Text[^n].\n\n[^n]: First paragraph.\n\n    Second paragraph.\n\n    - and a list\n",
+        );
+        let blocks = note(&d, 1);
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        assert!(matches!(blocks[0], Block::Paragraph(_)));
+        assert!(matches!(blocks[1], Block::Paragraph(_)));
+        assert!(matches!(blocks[2], Block::List { .. }));
+    }
+
+    #[test]
+    fn a_note_can_reference_another_note() {
+        let d = parse_blocks("Text[^a].\n\n[^a]: See also[^b].\n[^b]: The second note.\n");
+        assert!(d.footnote_block(1).is_some() && d.footnote_block(2).is_some());
+        // The reference inside the first note takes the number after it.
+        assert!(matches!(
+            &note(&d, 1)[0],
+            Block::Paragraph(v)
+                if matches!(&v[1], Inline::FootnoteRef { number: 2, .. })
+        ));
+        // The note carrying that reference is a top-level block in its own
+        // right: the arrow in note 2 goes back to note 1's block.
+        assert_eq!(d.footnote_reference_block(2), d.footnote_block(1));
+    }
+
+    #[test]
+    fn unused_definitions_vanish_and_undefined_references_stay_literal() {
+        let d = parse_blocks("Literal[^missing].\n\n[^unused]: No reference.\n");
+        assert_eq!(d.blocks.len(), 1, "{:#?}", d.blocks);
+        assert!(
+            d.has_footnotes,
+            "the definition still has to bar the splice"
+        );
+        match &d.blocks[0] {
+            Block::Paragraph(inlines) => assert!(matches!(
+                &inlines[1],
+                Inline::FootnoteRef { label, number: 0 } if label == "missing"
+            )),
+            other => panic!("expected a paragraph, got {other:?}"),
+        }
+        // A definition is not a link target either, so `[^x]` never resolved
+        // to the definition's dest the way `[x]` would.
+        assert!(!d.defs.contains_key("^unused"));
+    }
+
+    #[test]
+    fn footnote_syntax_inside_code_is_code() {
+        let d = parse_blocks("See[^x].\n\n```\n[^x]: code\n```\n");
+        assert_eq!(d.blocks.len(), 2, "{:#?}", d.blocks);
+        assert!(!d.has_footnotes);
+        assert!(matches!(
+            &d.blocks[1],
+            Block::Code { text, .. } if text.contains("[^x]:")
+        ));
+    }
+
+    #[test]
+    fn the_first_definition_of_a_label_wins() {
+        let d = parse_blocks("See[^d].\n\n[^d]: first\n[^d]: second\n");
+        assert_eq!(d.footnote_block(2), None, "a duplicate printed twice");
+        assert!(matches!(
+            &note(&d, 1)[0],
+            Block::Paragraph(inlines) if inlines == &vec![Inline::Text("first".into())]
+        ));
+        // Labels match case-insensitively, like link references.
+        let d = parse_blocks("Note[^Mark]\n\n[^mark]: matched.\n");
+        assert!(d.footnote_block(1).is_some());
+    }
+
+    #[test]
+    fn a_footnote_edit_is_never_spliced() {
+        use crate::core::buffer::Buffer;
+        // The section is built from the whole document, so a slice re-parse
+        // could not rebuild it: the splice must decline.
+        let mut buf = Buffer::from_text("text[^1]\n\n[^1]: note\n\ntail\n");
+        let old = parse_buffer(&buf);
+        edit_line(&mut buf, 4, " changed");
+        let edits = buf.take_edits().expect("the edit logged itself");
+        let (_, splice) = patch_document(old, &buf, &edits);
+        assert!(splice.is_none(), "a footnote document must go whole");
+        // Introducing the syntax into a document that had none is refused on
+        // the lines the edit touched.
+        let mut buf = Buffer::from_text("plain text\n");
+        let old = parse_buffer(&buf);
+        edit_line(&mut buf, 0, " [^1]");
+        let edits = buf.take_edits().expect("the edit logged itself");
+        let (_, splice) = patch_document(old, &buf, &edits);
+        assert!(splice.is_none(), "a new reference must go whole");
     }
 
     #[test]

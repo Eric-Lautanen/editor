@@ -12,7 +12,7 @@ use crate::{
     },
     layout::{
         self,
-        display_list::{DisplayList, DrawOp},
+        display_list::{DisplayList, DrawOp, HitAction},
         theme::Theme,
         Ctx,
     },
@@ -609,6 +609,36 @@ impl App {
         }
     }
 
+    /// How many shared pixels one pane's own pixels are worth: the factor
+    /// between the shared scroll offset and the position that pane paints at.
+    ///
+    /// Outside Split the shared offset *is* the pane's own, so this is 1.
+    /// Split links the halves by shared *progress*, not by pixels: each pane
+    /// paints `ratio × its own range`, and a pane's range is only a share of
+    /// the longer one. So a finger's `dy` is in the pane it is over, and has
+    /// to be divided by this to move that pane one pixel per pixel — a
+    /// wrapping Markdown preview measures 0.63, i.e. the editor under the
+    /// finger used to travel 63 px for 100 px of finger. A pane with no range
+    /// of its own has nothing to track, so it falls back to 1 (the gesture is
+    /// shared, as the scrollbar's is).
+    #[cfg(any(target_os = "windows", test))]
+    fn pane_share(&self, editor: bool) -> f32 {
+        if self.mode != Mode::Split {
+            return 1.0;
+        }
+        let shared = self.scroll.max();
+        let own = if editor {
+            self.editor_max()
+        } else {
+            self.preview_max()
+        };
+        if shared <= 0.0 || own <= 0.0 {
+            1.0
+        } else {
+            own / shared
+        }
+    }
+
     /// Whether the pointer is over the editor pane (or, when no pointer is
     /// tracked — keyboard arrows/time, a gesture carried without a mouse
     /// position — treat it as the editor, the pane horizontal scroll
@@ -671,15 +701,21 @@ impl App {
     /// release after the finger held still coasts zero and stays put. Pan's
     /// sign flips like every other vertical input: dragging up the screen
     /// moves the content down the document, so the velocity does too.
+    ///
+    /// The velocity arrives in the pane the finger was over, so it is carried
+    /// into shared pixels exactly like the pan deltas were (see
+    /// [`App::pane_share`]) — a flick that coasted in shared pixels would
+    /// travel at a share of the speed that threw it in Split.
     #[cfg(any(target_os = "windows", test))]
     fn coast(&mut self, _vx: f32, vy: f32, host: &mut dyn Host) {
         // Horizontal momentum is dropped on purpose: the coast state lives on
         // the vertical scroller, preview panes have nothing to pan sideways,
         // and a flick is vertical by nature. Only the vertical ride continues.
-        self.scroll.coast_from(-vy);
+        let share = self.pane_share(self.pointer_or_default_over_editor());
+        self.scroll.coast_from(-vy / share);
         if crate::platform::touch_trace_on() {
             crate::platform::touch_log(format!(
-                "[touch] coast_from: coast={:.3} animating={}",
+                "[touch] coast_from: vy={vy:.3} share={share:.3} coast={:.3} animating={}",
                 self.scroll.coast,
                 self.scroll.animating()
             ));
@@ -1843,7 +1879,8 @@ impl App {
         if !self.preview_click(x, y, host) {
             let point = self.toggle_point(x, y);
             let row = point.and_then(|(_, dy)| self.preview.row_at(&self.preview_rows, dy));
-            match self.click_seq(x, y) {
+            let clicks = self.click_seq(x, y);
+            match clicks {
                 // Double-click: the word under the pointer, or its row when
                 // there is no word there (a blank line, the space past the
                 // end of the text) so the gesture always selects something.
@@ -1882,10 +1919,14 @@ impl App {
                 }
             }
             #[cfg(any(target_os = "windows", test))]
-            if let Some(anchor) = self.preview_drag_row {
-                // A double/triple tap is how a finger selects text; the drag
-                // that may follow extends it. A single tap arms nothing.
-                self.arm_preview_touch(x, y, anchor);
+            if clicks >= 2 {
+                if let Some(anchor) = self.preview_drag_row {
+                    // A double/triple tap is how a finger selects text; the
+                    // drag that may follow extends it. A single tap arms
+                    // nothing: the flick a reader makes after touching a row
+                    // to look at it is a scroll, not a selection.
+                    self.arm_preview_touch(x, y, anchor);
+                }
             }
             host.request_redraw();
         }
@@ -2059,6 +2100,52 @@ impl App {
         }
     }
 
+    /// Where a footnote jump lands, in document y: `to_note` sends a marker
+    /// to its note, otherwise a note's number or return arrow goes back to
+    /// the first reference.
+    ///
+    /// A planned Markdown pane knows every block's top, so the target is
+    /// exact — notes and the prose that cites them are blocks of their own.
+    /// A whole-document pane has no plan; its hit regions are the geometry,
+    /// and the first hit for the action is the top of the target (the marker
+    /// before the note body, the first reference before any repeat).
+    fn footnote_jump_y(&self, number: usize, to_note: bool) -> Option<f32> {
+        if let (Some(crate::layout::PanePlan::Markdown(p)), Some((rev, doc))) =
+            (&self.pane_plan, &self.markdown_doc)
+        {
+            if *rev == self.buffer.revision() {
+                let block = if to_note {
+                    doc.footnote_block(number)
+                } else {
+                    doc.footnote_reference_block(number)
+                };
+                if let Some(i) = block {
+                    return Some(p.rows.top(i));
+                }
+            }
+        }
+        self.preview
+            .list
+            .hits
+            .iter()
+            .find_map(|h| match (&h.action, to_note) {
+                (HitAction::FootnoteBack(n), true) if *n == number => Some(h.rect.y),
+                (HitAction::FootnoteRef(n), false) if *n == number => Some(h.rect.y),
+                _ => None,
+            })
+    }
+
+    /// Scroll a footnote trip to its other end. `None` leaves the view alone:
+    /// a marker whose note does not print is not a target.
+    fn jump_to_footnote(&mut self, number: usize, to_note: bool) {
+        let Some(top) = self.footnote_jump_y(number, to_note) else {
+            return;
+        };
+        let target = (top - 32.0 * self.scale).max(0.0);
+        self.scroll.offset = target;
+        self.scroll.scroll_by(0.0);
+    }
+
     /// Arm the double-tap selection for a finger drag (see [`TouchSel`]):
     /// called from the double/triple-click branches, which have just made the
     /// selection the drag would extend.
@@ -2087,15 +2174,58 @@ impl App {
     /// A finger drag while an editor double-tap's selection is armed extends
     /// that selection instead of scrolling; otherwise it does the same for the
     /// preview. Returns `true` when the pan was consumed.
+    ///
+    /// The armed gesture belongs to the pane the *contact* is on, not to
+    /// whatever a previous tap left armed. Split has two panes a finger can
+    /// cross: a double-tap in the editor followed by a flick on the reading
+    /// half used to be spent extending a selection the finger was nowhere
+    /// near — the pan moved nothing and `PanEnd` retired it without a coast,
+    /// so that half was dead to touch until the arm was consumed. A stale
+    /// arm on the other pane is dropped here and the pan scrolls.
     #[cfg(any(target_os = "windows", test))]
-    fn on_touch_pan(&mut self, dx: f32, dy: f32, host: &mut dyn Host) -> bool {
+    fn on_touch_pan(&mut self, dx: f32, dy: f32, at: (f32, f32), host: &mut dyn Host) -> bool {
         // A drag extends a selection, so the Copy button's "Copied" flash is
         // no longer about the text that was copied.
         self.copy_done = false;
-        if self.touch_sel.is_some() {
+        let pane = self.gesture_pane(at);
+        if self.touch_sel.is_some() && pane != Some(false) {
             return self.on_editor_touch_pan(dx, dy, host);
         }
-        self.on_preview_touch_pan(dx, dy, host)
+        self.touch_sel = None;
+        if self.preview_touch.is_some() && pane != Some(true) {
+            return self.on_preview_touch_pan(dx, dy, host);
+        }
+        self.preview_touch = None;
+        false
+    }
+
+    /// Which pane a gesture's contact is over: `Some(true)` for the editor,
+    /// `Some(false)` for the reader. `None` when the input carries no position
+    /// — a synthesized pan, `(0, 0)` by the same convention
+    /// [`App::pointer_or_default_over_editor`] reads — or the contact is in
+    /// the bars around the panes. `None` leaves an armed gesture owning the
+    /// input, which is what keeps the position-less pans of the suite (and of
+    /// a host that cannot report one) behaving as they always did.
+    #[cfg(any(target_os = "windows", test))]
+    fn gesture_pane(&self, at: (f32, f32)) -> Option<bool> {
+        if at == (0.0, 0.0) {
+            return None;
+        }
+        let p = Point { x: at.0, y: at.1 };
+        match self.mode {
+            Mode::Edit => self.viewport().contains(p).then_some(true),
+            Mode::Preview => self.viewport().contains(p).then_some(false),
+            Mode::Split => {
+                let (left, right) = self.split_panes();
+                if right.contains(p) {
+                    Some(true)
+                } else if left.contains(p) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// The editor half of [`App::on_touch_pan`]. The virtual pointer starts
@@ -2176,6 +2306,34 @@ impl App {
     /// drag is held near a pane edge; every ~2 s, watch for on-disk changes.
     fn on_tick(&mut self, host: &mut dyn Host) {
         self.ticks = self.ticks.wrapping_add(1);
+        let dirty = self.tabs.iter().any(|t| t.buffer.dirty);
+        // Mirror the dirtiest tab first: the install thread runs on its own and
+        // refuses to close over unsaved edits rather than lose them.
+        crate::update::note_unsaved(dirty);
+        // The installer is already waiting for this PID. Save the session, then
+        // leave through the ordinary quit path so the new build restores the
+        // same tabs and window instead of coming up on an empty desktop.
+        if crate::update::take_restart_request() {
+            if dirty {
+                // An edit landed after the download. There is nowhere to put
+                // it, so the update stops here rather than taking the buffer
+                // with it; the status bar says why the window stayed.
+                crate::update::cancel_restart();
+                self.status_extra = "update stopped: save your changes, then try again".into();
+                host.request_redraw();
+            } else {
+                self.persist();
+                if crate::update::approve_restart() {
+                    host.quit();
+                    return;
+                }
+                // No token means the helper must not install, and leaving now
+                // would close the window for nothing.
+                crate::update::cancel_restart();
+                self.status_extra = "update could not start — see last-update.log".into();
+                host.request_redraw();
+            }
+        }
         // Pump an in-flight streamed load: one bounded chunk per tick (a few
         // milliseconds), so the window stays responsive the whole time the
         // file loads.
@@ -2420,6 +2578,16 @@ impl App {
             // log of what was pressed.
             Some(crate::layout::display_list::HitAction::Link(href)) => {
                 host.open_url(&href);
+                host.request_redraw();
+                true
+            }
+            Some(crate::layout::display_list::HitAction::FootnoteRef(note)) => {
+                self.jump_to_footnote(note, true);
+                host.request_redraw();
+                true
+            }
+            Some(crate::layout::display_list::HitAction::FootnoteBack(note)) => {
+                self.jump_to_footnote(note, false);
                 host.request_redraw();
                 true
             }
@@ -3437,11 +3605,16 @@ impl Handler for App {
                 // finger). The contact's position rides along: it, not the
                 // last mouse position, decides which pane the gesture drives.
                 self.last_mouse = (x, y);
-                if self.on_touch_pan(dx, dy, host) {
+                if self.on_touch_pan(dx, dy, (x, y), host) {
                     return;
                 }
                 self.pan_horizontal_direct_at(dx, Some((x, y)));
-                self.scroll_direct(-dy, host);
+                // `dy` is in the pane the finger is over; the shared scroller
+                // speaks its own taller space, so divide out that pane's share
+                // (1 outside Split) and the text under the finger keeps up
+                // with it exactly.
+                let share = self.pane_share(self.over_editor_pane(Some((x, y))));
+                self.scroll_direct(-dy / share, host);
             }
             #[cfg(any(target_os = "windows", test))]
             Event::PanEnd { vx, vy } => {

@@ -164,13 +164,25 @@ impl ScrollState {
             // simulated sub-steps would be indistinguishable from this at
             // animation frame sizes and four times the work.
             let decay = COAST_DECAY_PER_MS.powf(dt_ms);
-            self.offset = (self.offset + self.coast * dt_ms).clamp(0.0, self.max());
+            let was = self.offset;
+            let want = self.offset + self.coast * dt_ms;
+            self.offset = want.clamp(0.0, self.max());
             self.coast *= decay;
-            if self.coast.abs() <= COAST_MIN_PX_PER_MS || self.offset == self.target {
+            // The end of the document is a stop, not a wall: a coast wanting
+            // to travel past an edge is only held there, so once the clamp
+            // has left the view exactly where it was there is nothing left to
+            // animate — and its remaining velocity (up to a couple of seconds
+            // of it) must not keep the frame clock, and the whole pane,
+            // repainting a still picture. `offset == target` is the same stop
+            // for a release that landed on the edge.
+            if self.coast.abs() <= COAST_MIN_PX_PER_MS
+                || self.offset == was
+                || self.offset == self.target
+            {
                 self.coast = 0.0;
                 self.target = self.offset;
             }
-            return true;
+            return self.offset != was;
         }
         let was = self.offset;
         self.offset = glide_step(self.offset, self.target, dt_ms);
@@ -491,6 +503,25 @@ mod tests {
         assert_eq!(s.offset, 0.0);
         // And the `target` follows, so `animating` is a reliable stop signal.
         assert_eq!(s.target, 0.0);
+    }
+
+    #[test]
+    fn a_coast_into_an_edge_stops_instead_of_riding_it_out() {
+        // The clamp is a stop. The ride used to keep its velocity after the
+        // view had been held at the end of the document, asking for frames —
+        // and repainting a still pane — for the rest of the decay.
+        let mut s = scroller(0.0);
+        s.offset = s.max() - 100.0;
+        s.target = s.offset;
+        s.coast_from(3.0);
+        let mut frames = 0;
+        while s.animating() {
+            s.step(FAST_FRAME_MS);
+            frames += 1;
+            assert!(frames < 10, "the ride sat on the edge for {frames} frames");
+        }
+        assert_eq!(s.offset, s.max());
+        assert!(!s.step(FAST_FRAME_MS), "nothing left to paint");
     }
 
     #[test]

@@ -4,16 +4,21 @@ Two supported shapes:
 
 * `editor.wxs` — a per-user **MSI installer** built in CI (`release.yml`,
   `wix build`, pinned WiX v7 + the UI extension). Double-click installs through
-  a two-page wizard: a welcome page whose three checkboxes choose which
-  file-type groups to associate (documents/configs, code/markup) and whether to
-  put a shortcut on the Desktop, then the stock progress bar and a "Setup
-  complete" page whose checked-by-default **Launch Editor** box opens the app
-  when Finish is pressed. Every box is ticked by
-  default and each one owns a feature — `DocumentTypes`, `CodeTypes`,
-  `DesktopShortcutFeature` — so the state of a checkbox is the state of that
-  group. A silent `/qn` run shows no UI and lands on the same three defaults; an
-  `editor --update` run (`msiexec /passive`) shows a progress bar and reopens
-  the app afterwards without asking (see below). Either way the install
+  a two-page wizard: a welcome page whose four checkboxes choose which
+  file-type groups to associate (documents/configs, code/markup,
+  dotfiles/tool config) and whether to put a shortcut on the Desktop, then the
+  stock progress bar and a "Setup complete" page whose checked-by-default
+  **Launch Editor** box opens the app when Finish is pressed. Every box is
+  ticked by default and each one owns a feature — `DocumentTypes`,
+  `CodeTypes`, `DotfileTypes`, `DesktopShortcutFeature` — so the state of a
+  checkbox is the state of that group. The dotfile group registers
+  `.gitignore`-style names as extension keys (`Software\Classes\.gitignore`),
+  which is the only shape Windows accepts for them; bare names such as
+  `Dockerfile` have no per-filename association and stay **Open with** choices.
+  A silent `/qn` run shows no UI and lands on the same four defaults; an
+  `editor --update` run (`msiexec /passive`) shows a progress bar and passes
+  `EDITOR_SKIP_LAUNCH=1`, so the package launches nothing and the staged
+  helper reopens the app (see below). Either way the install
   major-upgrades any previous MSI in place, and the Start menu entry is not
   optional: it is how an app is expected to be reachable afterwards. Per-user is the preferred scope
   (`Scope="perUser"` plus `ALLUSERS=2` / `MSIINSTALLPERUSER=1`), so a standard
@@ -35,43 +40,49 @@ Two supported shapes:
   updater installs often, so the checkpoint bought nothing a re-run of the MSI
   does not; drop the property (or set it to 0) to get it back.
 
-  An update ends with the app running again, and **two** things can open it.
+  An update ends with the app running again exactly once. The hand-off is a
+  copy of the running exe staged in the payload directory and invoked as
+  `editor --apply-update <msi> <exe> <pid> <result> <log>`: separate argv
+  strings, no shell, no batch language, and no quoting rules to get wrong. It
+  waits for the old Editor to leave the process table *and* for
+  `last-install.approve` beside `last-install.txt` — the token the window
+  writes in the same tick it saves its session and quits. Removing that token
+  is the claim, so two helpers racing over one update cannot both install; a
+  window closed by the user, or one that stayed open over a dirty buffer,
+  leaves none, and then nothing is installed. `last-install.cancel` stops a
+  waiting helper immediately when the editor decides to stay.
 
-  The updater stages an `install.bat` that: waits for the running Editor to
-  leave the process table, runs `msiexec /i <msi> /passive
-  REBOOT=ReallySuppress`, waits for the installed exe's file stamp to change
-  (msiexec returning is not the same as the new build being on disk: an
-  elevated pass is not the process the batch started and can still be
-  finishing, and reopening early starts the old build, which the upgrade then
-  closes), and only then reopens it through Explorer. Explorer is asked, the
-  process table is checked, and the request is retried; `start "" /max` is the
-  last resort, because `start` inherits a hidden console's show state and would
-  otherwise open the window invisibly. Every step lands in
-  `%APPDATA%\Editor\last-update.log`. `REBOOT=ReallySuppress` means no update
-  can reboot the machine.
+  With the token claimed, the helper runs `msiexec /i <msi> /passive
+  REBOOT=ReallySuppress MSIDISABLERMRESTART=1 MSIRESTARTMANAGERCONTROL=Disable
+  EDITOR_SKIP_LAUNCH=1`, writes msiexec's exit code to `last-install.txt`, and
+  waits for the installed exe's file stamp to change. That wait is not
+  optional: msiexec returning is not the same as the new build being on disk
+  (an elevated pass is not the process the helper started and can still be
+  finishing), and reopening early starts the old build, which the upgrade then
+  closes. Only then does it relaunch, through `ShellExecuteW` with an explicit
+  `SW_SHOWNORMAL` — the shell's launch path does not inherit the helper's
+  `STARTUPINFO`, which is what made `start` open an invisible window — with a
+  direct spawn as the fallback.
 
-  The batch alone is not enough, and the reason is the outgoing build: a major
-  upgrade removes the old product from *inside* the new install's transaction,
-  and the old package's uninstall step calls `editor.exe --uninstall`, whose
-  payload sweep deletes `%TEMP%\editor-update-*` — the directory the batch is
-  running out of. cmd re-reads a batch line by line, so the handoff dies
-  silently: no exit code, no relaunch. (Measured on the 0.2.11 → 0.2.12 hop:
-  the payload directory was gone after a `/passive` install and the batch never
-  logged another line.) Two things fix it, and both are needed because an
-  installed package cannot change what the build it replaces does:
+  `EDITOR_SKIP_LAUNCH=1` disables the package's own launch actions
+  (`LaunchTargetPath` / `LaunchEditorPassive`), so an update has exactly one
+  relauncher. They stay in the package for updaters that shipped before the
+  property existed: those pass `/passive REBOOT=ReallySuppress` and no
+  `EDITOR_SKIP_LAUNCH`, so the package launches the app for them, which is
+  what rescued the hop into the first release that had the action. Silent
+  (`/qn`, `UILevel = 2`) deploys still open nothing, and a double-clicked
+  install opens the app only from the finish page's tick box.
 
-  * This package skips that call during an upgrade (`NOT
-    UPGRADINGPRODUCTCODE`), so every hop *from 0.2.12 onwards* keeps the
-    batch's script, and the sweep keeps anything younger than two minutes
-    (`clean_payloads` in `src/update.rs`).
-  * It also launches the app itself, from `LaunchEditorPassive` — immediate,
-    `asyncNoWait`, sequenced after `InstallFinalize`, conditioned on
-    `UILevel >= 3 AND REBOOT="ReallySuppress"`. That is exactly what an
-    updater's `/passive` install passes and nothing else does, including the
-    updaters that shipped before this action, so the hop *into* the first
-    release that has it is rescued too. Silent (`/qn`, `UILevel = 2`) deploys
-    still open nothing. Whichever of the two relaunches comes second finds the
-    app running, hands off to it and exits.
+  The helper is a copy of the exe, but it still lives in `%TEMP%`, so the
+  outgoing build's uninstall step (a major upgrade removes the old product
+  from *inside* the new install's transaction) can still delete the directory
+  it is running from. Two things keep that from killing the update, and both
+  are needed because an installed package cannot change what the build it
+  replaces does: this package skips that call during an upgrade (`NOT
+  UPGRADINGPRODUCTCODE`), and the payload sweep keeps anything younger than
+  two minutes (`clean_payloads` in `src/update.rs`). (Measured on the 0.2.11
+  → 0.2.12 hop with the old batch hand-off: the payload directory was gone
+  after a `/passive` install and the batch never logged another line.)
 
   Two placements of that action were measured and rejected, and both failures
   are worth keeping in mind before moving it:
@@ -89,9 +100,8 @@ Two supported shapes:
   Windows Installer alone does *not* relaunch anything otherwise: Restart
   Manager closes the window whose exe it must replace and leaves it closed
   (measured: a `/qn` install over a running Editor ended with no Editor at
-  all). A double-clicked install opens the app only from the finish page's
-  tick box, argument-less on purpose: the relaunched app restores the session
-  it saved on the way out, which is the last file and the window place.
+  all). That is why the update hand-off belongs to the helper, and why the
+  package's own launch actions exist at all.
 
   Both user-facing dialogs carry `NoMinimize`: WiX writes the Dialog table's
   Minimize attribute by default (it is what a progress bar wants), and a

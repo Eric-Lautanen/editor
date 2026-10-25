@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod block;
+mod html;
 pub mod inline;
 
 use ast::Document;

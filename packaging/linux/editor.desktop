@@ -6,4 +6,4 @@ Exec=editor %f
 Icon=editor
 Terminal=false
 Categories=Utility;TextEditor;Viewer;
-MimeType=text/markdown;application/json;application/x-ndjson;text/plain;text/csv;text/x-yaml;application/toml;
+MimeType=text/markdown;application/json;application/x-ndjson;text/plain;text/csv;text/x-yaml;application/toml;text/x-editor-dotfile;

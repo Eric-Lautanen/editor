@@ -1,11 +1,13 @@
 //! Inline Markdown: code spans, emphasis/strong, links/images (inline +
-//! reference-style), strike, autolinks, hard breaks. Footnotes are v2; HTML
-//! tags are skipped (ignored) per the plan.
+//! reference-style), strike, autolinks, hard breaks, and the inline HTML tags
+//! GitHub renders (`b`, `i`, `ins`, `mark`, `sup`, `sub`, `kbd`, `a`, `img`,
+//! `br`). Unknown tags are dropped but their content is kept.
 
 use std::collections::HashMap;
 
 use super::ast::Inline;
 use super::decode_entities;
+use super::html::{self, Tag, TagKind};
 
 /// Normalize a reference label: trim, collapse whitespace, lowercase.
 fn norm_label(s: &str) -> String {
@@ -231,6 +233,22 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
             let img = c == '!';
             let lb = if img { i + 1 } else { i };
             if let Some((inner, after)) = scan_bracket(&chars, lb) {
+                // `[^label]` is a footnote reference, not link text. Its
+                // number is assigned once the whole document is known; an
+                // undefined label renders as written.
+                if !img {
+                    if let Some(label) = inner.strip_prefix('^') {
+                        let label = label.trim();
+                        if !label.is_empty() && !label.contains('\n') {
+                            out.push(Out::Node(Inline::FootnoteRef {
+                                label: label.to_string(),
+                                number: 0,
+                            }));
+                            i = after;
+                            continue;
+                        }
+                    }
+                }
                 if let Some((href, next)) = scan_link_target(&chars, after)
                     .or_else(|| scan_reference(&chars, after, &inner, defs))
                 {
@@ -243,6 +261,9 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
                         Inline::Image {
                             src: href,
                             alt: decode_entities(&inner).into_owned(),
+                            width: None,
+                            height: None,
+                            align: None,
                         }
                     } else {
                         Inline::Link { href, content }
@@ -258,6 +279,10 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
         }
         // Autolink / email autolink / inline HTML / literal `<`.
         if c == '<' {
+            if let Some(next) = skip_comment(&chars, i) {
+                i = next;
+                continue;
+            }
             if let Some(end) = chars[i..].iter().position(|&x| x == '>') {
                 let inner: String = chars[i + 1..i + end].iter().collect();
                 if is_autolink(&inner) {
@@ -277,10 +302,10 @@ fn parse_raw(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
                     i += end + 1;
                     continue;
                 }
-                if is_html_tag(&inner) {
-                    i += end + 1; // Ignored per plan.
-                    continue;
-                }
+            }
+            if let Some(tag) = html::tag_at(&chars, i) {
+                i = inline_html(&chars, &tag, defs, &mut out);
+                continue;
             }
             push_text(&mut out, "<");
             i += 1;
@@ -534,27 +559,121 @@ fn is_email_autolink(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
-fn is_html_tag(s: &str) -> bool {
-    let s = s.trim();
-    let s = s.strip_prefix('/').unwrap_or(s);
-    if s.starts_with('!') || s.starts_with('?') {
-        return true;
+/// Skip an HTML comment (`<!-- … -->`) or declaration (`<!doctype …>`) that
+/// starts at `i`. GitHub drops both with their contents, so the preview does
+/// too; an unclosed comment runs to the end of the fragment.
+fn skip_comment(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i + 1) != Some(&'!') {
+        return None;
     }
-    let Some(first) = s.chars().next() else {
-        return false;
+    if chars.get(i + 2) == Some(&'-') && chars.get(i + 3) == Some(&'-') {
+        let mut j = i + 4;
+        while j + 2 < chars.len() {
+            if chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>' {
+                return Some(j + 3);
+            }
+            j += 1;
+        }
+        return Some(chars.len());
+    }
+    chars[i..].iter().position(|&c| c == '>').map(|p| i + p + 1)
+}
+
+/// Consume one inline HTML tag, pushing the node it stands for. Returns the
+/// index to resume parsing at.
+fn inline_html(
+    chars: &[char],
+    tag: &Tag,
+    defs: &HashMap<String, String>,
+    out: &mut Vec<Out>,
+) -> usize {
+    if tag.kind == TagKind::Close {
+        // A close tag with no opener of ours: the markup is dropped, exactly
+        // as GitHub's sanitizer drops it.
+        return tag.end;
+    }
+    if html::is_dangerous(&tag.name) {
+        return html::find_close(chars, tag.end, &tag.name)
+            .map(|(_, _, after)| after)
+            .unwrap_or(tag.end);
+    }
+    if tag.name == "br" {
+        out.push(Out::Node(Inline::HardBreak));
+        return tag.end;
+    }
+    if tag.name == "img" {
+        if let Some(src) = &tag.attrs.src {
+            out.push(Out::Node(Inline::Image {
+                src: src.clone(),
+                alt: tag.attrs.alt.clone().unwrap_or_default(),
+                width: tag.attrs.width,
+                height: tag.attrs.height,
+                align: tag.attrs.align,
+            }));
+        }
+        return tag.end;
+    }
+    if tag.self_closing {
+        return tag.end;
+    }
+    let Some((start, end, after)) = html::find_close(chars, tag.end, &tag.name) else {
+        // Unclosed: drop the opener and let the content parse normally.
+        return tag.end;
     };
-    if !first.is_ascii_alphabetic() {
-        return false;
+    let inner: String = chars[start..end].iter().collect();
+    let content = parse_inlines_with(&inner, defs);
+    let node = match tag.name.as_str() {
+        "b" | "strong" => Some(Inline::Strong(content)),
+        "i" | "em" => Some(Inline::Emph(content)),
+        "del" | "s" | "strike" => Some(Inline::Strike(content)),
+        "ins" | "u" => Some(Inline::Underline(content)),
+        "mark" => Some(Inline::Highlight(content)),
+        "sup" => Some(Inline::Sup(content)),
+        "sub" => Some(Inline::Sub(content)),
+        "code" | "kbd" | "samp" | "tt" => Some(Inline::Code(plain_text(&content))),
+        "a" => tag.attrs.href.as_ref().map(|href| Inline::Link {
+            href: href.clone(),
+            content,
+        }),
+        // Unknown tags are dropped but their content is not: that is what
+        // makes `<span>words</span>` read as `words`, like GitHub.
+        _ => None,
+    };
+    if let Some(node) = node {
+        out.push(Out::Node(node));
+    } else {
+        // Keep the interior by re-entering at the opener's end.
+        return tag.end;
     }
-    let name_len = s
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .count();
-    let rest = &s[name_len..];
-    // A tag name is followed by the end of the tag, a self-closing slash, or
-    // attributes. Without that shape it is prose in angle brackets (an email
-    // that failed the autolink rules, a `<not@an>`), not markup to drop.
-    rest.is_empty() || rest.starts_with('/') || rest.starts_with(char::is_whitespace)
+    after
+}
+
+fn plain_text(nodes: &[Inline]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        match node {
+            Inline::Text(t) | Inline::Code(t) => out.push_str(t),
+            Inline::Emph(v)
+            | Inline::Strong(v)
+            | Inline::Strike(v)
+            | Inline::Underline(v)
+            | Inline::Highlight(v)
+            | Inline::Sup(v)
+            | Inline::Sub(v) => out.push_str(&plain_text(v)),
+            Inline::Link { content, .. } => out.push_str(&plain_text(content)),
+            Inline::Image { alt, .. } => out.push_str(alt),
+            Inline::FootnoteRef { number, label } => {
+                if *number > 0 {
+                    out.push_str(&number.to_string());
+                } else {
+                    out.push_str(&format!("[^{label}]"));
+                }
+            }
+            Inline::SoftBreak => out.push(' '),
+            Inline::HardBreak => out.push('\n'),
+        }
+    }
+    out
 }
 
 pub fn parse_inlines_with(s: &str, defs: &HashMap<String, String>) -> Vec<Inline> {
@@ -569,6 +688,7 @@ pub fn parse_inlines_with(s: &str, defs: &HashMap<String, String>) -> Vec<Inline
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::markdown::ast::Align;
 
     fn pi(s: &str) -> Vec<Inline> {
         parse_inlines_with(s, &HashMap::new())
@@ -631,6 +751,9 @@ mod tests {
             vec![Inline::Image {
                 src: "i.png".into(),
                 alt: "alt".into(),
+                width: None,
+                height: None,
+                align: None,
             }]
         );
         assert_eq!(
@@ -644,8 +767,70 @@ mod tests {
                 content: vec![Inline::Text("https://e.com".into())],
             }]
         );
-        // Inline HTML tags are stripped but their content is kept.
-        assert_eq!(pi("a<b>x</b>c"), vec![Inline::Text("axc".into())]);
+        // Inline HTML formatting tags become real nodes; unknown tags are
+        // dropped but their content is kept.
+        assert_eq!(
+            pi("<b>x</b>"),
+            vec![Inline::Strong(vec![Inline::Text("x".into())])]
+        );
+        assert_eq!(pi("<span>x</span>"), vec![Inline::Text("x".into())]);
+    }
+
+    #[test]
+    fn the_html_github_allows_becomes_formatting() {
+        assert_eq!(
+            pi("<ins>u</ins> <mark>m</mark> <sup>2</sup> <sub>i</sub>"),
+            vec![
+                Inline::Underline(vec![Inline::Text("u".into())]),
+                Inline::Text(" ".into()),
+                Inline::Highlight(vec![Inline::Text("m".into())]),
+                Inline::Text(" ".into()),
+                Inline::Sup(vec![Inline::Text("2".into())]),
+                Inline::Text(" ".into()),
+                Inline::Sub(vec![Inline::Text("i".into())]),
+            ]
+        );
+        // `kbd` and `samp` read as monospace.
+        assert_eq!(pi("<kbd>Ctrl</kbd>"), vec![Inline::Code("Ctrl".into())]);
+        // An anchor keeps its target; one without an href is just a span.
+        assert_eq!(
+            pi("<a href=\"https://e.com\">t</a>"),
+            vec![Inline::Link {
+                href: "https://e.com".into(),
+                content: vec![Inline::Text("t".into())],
+            }]
+        );
+        assert_eq!(pi("<a name=x>t</a>"), vec![Inline::Text("t".into())]);
+        // `<img>` attributes reach the AST; unquoted values parse too.
+        assert_eq!(
+            pi("<img src=a.png alt='A' width=120 align=right>"),
+            vec![Inline::Image {
+                src: "a.png".into(),
+                alt: "A".into(),
+                width: Some(120),
+                height: None,
+                align: Some(Align::Right),
+            }]
+        );
+        assert_eq!(
+            pi("a<br>b"),
+            vec![
+                Inline::Text("a".into()),
+                Inline::HardBreak,
+                Inline::Text("b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn html_comments_and_dangerous_tags_are_removed_with_their_content() {
+        assert_eq!(pi("a<!-- hidden -->b"), vec![Inline::Text("ab".into())]);
+        assert_eq!(
+            pi("a<script>alert(1)</script>b"),
+            vec![Inline::Text("ab".into())]
+        );
+        // A stray close tag disappears; the text around it does not.
+        assert_eq!(pi("a</b>b"), vec![Inline::Text("ab".into())]);
     }
 
     #[test]

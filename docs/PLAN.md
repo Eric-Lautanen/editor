@@ -2040,6 +2040,303 @@ its rows, and the one band that kept re-rendering holds its ops across frames.
   it outright, and `is_iconic` alone missed that.
 
 
+### Touch inertia round (Oct 2026) — a flick that survived its own repaint
+- **Report**: touch scrolling has no momentum in Edit and is glitchy in Split,
+  while Preview coasts as it should. "Maybe a race between vertical and
+  horizontal scroll?"
+- **What the tests showed**: not a race, and not the digitizer — the coast was
+  being cancelled by the app's own repaint. The editor pane is a band (T1), so a
+  coast long enough to matter leaves the rows the band covers within about a
+  screen; the next paint relayouts, and `install_scroll_geometry` — R3's one
+  scroll install — ended every ride with `scroll_by(0.0)`, the scroller's way of
+  saying "the pointer took over". `coast_from` had not gone anywhere: the frame
+  after the rebuild had nothing left to advance and the clock stopped. Measured
+  in an 800×600 frame, the flick died 247 px in. Preview keeps a small file's
+  whole list, so it never rebuilds — hence "works usually in preview". A coarse
+  step paid it too: a PageDown or a fast wheel in Edit glided about a third of
+  the way and stopped (2000 px asked for, 300 px of it landed), which is the
+  "the wheel moves so little" note from the band round, still there. The Split
+  half of the report was a second, independent defect: the halves are linked by
+  shared *progress*, not by pixels, and a finger's `dy` was applied to the
+  shared offset as if it were that pane's own. With a wrapping Markdown preview
+  the editor under the finger moved 0.626 px per finger px while the far half
+  kept up 1:1 — 100 px of finger moved the touched pane 62.6 px.
+- **Fix**: a geometry install ends a ride only when the document underneath it
+  actually changed (its height, or the view's place in it); re-installing the
+  same document at the same place carries the coast — and a glide's target —
+  through, so a band rebuild mid-flick is invisible. And a finger's delta (and
+  the release velocity it hands to the coast) is divided by the share of the
+  shared range the pane under it owns, so that pane tracks the finger exactly;
+  the other half still reaches the end of the document with it, which is what
+  the shared progress is for.
+- **Verified**: `a_flick_keeps_its_coast_when_the_editor_band_rebuilds` walks
+  Edit and Split, requires that a band really did go stale during the ride, and
+  that the coast survives every rebuild and travels past 600 px — it fails on
+  the old code at 247 px. `a_split_finger_moves_the_pane_under_it_one_pixel_per_pixel`
+  pins 100 px of finger → 100 px of the touched pane in both halves, and a
+  2 px/ms release coasting that pane at 2 px/ms — it reads 62.6 px before the
+  fix; `a_wheel_glide_survives_a_band_rebuild` (a 2000 px step lands at 2000 px,
+  was 300 px). 547 tests, clippy and fmt green; the `editor_check_win` and
+  `editor_check_linux` cfg typechecks pass (`editor_check_macos` still needs a
+  Mac host for `link(kind = "framework")` and `std::os::unix`).
+
+
+### Update hand-off round (Oct 2026) — the helper waits for permission, not just an exit
+- **Report**: "the updater/installer and relaunch stuff is still glitchy." The
+  previous round had replaced the generated `install.bat` with a staged copy of
+  the exe running `--apply-update`, but that helper still installed whenever the
+  old PID disappeared. Every departure therefore became an install: a window the
+  user closed themselves, or one that stayed open over a dirty buffer after the
+  download finished, was replaced and relaunched anyway. The batch also could
+  not be called off once it had started, and the GUI path had no moment in which
+  to save the session before the process went away.
+- **The hand-off is data, and it asks first.** `editor.exe --apply-update <msi>
+  <exe> <pid> <result> <log>` takes five separate argv strings, so a path with
+  spaces, an `&` or a non-ASCII character arrives intact; no shell ever
+  re-parses it, and `cli::run` dispatches it before the ordinary flag table so
+  the helper can never open a window or restore a session. Before spawning it,
+  the install thread writes nothing but arms the hand-off; the permission is a
+  token beside `last-install.txt`, `last-install.approve`, written by the UI in
+  the same tick it leaves (or by `--update` on its way out). The helper waits
+  for the PID in one-second slices, polling `last-install.cancel` as it goes,
+  and then *removes* the approval before running `msiexec` — the removal is the
+  claim, so two helpers racing over one update cannot both install. No token,
+  no install; that is what makes "closed while downloading" and "typed after
+  it started" safe.
+- **Unsaved edits have two gates and a final say.** `install()` refuses before
+  the download and again after the checksum, and the UI mirrors
+  `any(tab.dirty)` on every tick. The tick that takes the hand-off checks once
+  more: a dirty tick writes the cancellation, leaves the window where it is,
+  and puts the reason on the status line instead of quitting. If the approval
+  itself cannot be written the tick cancels and stays too — leaving for an
+  update nothing can act on would close the window for nothing.
+- **The departure is the ordinary quit.** A GUI update calls `persist()` and
+  `host.quit()`, so the session file the relaunch reads is written by the same
+  path the close button and Ctrl+Q use. On Windows the helper then waits for
+  the *installed exe's stamp* to change (msiexec returning is not evidence that
+  the new build is on disk), and opens it with `ShellExecuteW` and an explicit
+  `SW_SHOWNORMAL` — the shell's launch path cannot inherit the helper's hidden
+  `STARTUPINFO`, which is what made an earlier `start` open an invisible
+  window. Three attempts, then a direct spawn. The relaunched app is
+  argument-less on purpose: it restores what the old window just saved.
+- **Linux and macOS have no helper to wait for them.** `hand_off` parks the
+  installed path in `PENDING_RELAUNCH`, and the departing tick writes the
+  session and starts it in the same frame; a hand-off that cannot start keeps
+  the window rather than ending with nothing on screen.
+- **The OS's own shutdown now saves the session too.** `WM_QUERYENDSESSION`
+  dispatches `CloseRequested` and returns 1. Vetoing the machine's shutdown was
+  never this app's call, and a restart or sign-out that killed the window
+  without a session write lost the tabs the next launch should have restored.
+- **Verified**: `the_helper_installs_only_for_an_approved_hand_off` proves the
+  token is required, that removing it is a one-winner claim, and that staying
+  writes the cancellation instead;
+  `windows_update_handoff_is_data_not_a_script` pins the five-argument argv and
+  the derived token paths; `unsaved_edits_are_visible_to_the_install_thread`
+  covers the mirror and the one-shot restart flag;
+  `the_installer_is_silent_bounded_and_cannot_restart_anything` keeps
+  `REBOOT=ReallySuppress`, `MSIDISABLERMRESTART=1`,
+  `MSIRESTARTMANAGERCONTROL=Disable` and `EDITOR_SKIP_LAUNCH=1` in place;
+  `the_package_launches_only_from_its_finish_page` holds the WiX condition. 559
+  tests, `cargo fmt --check` and clippy `-D warnings` on Windows, Linux and
+  macOS are green.
+
+### Extensionless files round (Oct 2026) — `.gitignore` is a file type too
+- **Report**: "we need it to associate with files like .gitignore etc."
+  `Path::extension()` returns `None` for `.gitignore`: to Rust it is a file
+  whose *stem* starts with a dot, and to Windows it is an extension key named
+  `.gitignore`. Neither side was wrong, but the classifier and the packaging
+  only spoke the first language, so the whole class of dotfiles — and bare
+  names such as `Dockerfile` and `LICENSE` — fell through to the plain-text
+  viewer and had no "Open with" entry.
+- **One rule for the name.** `FileKind::from_path` now asks `suffix()`, which
+  is the extension when there is one and the name after the dot otherwise
+  (`.env.local` keeps `local`; only a single segment is a dotfile). `EXTENSIONS`
+  carries the dotfile suffixes without their dot because that is the key both
+  the registry and the shared-mime glob use, and `FileKind` pins a
+  `NAMED_FILES` list (`dockerfile`, `makefile`, `rakefile`, `gemfile`,
+  `procfile`, `justfile`, `codeowners`, `license`) that has no dot at all.
+- **What each OS can actually claim.** Windows registers the eight dotfiles as
+  ordinary extension keys (`.gitignore`), which is the only mechanism it has;
+  Linux installs a `text/x-editor-dotfile` type with exact globs for both the
+  dotfiles and the named files, subclassed from `text/plain` so every other
+  viewer still opens them; macOS adds the dotfile names to
+  `CFBundleTypeExtensions`, where LaunchServices matches by extension, so that
+  is best-effort. Bare names have no per-filename association on
+  Windows or macOS, so there they stay a preview the app understands and a
+  Linux default; the README says so rather than promising more than the OS
+  offers.
+- **The wizard gets its own checkbox.** Appending nine more names to the
+  documents line would clip it, so `DotfileTypes` / `DOTFILE_TYPES=1` is its
+  own feature and its own row, ticked like the others and skippable on its own.
+- **Verified**: `dotfiles_are_classified_by_their_whole_name` (including
+  `.env.local` and a trailing-dot edge), `named_files_pick_a_viewer`,
+  `claimed_extensions_resolve`,
+  `packaging_manifests_claim_exactly_the_supported_extensions` (reads the WiX,
+  plist and mime manifests and fails on drift),
+  `linux_mime_package_matches_the_claimed_dotfiles_and_names` and
+  `dialog_filters_cover_every_claimed_extension`.
+
+### GitHub Markdown round (Oct 2026) — preview the file GitHub will publish
+- **Report**: "whatever the common enhancements that github does we need to be
+  able to replicate so people can check their markdowns before pushing." The
+  README idioms that matter are HTML, not Markdown: `<p align="center">` and
+  `<h1 align="center">` for the header, `<div align="center">`, `<img
+  width="…">`, `<details><summary>…</summary>`, and an HTML `<table>` holding
+  two screenshots side by side. None of it rendered.
+- **A scanner, not a sanitizer.** `parse/markdown/html.rs` reads one tag at a
+  time and keeps only the attributes the renderer can act on (`href`, `src`,
+  `alt`, `width`, `height`, `align`, `open`); `class`, `id`, `style` and event
+  handlers are not carried at all, so there is nothing to sanitize later and no
+  attribute string to re-parse. Tags that are not markup (`2 < 3`, `<not@an>`)
+  stay prose. GFM's sanctioned block-tag list decides where a block starts;
+  comments and dangerous elements (`script`, `style`, `iframe`, `object`,
+  `form`, `svg`, …) are dropped with their contents.
+- **Inline HTML is formatting.** `b/strong`, `i/em`, `del/s/strike`, `ins/u`,
+  `mark`, `sup`, `sub`, `code/kbd/samp/tt`, `a href`, `img` and `br` map to
+  real `Inline` variants, so they wrap, style and lay out like their Markdown
+  equivalents instead of appearing as literal angle brackets. Unknown tags drop
+  the tag and keep the content, which is what GitHub's sanitizer effectively
+  does.
+- **Blocks keep their structure.** Containers (`div`, `center`, `section`,
+  `figure`, `p`) become `Block::Html { align, blocks }` with their contents
+  parsed as Markdown, so a centred README header is ordinary blocks in a
+  centred column. `h1`–`h6` keep their level (and their `align`), `<hr>` is a
+  rule, `<pre>` is code, `<ul>/<ol>` are real lists, and `<table>` maps onto  the existing Markdown table shape (the `<th>` row as the header, cell `align`
+  honoured).
+- **The screenshot table renders as one.** Mapping a `<table>` onto the table
+  shape was only half of the idiom: the first pass laid out cells as one line
+  of text, so a cell holding nothing but `<img>` drew nothing, and a table
+  with no `<th>` had its first row taken for a header and collapsed into an
+  empty band. Cells now measure and draw their image cards (an image-only cell
+  is the normal case), a row with a card grows to its height so the caption
+  row sits underneath, and a table with no `<th>` gets no header band at all
+  rather than an invented one. A Markdown cell with an image gets the same
+  treatment, since both share the table layout.
+- **Badges are a row, and a link.** `<p align="center">` holding one
+  `<a href><img></a>` per line is how a README opens; the images used to stack
+  into a column of cards and ignore the anchor. Images separated only by
+  whitespace now share one row (shrinking to fit the column), and a badge's
+  card carries the anchor's URL as a hit region, so clicking it opens the
+  link. An image with no anchor still has none.
+- **`<picture>` is a container.** The dark/light logo idiom puts a `<source>`
+  and a fallback `<img>` inside `<picture>`, indented for the reader's eye.
+  The tag was not a block, so the four-space-indented `<img>` line parsed as
+  an indented code block and the preview showed the source instead of the
+  logo. `<picture>` is a block container now, its `<source>` is dropped like
+  any unknown tag, and the block parsers strip the common indentation of an
+  HTML container's inner lines — indentation inside HTML is formatting, not
+  Markdown. A nested container without an `align` of its own inherits the one
+  around it, so the logo stays centred.
+- **A blank line keeps two quotes apart.** `> first` followed by a blank line
+  and `> second` used to merge into a single quote, which turned a second
+  alert (`> [!WARNING]`) into literal text inside the first. The blank line
+  ends the quote, as CommonMark and GitHub have it; a `>`-only line still
+  continues one.
+- **`<details>` is expanded on purpose.** A preview used to check a README
+  before pushing should show the body, not hide it behind a click, so the
+  summary renders as a label bar followed by its blocks. A `<details>` with no
+  `<summary>` gets "Details" rather than vanishing.
+- **GitHub alerts are callouts.** `> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`,
+  `[!WARNING]` and `[!CAUTION]` become `Block::Alert` with the flavour's label
+  and accent colour, instead of an anonymous quote bar that reads like any
+  other quotation.
+- **Footnotes are collected, not left as text.** `note[^1]` renders as a
+  raised number, and the referenced `[^1]: …` definitions print once at the
+  end under a rule, as a numbered list. Numbers follow the order references
+  first appear, not the order the definitions were written in; a note can
+  hold several blocks (continuation lines indent four spaces); a reference
+  with no definition stays as typed and an unused definition prints nothing.
+  Definitions are lifted out before the block parse and their lines blanked,
+  so every later block keeps its line number. Each note is its own block
+  after a `FootnoteRule` block, which is what lets the plan name a note's top
+  and a band paint only the notes it shows.
+- **Footnotes are two-way links.** A marker carries a `HitAction::FootnoteRef`
+  hit region; the note's number and the ↩ that closes it carry
+  `FootnoteBack`. The app resolves the other end through the plan's block
+  rows when the pane is planned, and through the hit regions themselves in a
+  whole-document pane, then scrolls that end into view. Clicking a marker is
+  a jump, not an `open_url` — no browser is involved.
+- The section is whole-document state — the typing splice declines a text
+  that carries any definition, and `Document::has_footnotes` carries that
+  fact. `Document::footnote_block`/`footnote_reference_block` are the lookups
+  the jump uses.
+- **Layout follows.** Rows inside an aligned container are shifted within the
+  column (`RowBox` keeps `emit_rows` under clippy's argument limit), underline,
+  highlight, superscript and subscript are real spans, an image placeholder
+  honours `width`/`height` and its container's alignment, and the details bar
+  and alert callout are painted with the same palette as the rest of the
+  preview.
+- **Verified**: `the_html_github_allows_becomes_formatting`,
+  `html_comments_and_dangerous_tags_are_removed_with_their_content`,
+  `html_containers_render_their_content`,
+  `details_render_expanded_with_their_summary`,
+  `html_tables_map_onto_the_markdown_table_shape`,
+  `html_lists_become_real_lists`,
+  `alerts_replace_the_anonymous_quote_bar`,
+  `dangerous_html_and_comments_are_dropped_with_their_content`,
+  `a_definition_inside_code_or_html_does_not_resolve` (a link definition inside
+  an HTML block must not leak into the surrounding document),
+  `a_blank_line_keeps_two_quotes_apart`,
+  `an_html_layout_table_has_no_header_row` and
+  `a_picture_renders_its_fallback_image`,
+  `footnotes_collect_into_one_numbered_section`,
+  `a_footnote_can_hold_several_blocks`,
+  `a_note_can_reference_another_note`,
+  `unused_definitions_vanish_and_undefined_references_stay_literal`,
+  `footnote_syntax_inside_code_is_code`,
+  `the_first_definition_of_a_label_wins`,
+  `a_footnote_edit_is_never_spliced` and the app tests
+  `footnote_markers_jump_to_the_note_and_back` (whole pane) and
+  `a_planned_markdown_pane_jumps_footnotes_by_block` (banded pane), plus the
+  layout tests
+  `html_alignment_shifts_rows_within_the_column`,
+  `an_image_honours_width_and_container_alignment`,
+  `details_and_alerts_render_their_labels_and_bodies`,
+  `an_html_table_lays_out_like_a_markdown_one`,
+  `an_html_layout_table_puts_its_images_side_by_side`,
+  `a_markdown_table_cell_can_hold_an_image`,
+  `adjacent_badges_share_a_row_and_stay_links`,
+  `a_picture_stays_centered_like_the_paragraph_around_it`,
+  `footnotes_render_numbers_and_a_list_after_the_prose` and
+  `footnote_markers_and_notes_carry_jump_hits`.
+
+
+### Touch gesture round (Oct 2026) — the arm that outlived its tap
+- **Report**: "inertia still stops working sometimes, only in Edit and Split;
+  preview is fine." The previous round had fixed the coast itself (a geometry
+  re-install no longer ends a ride), so what was left was gesture *state*.
+- **Two arms, two ways to eat a flick.** The preview armed its row-selection
+  drag on *any* press that landed on a row, not only the double/triple tap its
+  comment promised: a tap to look at a line, then a flick within a second,
+  became a selection — nothing scrolled and `PanEnd` retired the gesture
+  without a coast. And an armed gesture owned every pan it saw, wherever the
+  finger was: Split's two halves are one window to a stale virtual pointer, so
+  a double-tap in the editor followed by a flick on the reading half spent its
+  deltas "off the pane" (consumed, no scroll) and `PanEnd` again retired it
+  without a coast. That is the "sometimes": it needed a tap before the flick,
+  and a double-tap in one half to kill the other. Preview was the one mode with
+  a single pane and no tap-then-flick path to lose.
+- **Fix**: a gesture belongs to the pane its *contact* is on — `Event::Pan`
+  already carries the contact position, and `gesture_pane` answers editor,
+  reader or neither (a position-less pan keeps the armed gesture, so the
+  synthesized pans in the suite read as before). An arm on the other pane is
+  dropped and the pan scrolls, with its coast. The preview arms nothing on a
+  single tap. Also, while in the engine: a coast held at the end of the
+  document now stops there instead of keeping the frame clock and repainting a
+  still pane for the rest of its decay, and the Win32 touch handler ignores an
+  `Up` that lifts no tracked contact — a stray one reported a zero-velocity
+  `PanEnd`, which cancels the coast the real gesture just started.
+- **Verified**: `a_tap_before_a_flick_does_not_turn_it_into_a_selection`,
+  `an_armed_editor_selection_does_not_swallow_a_flick_on_the_reader_half`,
+  `an_armed_reader_selection_does_not_swallow_a_flick_on_the_editor_half` and
+  `a_coast_into_an_edge_stops_instead_of_riding_it_out`; the first three fail
+  on the previous tree. 581 tests green, clippy and fmt clean with no `allow`
+  left in the tree (the table row painter takes its geometry as one struct
+  instead of the lint's exception), and the update helper's failure dialog goes
+  through the surface that exists in every build of `update.rs` so the
+  `editor_check_*` type-checks compile again.
+
+
 ## Remaining responsiveness work
 
 The product is frozen, so what is left is making the window answer faster. The

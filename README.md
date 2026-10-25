@@ -60,6 +60,36 @@ keyboard.
 
 ## What's new (October 2026)
 
+- **Markdown that matches GitHub.** The preview now renders the HTML a README
+  actually uses: centred `<p>` and `<h1>` headers, `<div align="center">`,
+  sized `<img width="…">`, `<details><summary>`, `<picture>` logos, and HTML
+  tables — the side-by-side screenshot idiom, images and captions included.
+  A line of badge images stays a line, and a badge opens the link it sits in.
+  Inline HTML becomes real formatting (`<b>`,
+  `<i>`, `<u>`, `<ins>`, `<mark>`, `<sup>`, `<sub>`, `<br>`, links, images),
+  and GitHub alerts (`> [!NOTE]`, `[!TIP]`, `[!WARNING]`, …) become labelled
+  callouts instead of anonymous quote bars. GitHub footnotes — `note[^1]`
+  with a `[^1]: …` definition anywhere in the file — become raised numbers
+  and a numbered list at the end, in the order the references appear rather
+  than the order the definitions were written. A marker jumps to its note;
+  the number or the ↩ at the end of a note goes back to the first reference.
+  Comments and dangerous tags
+  are dropped with their contents; an unknown tag keeps its text. Check your
+  README before you push, not after.
+- **The dotfiles open too.** `.gitignore`, `.gitattributes`, `.gitmodules`,
+  `.editorconfig`, `.dockerignore`, `.npmrc`, `.nvmrc` and `.prettierrc` are
+  real associations now on Windows and Linux, not plain text that happened to
+  open. (macOS matches by extension, so a name like `.gitignore` is
+  best-effort there.) The app also recognises bare names — `Dockerfile`,
+  `Makefile`, `Rakefile`, `Gemfile`, `Procfile`, `Justfile`, `CODEOWNERS`,
+  `LICENSE` — and Linux associates those by whole filename, which is the only
+  platform with a mechanism for it.
+- **An update that asks before it acts.** The Windows hand-off is a staged copy
+  of the app, not a batch script, and it installs only when the window it
+  belongs to left *for the update*: closing Editor yourself while a download
+  runs, or typing into a dirty tab, cancels it instead of installing over you.
+  Unsaved edits make the update refuse and say so. No installer can reboot the
+  machine, and the window that comes back has your tabs, file and place.
 - **Big files stay instant (0.2.5).** Jumping to the end of a multi-megabyte
   code file paints immediately: the highlighter carries its tint state along
   the document instead of re-deriving it from the top, a resize adopts that
@@ -190,18 +220,22 @@ unsigned and the OS will show its usual unknown-publisher warning.
 ### Windows
 
 **Run the `.msi`** — that is the whole install. It is per-user, so there is no
-admin prompt, and the wizard is one page with three checkboxes, all ticked:
+admin prompt, and the wizard is one page with four checkboxes, all ticked:
 
 | | |
 |---|---|
 | Documents and config files | md, markdown, json, jsonl, ndjson, txt, log, csv, tsv, yaml, yml, toml, ini, cfg, conf |
 | Code and markup files | rs, py, js, ts, c, h, cpp, hpp, cs, java, go, rb, php, css, html, xml, sh |
+| Dotfiles and tool config | gitignore, gitattributes, gitmodules, editorconfig, dockerignore, npmrc, nvmrc, prettierrc |
 | Create a shortcut on the Desktop | a Start menu entry is always added |
 
 These only *offer* Editor in the Explorer "Open with" menu — a file type you
-have already assigned to another program keeps that program. The install also
-adds an entry to Installed apps, and running the installer again with
-different boxes ticked changes your choices.
+have already assigned to another program keeps that program. The dotfile row
+registers names like `.gitignore` the only way Windows can, as extension keys;
+bare names such as `Dockerfile` and `LICENSE` have no per-filename association
+on Windows, so they open through **Open with** rather than claiming a menu
+entry. The install also adds an entry to Installed apps, and running the
+installer again with different boxes ticked changes your choices.
 
 The portable zip is the alternative: unzip it wherever you like and run
 `editor --install` to register the same "Open with" entries (still per-user,
@@ -216,9 +250,12 @@ settings and recent-files list are kept (they are yours); delete
 Unpack the tarball and run `packaging/linux/install.sh`. It installs the
 binary to `~/.local/bin`, adds a launcher to your applications menu **and a
 shortcut on your Desktop**, installs the launcher icons, and makes Editor the
-default app for Markdown, JSON, NDJSON, plain text, CSV, YAML and TOML (Linux
-has no "Open with" list to be offered in, so there it does take the defaults).
-Set `EDITOR_NO_DESKTOP_SHORTCUT=1` to leave the Desktop alone.
+default app for Markdown, JSON, NDJSON, plain text, CSV, YAML and TOML, plus
+the dotfiles and tool configs above and the bare names (`Dockerfile`,
+`Makefile`, `Rakefile`, `Gemfile`, `Procfile`, `Justfile`, `CODEOWNERS`,
+`LICENSE`). Linux is the one platform that can match a whole filename, so there
+that list is exact. Set `EDITOR_NO_DESKTOP_SHORTCUT=1` to leave the Desktop
+alone.
 
 To undo all of it, delete `~/.local/bin/editor`,
 `~/.local/share/applications/editor.desktop`, `~/Desktop/editor.desktop` and
@@ -227,8 +264,10 @@ To undo all of it, delete `~/.local/bin/editor`,
 ### macOS
 
 Unzip, then drag `Editor.app` into `/Applications`. The bundle declares the
-same document types, so Finder's "Open With" offers it. There is no Desktop
-shortcut to add here — the Dock and Spotlight are how an app is launched.
+same document types, including the dotfiles, so Finder's "Open With" offers it
+for ordinary extensions; macOS matches by extension, so a bare name or a
+`.gitignore` has no per-filename menu entry. There is no Desktop shortcut to
+add here — the Dock and Spotlight are how an app is launched.
 
 The bundle is not signed or notarized yet, so Gatekeeper refuses the first
 launch of a downloaded copy: right-click the app and choose **Open** once
@@ -266,12 +305,31 @@ editor --update      # check GitHub and install the newest release now
 
 When an update installs, the app closes and comes back on the new version with
 what you had open — the session file it wrote on the way out (open tabs, the
-file you were in, the window's size and place) is what the fresh process reads.
-On Windows the updater runs the installer and reopens the app once it has
-finished, because Restart Manager closes a running app for an upgrade but does
-not reopen it. The whole attempt — check, download, checksum, the installer's
-exit code, the relaunch — is also appended to `%APPDATA%\Editor\last-update.log`
-(the previous attempt kept as `last-update.1.log`), so an update that  misbehaves is diagnosable from a file afterwards instead of by guesswork.
+file you were in, the view, the window's size and place) is what the fresh
+process reads. On Windows the hand-off is a staged copy of the app itself, not
+a batch script: it waits for the old window to exit *and* for the approval that
+window writes as it leaves, then runs the installer with `/passive
+REBOOT=ReallySuppress MSIDISABLERMRESTART=1 MSIRESTARTMANAGERCONTROL=Disable
+EDITOR_SKIP_LAUNCH=1`. An update can therefore close and reopen the app but
+never reboot the machine, and the package itself launches nothing.
+
+That approval is also what keeps an update from outliving the window that asked
+for it. Close Editor yourself while the download runs, or type into a dirty tab
+afterwards, and the hand-off is cancelled: nothing is installed, and the window
+that is still there says why. Unsaved edits stop the install before the
+download and again after the checksum. If the installer does refuse, the next
+launch names its exit code in the About box instead of pretending it worked.
+Linux and macOS have no helper to wait for them: the window saves, then starts
+the newly installed build from the same tick. If that start fails, the old
+window stays open rather than closing on nothing.
+
+The whole attempt — check, download, checksum, the helper's wait, the
+installer's exit code, the relaunch — is appended to `last-update.log` in the
+app's config directory (`%APPDATA%\Editor` on Windows,
+`$XDG_CONFIG_HOME/editor` or `~/.config/editor` on Linux, and
+`~/Library/Application Support/Editor` on macOS), with the previous attempt
+kept as `last-update.1.log`. So an update that misbehaves is diagnosable from
+a file afterwards instead of by guesswork.
 
 A newer install always replaces the older one in place, so file associations
 keep working — re-running `--install` is only needed if you *move* the

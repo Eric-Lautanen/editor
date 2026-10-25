@@ -1,8 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Shared-mime-info package installed by install.sh. The JSON-lines type is
+     not in the shared database on most distributions; the dotfile type is how
+     a file such as `.gitignore` (which has no extension) can be associated at
+     all on Linux: the glob names the whole file, and the type subclasses
+     text/plain so every other viewer still treats it as text. The list mirrors
+     DOTFILES / NAMED_FILES in src/core/file_kind.rs (pinned by a test). -->
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
   <mime-type type="application/x-ndjson">
     <comment>Newline-delimited JSON</comment>
     <glob pattern="*.jsonl"/>
     <glob pattern="*.ndjson"/>
+  </mime-type>
+  <mime-type type="text/x-editor-dotfile">
+    <comment>Dotfile or tool configuration</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.gitignore" weight="80"/>
+    <glob pattern="*.gitattributes" weight="80"/>
+    <glob pattern="*.gitmodules" weight="80"/>
+    <glob pattern="*.editorconfig" weight="80"/>
+    <glob pattern="*.dockerignore" weight="80"/>
+    <glob pattern="*.npmrc" weight="80"/>
+    <glob pattern="*.nvmrc" weight="80"/>
+    <glob pattern="*.prettierrc" weight="80"/>
+    <glob pattern="Dockerfile" weight="80"/>
+    <glob pattern="Makefile" weight="80"/>
+    <glob pattern="Rakefile" weight="80"/>
+    <glob pattern="Gemfile" weight="80"/>
+    <glob pattern="Procfile" weight="80"/>
+    <glob pattern="Justfile" weight="80"/>
+    <glob pattern="CODEOWNERS" weight="80"/>
+    <glob pattern="LICENSE" weight="80"/>
   </mime-type>
 </mime-info>

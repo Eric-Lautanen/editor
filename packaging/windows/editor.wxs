@@ -178,8 +178,8 @@
            runs it; an upgrade does not need it, because the new package writes
            the same associations and its first launch sweeps the payload. -->
       <Custom Action="UnregisterOnUninstall" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <Custom Action="LaunchTargetPath" After="InstallFinalize" Condition="UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot;" />
-      <Custom Action="LaunchEditorPassive" After="LaunchTargetPath" Condition="UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot;" />
+      <Custom Action="LaunchTargetPath" After="InstallFinalize" Condition="UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot; AND NOT EDITOR_SKIP_LAUNCH" />
+      <Custom Action="LaunchEditorPassive" After="LaunchTargetPath" Condition="UILevel &gt;= 3 AND REBOOT=&quot;ReallySuppress&quot; AND NOT EDITOR_SKIP_LAUNCH" />
     </InstallExecuteSequence>
 
     <!-- Per-user preferred, stated rather than implied: ALLUSERS=2 with
@@ -279,6 +279,20 @@
         <ComponentRef Id="ExtXml" />
         <ComponentRef Id="ExtSh" />
       </Feature>
+      <!-- Dotfiles and tool config: extensionless-looking names that Windows
+           nevertheless treats as extensions (`.gitignore` is
+           `Software\Classes\.gitignore`). Their own group keeps the dialog
+           lines short enough not to clip. -->
+      <Feature Id="DotfileTypes" Title="Associate dotfiles and tool config" Description="gitignore, gitattributes, gitmodules, editorconfig, dockerignore, npmrc, nvmrc, prettierrc in your Open-with menu." Level="1" AllowAdvertise="no">
+        <ComponentRef Id="ExtGitignore" />
+        <ComponentRef Id="ExtGitattributes" />
+        <ComponentRef Id="ExtGitmodules" />
+        <ComponentRef Id="ExtEditorconfig" />
+        <ComponentRef Id="ExtDockerignore" />
+        <ComponentRef Id="ExtNpmrc" />
+        <ComponentRef Id="ExtNvmrc" />
+        <ComponentRef Id="ExtPrettierrc" />
+      </Feature>
     </Feature>
     <!-- The setup UI. Two pages of our own, then the UI extension's stock
          ProgressDlg/CancelDlg/ErrorDlg/UserExit.
@@ -314,6 +328,7 @@
          must produce. -->
     <Property Id="DOCUMENT_TYPES" Value="1" />
     <Property Id="CODE_TYPES" Value="1" />
+    <Property Id="DOTFILE_TYPES" Value="1" />
     <Property Id="DESKTOP_SHORTCUT" Value="1" />
     <!-- Checked by default on the completion page: a fresh install should end
          with the app open, not with the user hunting for the Start menu. A
@@ -330,7 +345,7 @@
       <Dialog
           Id="EditorWelcomeDlg"
           Width="370"
-          Height="270"
+          Height="286"
           Title="Install Editor"
           NoMinimize="yes">
         <Control Id="AppIcon" Type="Icon" X="18" Y="10" Width="32" Height="32" Text="editor_setup.ico" />
@@ -351,24 +366,28 @@
         <Control Id="DocumentsList" Type="Text" X="36" Y="96" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="md markdown json jsonl ndjson txt log csv tsv yaml yml toml ini cfg conf" />
         <Control Id="CodeCheck" Type="CheckBox" X="18" Y="114" Width="336" Height="10" Property="CODE_TYPES" CheckBoxValue="1" Text="Code and markup files" />
         <Control Id="CodeList" Type="Text" X="36" Y="126" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="rs py js ts c h cpp hpp cs java go rb php css html xml sh" />
-        <Control Id="ShortcutSection" Type="Text" X="18" Y="146" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="Shortcuts" />
-        <Control Id="DesktopCheck" Type="CheckBox" X="18" Y="164" Width="336" Height="10" Property="DESKTOP_SHORTCUT" CheckBoxValue="1" Text="Create a shortcut on the Desktop" />
-        <Control Id="StartMenuNote" Type="Text" X="36" Y="175" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="A Start menu entry is always added." />
-        <Control Id="Note" Type="Text" X="18" Y="194" Width="334" Height="34" Transparent="yes" NoPrefix="yes" Text="Editor only joins the Open with menu - your current default apps are not changed. Run the installer again to change these choices." />
-        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="DotfilesCheck" Type="CheckBox" X="18" Y="140" Width="336" Height="10" Property="DOTFILE_TYPES" CheckBoxValue="1" Text="Dotfiles and tool config" />
+        <Control Id="DotfilesList" Type="Text" X="36" Y="152" Width="318" Height="20" Transparent="yes" NoPrefix="yes" Text="gitignore gitattributes gitmodules editorconfig dockerignore npmrc nvmrc prettierrc" />
+        <Control Id="ShortcutSection" Type="Text" X="18" Y="176" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="Shortcuts" />
+        <Control Id="DesktopCheck" Type="CheckBox" X="18" Y="194" Width="336" Height="10" Property="DESKTOP_SHORTCUT" CheckBoxValue="1" Text="Create a shortcut on the Desktop" />
+        <Control Id="StartMenuNote" Type="Text" X="36" Y="205" Width="318" Height="10" Transparent="yes" NoPrefix="yes" Text="A Start menu entry is always added." />
+        <Control Id="Note" Type="Text" X="18" Y="224" Width="334" Height="30" Transparent="yes" NoPrefix="yes" Text="Editor only joins the Open with menu - your current default apps are not changed. Run the installer again to change these choices." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="258" Width="370" Height="0" />
         <!-- The checkbox pattern: the check state lands in the property
              (CheckBoxValue) and these events turn it into feature state.
              Unchecked -> Remove (absent); checked -> AddLocal (installed). -->
-        <Control Id="Install" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Install">
+        <Control Id="Install" Type="PushButton" X="236" Y="263" Width="56" Height="17" Default="yes" Text="Install">
           <Publish Event="AddLocal" Value="DocumentTypes" Condition="DOCUMENT_TYPES" Order="1" />
           <Publish Event="Remove" Value="DocumentTypes" Condition="NOT DOCUMENT_TYPES" Order="2" />
           <Publish Event="AddLocal" Value="CodeTypes" Condition="CODE_TYPES" Order="3" />
           <Publish Event="Remove" Value="CodeTypes" Condition="NOT CODE_TYPES" Order="4" />
-          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="DESKTOP_SHORTCUT" Order="5" />
-          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT DESKTOP_SHORTCUT" Order="6" />
-          <Publish Event="EndDialog" Value="Return" Order="7" />
+          <Publish Event="AddLocal" Value="DotfileTypes" Condition="DOTFILE_TYPES" Order="5" />
+          <Publish Event="Remove" Value="DotfileTypes" Condition="NOT DOTFILE_TYPES" Order="6" />
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="DESKTOP_SHORTCUT" Order="7" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT DESKTOP_SHORTCUT" Order="8" />
+          <Publish Event="EndDialog" Value="Return" Order="9" />
         </Control>
-        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+        <Control Id="Cancel" Type="PushButton" X="304" Y="263" Width="56" Height="17" Cancel="yes" Text="Cancel">
           <Publish Event="EndDialog" Value="Exit" />
         </Control>
       </Dialog>
@@ -612,7 +631,52 @@
           <RegistryKey Root="HKCU" Key="Software\Classes\.sh\OpenWithProgids">
             <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
           </RegistryKey>
-        </Component>      </Directory>
+        </Component>
+        <!-- Dotfiles are extensions as far as the shell is concerned:
+             `.gitignore` is `Software\Classes\.gitignore` even though
+             `Path::extension()` calls it nothing. Same OpenWithProgids shape
+             as every other type; see `DOTFILES` in core::file_kind. -->
+        <Component Id="ExtGitignore" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.gitignore\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtGitattributes" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.gitattributes\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtGitmodules" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.gitmodules\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtEditorconfig" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.editorconfig\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtDockerignore" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.dockerignore\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtNpmrc" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.npmrc\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtNvmrc" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.nvmrc\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+        <Component Id="ExtPrettierrc" Guid="*">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.prettierrc\OpenWithProgids">
+            <RegistryValue Name="Editor.Document" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+        </Component>
+      </Directory>
     </StandardDirectory>
 
     <!-- The Desktop shortcut. Same per-user KeyPath trick as the Start menu

@@ -978,6 +978,202 @@ fn a_finger_drag_after_a_preview_double_tap_selects_rows() {
     assert!(app.preview_touch.is_none(), "the gesture is retired");
 }
 
+/// A tap selects nothing and arms nothing: the flick that follows it is a
+/// scroll, with the coast the finger threw. The gesture used to be armed by
+/// any press on a row, so a tap followed by a flick inside the tap's second
+/// became a row selection that scrolled nothing and coasted nowhere.
+#[test]
+fn a_tap_before_a_flick_does_not_turn_it_into_a_selection() {
+    let mut app = open("editor_test_tap_flick.txt", &"one\ntwo\n".repeat(400));
+    let mut host = NullHost::default();
+    let _ = app.render_headless(900, 600, 1.0);
+    let row = app.preview_rows[2].clone();
+    let (x, y) = (
+        row.x0 + 10.0,
+        app.viewport().y + (row.top + row.bottom) / 2.0,
+    );
+    app.on_event(
+        Event::MouseDown {
+            x,
+            y,
+            button: MouseButton::Left,
+        },
+        &mut host,
+    );
+    app.on_event(
+        Event::MouseUp {
+            x,
+            y,
+            button: MouseButton::Left,
+        },
+        &mut host,
+    );
+    assert!(
+        app.preview_touch.is_none(),
+        "a single tap must not arm a selection drag"
+    );
+    let before = app.scroll.offset;
+    for _ in 0..5 {
+        app.on_event(
+            Event::Pan {
+                dx: 0.0,
+                dy: -20.0,
+                x,
+                y,
+            },
+            &mut host,
+        );
+    }
+    assert!(
+        (app.scroll.offset - before - 100.0).abs() < 0.05,
+        "the flick after a tap must scroll, moved {}",
+        app.scroll.offset - before
+    );
+    assert!(
+        app.preview_sel.is_none(),
+        "and must not leave a selection behind"
+    );
+    app.on_event(Event::PanEnd { vx: 0.0, vy: -2.0 }, &mut host);
+    assert!(
+        app.scroll.coast != 0.0,
+        "the flick after a tap must coast like any other"
+    );
+}
+
+/// The armed gesture belongs to the pane the finger is on, not to whatever a
+/// previous tap left armed: a double-tap in the editor halves, then a flick
+/// over the reader half, is a scroll of the reader — and it coasts. The
+/// editor arm used to consume every pan it saw (a drag off its pane spends no
+/// delta but still counts as the selection's), and `PanEnd` then retired the
+/// gesture without a coast, so the reader half was dead to touch for as long
+/// as the arm lived.
+#[test]
+fn an_armed_editor_selection_does_not_swallow_a_flick_on_the_reader_half() {
+    let text =
+        "# heading\n\na paragraph that is long enough to fill a row of the split\n\n".repeat(120);
+    let mut app = open("editor_test_armed_split.md", &text);
+    app.set_mode(Mode::Split);
+    let mut host = NullHost::default();
+    let _ = app.render_headless(1000, 600, 1.0);
+    let (left, right) = app.split_panes();
+    let (ex, ey) = (right.x + right.w / 2.0, right.y + right.h / 2.0);
+    for _ in 0..2 {
+        app.on_event(
+            Event::MouseDown {
+                x: ex,
+                y: ey,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        app.on_event(
+            Event::MouseUp {
+                x: ex,
+                y: ey,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+    }
+    assert!(
+        app.touch_sel.is_some(),
+        "the double-tap arms the editor's selection drag"
+    );
+    let (px, py) = (left.x + left.w / 2.0, left.y + left.h / 2.0);
+    let before = app.preview_scroll();
+    for _ in 0..5 {
+        app.on_event(
+            Event::Pan {
+                dx: 0.0,
+                dy: -20.0,
+                x: px,
+                y: py,
+            },
+            &mut host,
+        );
+    }
+    assert!(
+        app.preview_scroll() > before + 50.0,
+        "a finger on the reader half scrolls it: moved {}",
+        app.preview_scroll() - before
+    );
+    app.on_event(Event::PanEnd { vx: 0.0, vy: -2.0 }, &mut host);
+    assert!(app.touch_sel.is_none(), "the stale arm is dropped");
+    assert!(
+        app.scroll.coast != 0.0,
+        "and the flick coasts the pane it happened on"
+    );
+}
+
+/// The other direction of the same rule: a reader-half tap arms a reader
+/// selection, and a flick on the *editor* half is still the editor's scroll.
+#[test]
+fn an_armed_reader_selection_does_not_swallow_a_flick_on_the_editor_half() {
+    let text =
+        "# heading\n\na paragraph that is long enough to fill a row of the split\n\n".repeat(120);
+    let mut app = open("editor_test_armed_reader.md", &text);
+    app.set_mode(Mode::Split);
+    let mut host = NullHost::default();
+    let _ = app.render_headless(1000, 600, 1.0);
+    let (left, right) = app.split_panes();
+    let row = app
+        .preview_rows
+        .iter()
+        .find(|r| r.top > left.y)
+        .expect("a reader row to tap")
+        .clone();
+    let (px, py) = (
+        row.x0 + 10.0,
+        left.y + (row.top + row.bottom) / 2.0 - app.preview_scroll(),
+    );
+    for _ in 0..2 {
+        app.on_event(
+            Event::MouseDown {
+                x: px,
+                y: py,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        app.on_event(
+            Event::MouseUp {
+                x: px,
+                y: py,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+    }
+    assert!(
+        app.preview_touch.is_some(),
+        "the reader double-tap arms its selection drag"
+    );
+    let (ex, ey) = (right.x + right.w / 2.0, right.y + right.h / 2.0);
+    let before = app.editor_scroll();
+    for _ in 0..5 {
+        app.on_event(
+            Event::Pan {
+                dx: 0.0,
+                dy: -20.0,
+                x: ex,
+                y: ey,
+            },
+            &mut host,
+        );
+    }
+    assert!(
+        app.editor_scroll() > before + 50.0,
+        "a finger on the editor half scrolls it: moved {}",
+        app.editor_scroll() - before
+    );
+    app.on_event(Event::PanEnd { vx: 0.0, vy: -2.0 }, &mut host);
+    assert!(app.preview_touch.is_none(), "the stale arm is dropped");
+    assert!(
+        app.scroll.coast != 0.0,
+        "and the flick coasts the pane it happened on"
+    );
+}
+
 #[test]
 fn headless_render_draws_text_and_statusbar() {
     let mut app = open("editor_test_a.txt", "Hello Editor\nsecond line");
@@ -1221,6 +1417,138 @@ fn hovering_a_link_names_it_in_the_status_bar() {
     );
     assert_eq!(host.opened_url.as_deref(), Some(href.as_str()));
     assert!(app.status_extra.is_empty(), "status: {}", app.status_extra);
+}
+
+#[test]
+fn footnote_markers_jump_to_the_note_and_back() {
+    use crate::layout::display_list::HitAction;
+    // Enough prose that the notes are off-screen at the top.
+    let mut text = String::from("A claim[^1].\n\n");
+    for i in 0..40 {
+        text.push_str(&format!(
+            "Paragraph {i} has enough words to fill a line of the reading column, so the page scrolls.\n\n"
+        ));
+    }
+    text.push_str("[^1]: The note at the bottom.\n");
+    let mut app = open("editor_test_footnote_jump.md", &text);
+    let _ = app.render_headless(800, 600, 1.0);
+    let refs: Vec<Rect> = app
+        .preview
+        .list
+        .hits
+        .iter()
+        .filter_map(|h| match &h.action {
+            HitAction::FootnoteRef(1) => Some(h.rect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refs.len(), 1, "one marker hit region");
+    let note_top = app
+        .preview
+        .list
+        .hits
+        .iter()
+        .filter_map(|h| match &h.action {
+            HitAction::FootnoteBack(1) => Some(h.rect),
+            _ => None,
+        })
+        .map(|r| r.y)
+        .fold(f32::INFINITY, f32::min);
+    let mut host = NullHost::default();
+    let vp = app.viewport();
+    let click = |app: &App, rect: &Rect| {
+        (
+            vp.x + rect.x + rect.w / 2.0,
+            vp.y + rect.y + rect.h / 2.0 - app.scroll.offset,
+        )
+    };
+    let (x, y) = click(&app, &refs[0]);
+    app.on_event(
+        Event::MouseDown {
+            x,
+            y,
+            button: MouseButton::Left,
+        },
+        &mut host,
+    );
+    // A note near the end lands as far as the page can scroll.
+    let landed = (note_top - 32.0 * app.scale).max(0.0).min(app.scroll.max());
+    assert!(
+        (app.scroll.offset - landed).abs() < 1.0,
+        "marker jumped to {}, want {landed}",
+        app.scroll.offset
+    );
+    assert!(
+        app.scroll.offset <= note_top && note_top < app.scroll.offset + vp.h,
+        "the note is not in view at {}",
+        app.scroll.offset
+    );
+    // The return arrow at the end of the note goes back to the marker.
+    let arrow = app
+        .preview
+        .list
+        .hits
+        .iter()
+        .filter_map(|h| match &h.action {
+            HitAction::FootnoteBack(1) => Some(h.rect),
+            _ => None,
+        })
+        .max_by(|a, b| a.y.total_cmp(&b.y))
+        .expect("return arrow");
+    let (x, y) = click(&app, &arrow);
+    app.on_event(
+        Event::MouseDown {
+            x,
+            y,
+            button: MouseButton::Left,
+        },
+        &mut host,
+    );
+    let back = (refs[0].y - 32.0 * app.scale).max(0.0);
+    assert!(
+        (app.scroll.offset - back).abs() < 1.0,
+        "arrow returned to {}, want {back}",
+        app.scroll.offset
+    );
+}
+
+#[test]
+fn a_planned_markdown_pane_jumps_footnotes_by_block() {
+    // Below the plan threshold this would be one display list; here the pane
+    // paints bands, so the jump targets come from the plan's block rows.
+    let mut text = String::from("Top[^1].\n\n");
+    for i in 0..60 {
+        text.push_str(&format!(
+            "Paragraph {i} has enough words to fill a line of the reading column, so the page scrolls.\n\n"
+        ));
+    }
+    text.push_str("[^1]: The note at the bottom.\n");
+    let mut app = planned_app("footnote_jump", "md", &text, 20);
+    let _ = app.render_headless(800, 600, 1.0);
+    let (note_top, ref_top) = {
+        let Some(layout::PanePlan::Markdown(p)) = &app.pane_plan else {
+            panic!("the fixture must be planned");
+        };
+        let doc = &app.markdown_doc.as_ref().expect("the parsed document").1;
+        let note = doc.footnote_block(1).expect("note 1");
+        let reference = doc.footnote_reference_block(1).expect("its reference");
+        assert!(note > reference, "notes print after the prose");
+        (p.rows.top(note), p.rows.top(reference))
+    };
+    app.jump_to_footnote(1, true);
+    let landed = (note_top - 32.0 * app.scale).max(0.0).min(app.scroll.max());
+    assert!(
+        (app.scroll.offset - landed).abs() < 1.0,
+        "planned jump landed at {}, want {landed}",
+        app.scroll.offset
+    );
+    app.jump_to_footnote(1, false);
+    let back = (ref_top - 32.0 * app.scale).max(0.0);
+    assert!(
+        (app.scroll.offset - back).abs() < 1.0,
+        "planned return landed at {}, want {back}",
+        app.scroll.offset
+    );
 }
 
 #[test]
@@ -1684,7 +2012,7 @@ fn nested_toggles_collapse_and_reexpand() {
         .iter()
         .filter_map(|h| match &h.action {
             crate::layout::display_list::HitAction::ToggleNode(id) => Some((h.rect, *id)),
-            crate::layout::display_list::HitAction::Link(_) => None,
+            _ => None,
         })
         .collect();
     assert!(hits.len() >= 3, "want root + 2 nested toggles");
@@ -3308,6 +3636,190 @@ fn a_flick_coasts_past_the_finger() {
     }
     assert!(!host.animating);
     assert_eq!(app.scroll.offset, app.scroll.target);
+}
+
+#[test]
+fn a_flick_keeps_its_coast_when_the_editor_band_rebuilds() {
+    // The report: touch inertia works in Preview and dies in Edit. The
+    // editor pane is a *band* (T1): a coast long enough to leave the rows it
+    // covers makes the next paint rebuild it, and the geometry install that
+    // follows used to end every ride — `scroll_by(0.0)` resets the coast —
+    // which stops the flick dead about a screen in. Preview keeps a small
+    // file's whole list, so it never rebuilds and never showed the bug; Split
+    // rebuilds the editor half and stutters. Every mode is walked here
+    // because the two pans and the two relayout paths must agree.
+    for mode in [Mode::Edit, Mode::Split] {
+        let mut app = open(
+            &format!("editor_test_fling_band_{mode:?}.txt"),
+            &"line\n".repeat(2000),
+        );
+        app.set_mode(mode);
+        let mut host = NullHost::default();
+        let mut canvas = app.render_headless(800, 600, 1.0);
+        assert!(
+            !app.editor_band_stale(),
+            "{mode:?}: the first paint builds the band"
+        );
+
+        app.on_event(
+            Event::Pan {
+                dx: 0.0,
+                dy: -40.0,
+                x: 400.0,
+                y: 300.0,
+            },
+            &mut host,
+        );
+        app.on_event(Event::PanEnd { vx: 0.0, vy: -2.0 }, &mut host);
+        assert!(
+            app.scroll.coast != 0.0,
+            "{mode:?}: the flick starts a coast"
+        );
+
+        let start = app.scroll.offset;
+        let mut frames = 0;
+        let mut rebuilt = false;
+        while app.scrolling && frames < 600 {
+            app.on_event(Event::Frame, &mut host);
+            let stale = app.editor_band_stale();
+            app.paint(&mut canvas);
+            rebuilt |= stale;
+            frames += 1;
+            assert!(
+                app.scroll.coast != 0.0 || !app.scrolling,
+                "{mode:?}: the coast died under a band rebuild {} px in",
+                app.scroll.offset - start
+            );
+        }
+        assert!(
+            rebuilt,
+            "{mode:?}: the flick never crossed a band boundary, so this proves nothing"
+        );
+        assert!(
+            app.scroll.offset - start > 600.0,
+            "{mode:?}: the flick coasted only {} px",
+            app.scroll.offset - start
+        );
+    }
+}
+
+#[test]
+fn a_wheel_glide_survives_a_band_rebuild() {
+    // The same install that killed a coast took a glide's destination with it:
+    // a PageDown in Edit mode crosses the editor band, the rebuild re-installed
+    // the scroll geometry and the remaining travel was dropped mid-ride. The
+    // destination is the wheel's, and re-installing the same document at the
+    // same place must leave it alone.
+    let mut app = open("editor_test_pagedown_band.txt", &"line\n".repeat(2000));
+    app.set_mode(Mode::Edit);
+    let mut host = NullHost::default();
+    let mut canvas = app.render_headless(800, 600, 1.0);
+    app.on_event(
+        Event::Scroll {
+            dx: 0.0,
+            dy: -2000.0,
+        },
+        &mut host,
+    );
+    assert_eq!(
+        app.scroll.offset, 0.0,
+        "a big step glides, it does not jump"
+    );
+    assert_eq!(app.scroll.target, 2000.0);
+    let mut rebuilt = false;
+    for _ in 0..600 {
+        if !app.scrolling {
+            break;
+        }
+        app.on_event(Event::Frame, &mut host);
+        rebuilt |= app.editor_band_stale();
+        app.paint(&mut canvas);
+    }
+    assert!(
+        rebuilt,
+        "the glide never crossed a band boundary, so this proves nothing"
+    );
+    assert_eq!(
+        app.scroll.offset, 2000.0,
+        "the wheel's destination is still where it lands"
+    );
+    assert!(!app.scrolling, "and the clock ends with the ride");
+}
+
+#[test]
+fn a_split_finger_moves_the_pane_under_it_one_pixel_per_pixel() {
+    // Split links its halves by shared *progress*, not by pixels: each pane
+    // paints a ratio of its own range, and a range is only a share of the
+    // longer one. A finger's `dy` is in the pane it is over, so that share
+    // has to be divided out — measured before the fix, a wrapping Markdown
+    // preview put the editor at 0.63, and the text under the finger travelled
+    // 63 px for 100 px of finger while the far half kept up.
+    let text = "# heading
+
+some words in a paragraph that wraps because markdown                 wraps at the pane
+
+"
+    .repeat(400);
+    let mut app = open("editor_test_split_pan.md", &text);
+    app.set_mode(Mode::Split);
+    let mut host = NullHost::default();
+    let _ = app.render_headless(800, 600, 1.0);
+    let editor_share = app.pane_share(true);
+    let preview_share = app.pane_share(false);
+    assert!(
+        editor_share < 0.9 && preview_share > editor_share,
+        "the fixture needs unequal panes, or this proves nothing:          editor {editor_share}, preview {preview_share}"
+    );
+    // The finger is over the editor half: the editor is what must keep up.
+    let area = app.editor_area();
+    let (fx, fy) = (area.x + area.w / 2.0, area.y + area.h / 2.0);
+    let before = app.editor_scroll();
+    for _ in 0..5 {
+        app.on_event(
+            Event::Pan {
+                dx: 0.0,
+                dy: -20.0,
+                x: fx,
+                y: fy,
+            },
+            &mut host,
+        );
+    }
+    assert!(
+        (app.editor_scroll() - before - 100.0).abs() < 0.05,
+        "the pane under the finger tracks it: moved {} px for 100 px of finger",
+        app.editor_scroll() - before
+    );
+    // And the flick it threw coasts at the speed the finger let go at, in
+    // the same pane's pixels — not at a share of it.
+    app.on_event(Event::PanEnd { vx: 0.0, vy: -2.0 }, &mut host);
+    assert!(
+        (app.scroll.coast * editor_share - 2.0).abs() < 0.05,
+        "a 2 px/ms flick coasts the editor at {} px/ms",
+        app.scroll.coast * editor_share
+    );
+
+    // The other half is the same rule: a finger over the preview tracks the
+    // preview, and the editor follows at its own share of the progress.
+    let view = app.viewport();
+    let (px, py) = (view.x + view.w / 4.0, view.y + view.h / 2.0);
+    let before = app.preview_scroll();
+    for _ in 0..5 {
+        app.on_event(
+            Event::Pan {
+                dx: 0.0,
+                dy: -20.0,
+                x: px,
+                y: py,
+            },
+            &mut host,
+        );
+    }
+    assert!(
+        (app.preview_scroll() - before - 100.0).abs() < 0.05,
+        "the preview tracks a finger over it: moved {} px for 100 px of finger",
+        app.preview_scroll() - before
+    );
 }
 
 #[test]

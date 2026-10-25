@@ -128,4 +128,8 @@ pub struct HitRegion {
 pub enum HitAction {
     Link(String),
     ToggleNode(usize),
+    /// A footnote marker: jump to the note with this number.
+    FootnoteRef(usize),
+    /// A note's number or return arrow: jump back to its first reference.
+    FootnoteBack(usize),
 }

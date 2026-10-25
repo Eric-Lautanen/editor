@@ -267,6 +267,10 @@ mod ffi {
     pub const WM_GETMINMAXINFO: u32 = 0x0024;
     pub const WM_PAINT: u32 = 0x000F;
     pub const WM_CLOSE: u32 = 0x0010;
+    /// Windows is asking every window to close: shutdown, restart, sign-out,
+    /// or an installer that needs the exe (Restart Manager). The answer is a
+    /// session write and a normal quit; vetoing would block the whole session.
+    pub const WM_QUERYENDSESSION: u32 = 0x0011;
     pub const WM_ERASEBKGND: u32 = 0x0014;
     /// Activation change; returning TRUE without DefWindowProc keeps the
     /// legacy inactive frame off our borderless client edges.
@@ -1918,6 +1922,16 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                         }
                         st.touch = Some((x, y));
                     } else if touch_action(t.flags) == TouchAction::Up {
+                        // Only the lift of a contact this handler tracked is a
+                        // release. A stray `Up` — a driver repeating one, or a
+                        // stream that a focus loss already cancelled — has no
+                        // history to estimate from, so it would report a
+                        // zero-velocity `PanEnd` and cancel the coast the real
+                        // gesture just started.
+                        if st.touch.is_none() {
+                            ttrace!("[touch] LIFT without a contact: ignored");
+                            continue;
+                        }
                         // The finger lifted. Estimate the flick velocity from
                         // the last ~100 ms of the contact so the app can coast;
                         // a held-still finger's OLS slope is ~0 and starts
@@ -2210,6 +2224,15 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             // App decides (e.g. unsaved-changes prompt later); it calls host.quit() -> destroy_window.
             dispatch(st, hwnd, Event::CloseRequested);
             0
+        }
+        WM_QUERYENDSESSION => {
+            // Not a question we get to answer "no" to: returning FALSE vetoes
+            // the machine's shutdown. Leaving through the same path as the
+            // close button writes the session first, so the next launch
+            // reopens the window it had. Windows re-sends this as WM_CLOSE if
+            // the shutdown is cancelled, which the destroyed window never sees.
+            dispatch(st, hwnd, Event::CloseRequested);
+            1
         }
         WM_DESTROY => {
             post_quit_message(0);

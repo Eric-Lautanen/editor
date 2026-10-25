@@ -14,31 +14,125 @@ pub enum FileKind {
     PlainText,
 }
 
-/// Extensions claimed by the app (see `platform::install` and packaging).
+/// Suffixes claimed by the app (see `platform::install` and packaging).
 /// All ride the same zero-dependency viewers; `Open With` entries, never a
 /// default handler grab.
+///
+/// A leading dot is not an "extension" to `Path::extension`, but it is to
+/// Windows and to the shell: `.gitignore` is registered as
+/// `Software\Classes\.gitignore`, so the entry here is written without its
+/// dot. [`suffix`] is what makes the parse side agree.
 pub const EXTENSIONS: &[&str] = &[
-    "md", "markdown", "json", "jsonl", "ndjson", "txt", "log", "csv", "tsv", "yaml", "yml", "toml",
-    "ini", "cfg", "conf", "rs", "py", "js", "ts", "c", "h", "cpp", "hpp", "cs", "java", "go", "rb",
-    "php", "css", "html", "xml", "sh",
+    "md",
+    "markdown",
+    "json",
+    "jsonl",
+    "ndjson",
+    "txt",
+    "log",
+    "csv",
+    "tsv",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "rs",
+    "py",
+    "js",
+    "ts",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cs",
+    "java",
+    "go",
+    "rb",
+    "php",
+    "css",
+    "html",
+    "xml",
+    "sh",
+    "gitignore",
+    "gitattributes",
+    "gitmodules",
+    "editorconfig",
+    "dockerignore",
+    "npmrc",
+    "nvmrc",
+    "prettierrc",
 ];
+
+/// The dotfile suffixes: names whose whole point is that they have no
+/// extension (`Path::extension()` returns `None` for them). Kept separate from
+/// [`EXTENSIONS`] only so the packaging tests and the docs can say "dotfile"
+/// instead of making a reader infer it from the missing dot.
+#[cfg(test)]
+pub const DOTFILES: &[&str] = &[
+    "gitignore",
+    "gitattributes",
+    "gitmodules",
+    "editorconfig",
+    "dockerignore",
+    "npmrc",
+    "nvmrc",
+    "prettierrc",
+];
+
+/// Files whose name *is* the type: no dot at all, so no registry can claim
+/// them as an extension. The app still opens them (a preview needs to know
+/// what it is looking at), and the Linux MIME package matches them by exact
+/// glob; Windows and macOS have no per-filename association mechanism, so
+/// there they stay "Open with" choices only.
+pub const NAMED_FILES: &[&str] = &[
+    "dockerfile",
+    "makefile",
+    "rakefile",
+    "gemfile",
+    "procfile",
+    "justfile",
+    "codeowners",
+    "license",
+];
+
+/// The suffix [`FileKind`] classifies by: a normal extension, or the name
+/// after the dot for a dotfile. `None` for a name that has neither.
+fn suffix(p: &Path) -> Option<String> {
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        return Some(ext.to_ascii_lowercase());
+    }
+    let name = p.file_name()?.to_str()?.to_ascii_lowercase();
+    let stem = name.strip_prefix('.')?;
+    // `.env.local` has a real extension (`local`); only the single-segment
+    // form (`.gitignore`) belongs here.
+    (!stem.is_empty() && !stem.contains('.')).then(|| stem.to_string())
+}
 
 impl FileKind {
     pub fn from_path(p: &Path) -> Self {
-        match p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref()
-        {
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            let name = name.to_ascii_lowercase();
+            if NAMED_FILES.contains(&name.as_str()) {
+                return match name.as_str() {
+                    "license" | "codeowners" => Self::PlainText,
+                    _ => Self::Code,
+                };
+            }
+        }
+        match suffix(p).as_deref() {
             Some("md" | "markdown" | "mdown") => Self::Markdown,
             Some("json") => Self::Json,
             Some("jsonl" | "ndjson") => Self::JsonLines,
             Some("csv" | "tsv" | "tab") => Self::Csv,
             Some("yaml" | "yml") => Self::Yaml,
             Some("toml") => Self::Toml,
-            Some("ini" | "cfg" | "conf") => Self::Ini,
+            Some("ini" | "cfg" | "conf" | "editorconfig" | "npmrc" | "nvmrc" | "prettierrc") => {
+                Self::Ini
+            }
             Some("log") => Self::Log,
+            Some("gitignore" | "gitattributes" | "gitmodules" | "dockerignore") => Self::PlainText,
             Some(
                 "rs" | "py" | "js" | "ts" | "c" | "h" | "cpp" | "hpp" | "cs" | "java" | "go" | "rb"
                 | "php" | "css" | "html" | "xml" | "sh",
@@ -82,6 +176,19 @@ pub const SAVE_GROUPS: &[(&str, &[&str])] = &[
     ("JSON Lines", &["jsonl", "ndjson"]),
     ("CSV", &["csv", "tsv"]),
     ("Config", &["yaml", "yml", "toml", "ini", "cfg", "conf"]),
+    (
+        "Dotfiles",
+        &[
+            "gitignore",
+            "gitattributes",
+            "gitmodules",
+            "editorconfig",
+            "dockerignore",
+            "npmrc",
+            "nvmrc",
+            "prettierrc",
+        ],
+    ),
     (
         "Code",
         &[
@@ -138,6 +245,71 @@ mod tests {
         assert_eq!(FileKind::from_path(Path::new("a")), FileKind::PlainText);
     }
 
+    /// `.gitignore` has no extension as far as `Path` is concerned, which is
+    /// why it opened as plain text and, before [`suffix`], could not be
+    /// associated at all: the installer wrote `Software\Classes\.gitignore`
+    /// from this list while the parse side asked for an extension that does
+    /// not exist.
+    #[test]
+    fn dotfiles_are_classified_by_their_whole_name() {
+        assert_eq!(
+            FileKind::from_path(Path::new(".gitignore")),
+            FileKind::PlainText
+        );
+        assert_eq!(
+            FileKind::from_path(Path::new(".gitattributes")),
+            FileKind::PlainText
+        );
+        assert_eq!(
+            FileKind::from_path(Path::new(".editorconfig")),
+            FileKind::Ini
+        );
+        assert_eq!(FileKind::from_path(Path::new(".npmrc")), FileKind::Ini);
+        assert_eq!(
+            FileKind::from_path(Path::new(r"C:\repo\.prettierrc")),
+            FileKind::Ini
+        );
+        for dot in DOTFILES {
+            assert_eq!(
+                FileKind::from_path(Path::new(&format!(".{dot}"))),
+                FileKind::from_path(Path::new(&format!("x.{dot}"))),
+                ".{dot} and x.{dot} must classify the same"
+            );
+        }
+        // A dotfile with a real second extension is not a dotfile.
+        assert_eq!(
+            FileKind::from_path(Path::new(".env.local")),
+            FileKind::PlainText
+        );
+        assert_eq!(suffix(Path::new(".env.local")).as_deref(), Some("local"));
+        assert_eq!(
+            suffix(Path::new(".gitignore")).as_deref(),
+            Some("gitignore")
+        );
+    }
+
+    /// Bare names have no suffix to register, but a preview still has to pick
+    /// a viewer for them.
+    #[test]
+    fn named_files_pick_a_viewer() {
+        assert_eq!(FileKind::from_path(Path::new("Dockerfile")), FileKind::Code);
+        assert_eq!(FileKind::from_path(Path::new("Makefile")), FileKind::Code);
+        assert_eq!(
+            FileKind::from_path(Path::new("LICENSE")),
+            FileKind::PlainText
+        );
+        assert_eq!(
+            FileKind::from_path(Path::new("CODEOWNERS")),
+            FileKind::PlainText
+        );
+        // Casing is not significant, and a directory is not a name.
+        assert_eq!(FileKind::from_path(Path::new("dockerfile")), FileKind::Code);
+        assert_eq!(
+            FileKind::from_path(Path::new("vendor/License.md")),
+            FileKind::Markdown
+        );
+    }
+
     #[test]
     fn claimed_extensions_resolve() {
         for e in EXTENSIONS {
@@ -178,8 +350,11 @@ mod tests {
 
         // Windows: one `Software\Classes\.<ext>\OpenWithProgids` key per
         // extension, shared by the MSI and the portable `--install` path.
+        // Anchor on the attribute, not the bare path: the file's own comments
+        // name a key when explaining why it exists.
+        const KEY: &str = "Key=\"Software\\Classes\\.";
         let mut win: Vec<&str> = WXS
-            .match_indices("Software\\Classes\\.")
+            .match_indices(KEY)
             .filter_map(|(i, key)| WXS[i + key.len()..].split('\\').next())
             .collect();
         win.sort_unstable();
@@ -233,6 +408,36 @@ mod tests {
             declared, installed,
             "editor.desktop and install.sh disagree on the MIME types"
         );
+    }
+
+    /// The dotfile MIME package is the only place Linux can say "this exact
+    /// name is Editor's": unlike Windows there is no extension key for
+    /// `.gitignore`, and unlike a filename argument there is no shell to
+    /// invoke. The globs and [`DOTFILES`]/[`NAMED_FILES`] are two copies of
+    /// one promise, so they are compared here rather than in a manual install.
+    #[test]
+    fn linux_mime_package_matches_the_claimed_dotfiles_and_names() {
+        const XML: &str = include_str!("../../packaging/linux/editor-mime.xml");
+        let mut globs: Vec<String> = XML
+            .match_indices("<glob pattern=\"")
+            .filter_map(|(i, key)| {
+                let rest = &XML[i + key.len()..];
+                rest.split('"').next().map(|s| s.to_string())
+            })
+            .collect();
+        globs.sort();
+        globs.dedup();
+
+        for dot in DOTFILES {
+            let want = format!("*.{dot}");
+            assert!(globs.contains(&want), "editor-mime.xml lacks {want}");
+        }
+        for name in NAMED_FILES {
+            assert!(
+                globs.iter().any(|g| g.eq_ignore_ascii_case(name)),
+                "editor-mime.xml lacks {name}"
+            );
+        }
     }
 
     #[test]
