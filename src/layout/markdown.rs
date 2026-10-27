@@ -1249,11 +1249,14 @@ impl Md<'_> {
                 self.measure_cell(&spans, ci, size, max_w, &mut widths);
             }
         }
-        let natural: f32 = widths.iter().sum::<f32>() + cell_pad * 2.0 * n as f32;
+        let mut natural: f32 = widths.iter().sum::<f32>() + cell_pad * 2.0 * n as f32;
         if natural > max_w {
-            // Equal shares; cells truncate with an ellipsis downstream.
-            let share = ((max_w - cell_pad * 2.0 * n as f32) / n as f32).max(adv * 4.0);
-            widths = vec![share; n];
+            // Too wide for the reading column: shrink the columns to fit and
+            // let the cells wrap. Clipping every cell to one ellipsized line —
+            // what this used to do — quietly dropped the rest of its text.
+            let avail = (max_w - cell_pad * 2.0 * n as f32).max(0.0);
+            widths = super::fit_columns(&widths, avail, adv * 4.0);
+            natural = widths.iter().sum::<f32>() + cell_pad * 2.0 * n as f32;
         }
         // Column origins.
         let mut col_x = Vec::with_capacity(n);
@@ -1266,7 +1269,7 @@ impl Md<'_> {
         let mut top = self.y;
         // Header band: the head row reads as a header, not just bold text.
         if !head.is_empty() {
-            let h = self.table_row_h(head, FontStyle::Bold, lh);
+            let h = self.table_row_h(head, FontStyle::Bold, size, &widths, lh);
             self.ops.push(DrawOp::Rect {
                 rect: Rect::new(x, top, table_w, h),
                 color: self.theme.code_bg,
@@ -1295,7 +1298,7 @@ impl Md<'_> {
             // Pad short rows with empty cells.
             let mut full = row.clone();
             full.resize_with(n, Default::default);
-            let h = self.table_row_h(&full, FontStyle::Regular, lh);
+            let h = self.table_row_h(&full, FontStyle::Regular, size, &widths, lh);
             if ri % 2 == 1 {
                 self.ops.push(DrawOp::Rect {
                     rect: Rect::new(x, top, table_w, h),
@@ -1332,22 +1335,33 @@ impl Md<'_> {
         }
     }
 
-    /// A row's height: one text line, or an image cell's card (plus the text
-    /// line beside it), whichever is taller.
-    fn table_row_h(&self, cells: &[Vec<Inline>], style: FontStyle, lh: f32) -> f32 {
+    /// A row's height: its tallest cell — the cell's image cards stacked, plus
+    /// one line for every visual row its text wraps to at the column's width.
+    /// The wrapping [`Self::render_row`] runs, so a row and the one after it
+    /// cannot disagree about where the first ends.
+    fn table_row_h(
+        &self,
+        cells: &[Vec<Inline>],
+        style: FontStyle,
+        size: f32,
+        widths: &[f32],
+        lh: f32,
+    ) -> f32 {
         let mut h = lh;
-        for cell in cells {
+        for (ci, cell) in cells.iter().enumerate() {
             let spans = cell_spans(cell, style, self.theme);
+            let budget = widths.get(ci).copied().unwrap_or(0.0);
             let mut cards = 0.0;
-            let mut text = false;
-            for span in &spans {
-                match &span.image {
-                    Some(image) => cards += self.image_card_h(image),
-                    None if !span.text.trim().is_empty() => text = true,
-                    None => {}
-                }
+            for image in spans.iter().filter_map(|s| s.image.as_ref()) {
+                cards += self.image_card_h(image);
             }
-            h = h.max(cards + if text { lh } else { 0.0 });
+            let text: Vec<Span> = spans.into_iter().filter(|s| s.image.is_none()).collect();
+            let lines = if text.iter().all(|s| s.text.trim().is_empty()) {
+                0.0
+            } else {
+                wrap_spans(self.fonts, &text, size, budget).len() as f32
+            };
+            h = h.max(cards + lines * lh);
         }
         h
     }
@@ -1392,61 +1406,52 @@ impl Md<'_> {
             if text.iter().all(|s| s.text.trim().is_empty()) {
                 continue;
             }
-            let text_w: f32 = text
-                .iter()
-                .filter(|s| !s.brk)
-                .map(|s| self.fonts.measure(s.style, &s.text, size))
-                .sum();
-            let truncated = text_w > budget;
-            let avail = if truncated {
-                budget - self.fonts.measure(style, "…", size)
-            } else {
-                budget
-            };
-            // Lay out one visual row, then clip/truncate pieces to budget.
-            let wrapped = wrap_spans(self.fonts, &text, size, avail);
-            let first = wrapped.into_iter().next().unwrap_or_default();
-            let used: f32 = first
-                .iter()
-                .map(|&(si, s, e)| {
-                    self.fonts
-                        .measure_range(text[si].style, &text[si].text, s, e, size)
-                })
-                .sum();
-            let mut ox = match cell_align {
-                Align::Right => col_x[ci] + cell_pad + (budget - used).max(0.0),
-                Align::Center => col_x[ci] + cell_pad + ((budget - used).max(0.0) / 2.0),
-                Align::None | Align::Left => col_x[ci] + cell_pad,
-            };
-            let baseline = self.baseline(cy, style, size);
-            for &(si, s, e) in &first {
-                let sp = &text[si];
-                let piece: String = sp.text.chars().skip(s).take(e - s).collect();
-                if piece.is_empty() {
-                    continue;
+            // The cell wraps to its column and the row grows to fit it: a cell
+            // used to be laid out as one visual row and cut off at the column
+            // edge with an ellipsis, which lost everything past the cut.
+            for row in wrap_spans(self.fonts, &text, size, budget) {
+                let used: f32 = row
+                    .iter()
+                    .map(|&(si, s, e)| {
+                        let sp = &text[si];
+                        self.fonts
+                            .measure_range(sp.style, &sp.text, s, e, span_size(sp, size))
+                    })
+                    .sum();
+                let mut ox = match cell_align {
+                    Align::Right => col_x[ci] + cell_pad + (budget - used).max(0.0),
+                    Align::Center => col_x[ci] + cell_pad + ((budget - used).max(0.0) / 2.0),
+                    Align::None | Align::Left => col_x[ci] + cell_pad,
+                };
+                let baseline = self.baseline(cy, style, size);
+                for &(si, s, e) in &row {
+                    let sp = &text[si];
+                    let piece: String = sp.text.chars().skip(s).take(e - s).collect();
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    let ssize = span_size(sp, size);
+                    let w = self.fonts.measure(sp.style, &piece, ssize);
+                    self.text_op(ox, baseline, piece, sp.style, ssize, sp.color);
+                    if sp.link.is_some() {
+                        let uy = self.underline_y(baseline, sp.style, ssize);
+                        self.ops.push(DrawOp::Line {
+                            x0: ox,
+                            y0: uy,
+                            x1: ox + w,
+                            y1: uy,
+                            color: sp.color,
+                        });
+                    }
+                    if let Some(href) = &sp.link {
+                        self.hits.push(HitRegion {
+                            rect: Rect::new(ox, cy, w.max(4.0), lh),
+                            action: HitAction::Link(href.clone()),
+                        });
+                    }
+                    ox += w;
                 }
-                let w = self.fonts.measure(sp.style, &piece, size);
-                self.text_op(ox, baseline, piece, sp.style, size, sp.color);
-                if sp.link.is_some() {
-                    let uy = self.underline_y(baseline, sp.style, size);
-                    self.ops.push(DrawOp::Line {
-                        x0: ox,
-                        y0: uy,
-                        x1: ox + w,
-                        y1: uy,
-                        color: sp.color,
-                    });
-                }
-                if let Some(href) = &sp.link {
-                    self.hits.push(HitRegion {
-                        rect: Rect::new(ox, cy, w.max(4.0), lh),
-                        action: HitAction::Link(href.clone()),
-                    });
-                }
-                ox += w;
-            }
-            if truncated {
-                self.text_op(ox, baseline, "…".into(), style, size, self.theme.muted);
+                cy += lh;
             }
         }
     }
@@ -1913,6 +1918,104 @@ mod tests {
             .filter(|op| matches!(op, DrawOp::RoundedRect { .. }))
             .count();
         assert!(rounded >= 2, "image card frame missing");
+    }
+
+    #[test]
+    fn a_table_wider_than_the_column_wraps_its_cells() {
+        // The report: a table too wide for the reading column had every cell cut
+        // off at its column edge with an ellipsis, so most of the text was
+        // quietly gone. A cell wraps onto as many rows as it needs now, and its
+        // row grows to hold them.
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let cell = "a fairly long description of the alpha row that is wide enough \
+                    that the three columns together cannot fit the reading column \
+                    at this window width";
+        let src = format!(
+            "| Name | Description | Notes |\n|---|---|---|\n| alpha | {cell} | first note |\n"
+        );
+        let list = layout(&doc(&src), 800.0, &c);
+        let painted: Vec<&str> = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !painted.iter().any(|p| p.contains('…')),
+            "a cell was clipped: {painted:?}"
+        );
+        // A wrap drops the space it broke at, so compare word by word over the
+        // pieces in paint order.
+        let joined = painted.join(" ");
+        let painted: Vec<&str> = joined.split_whitespace().collect();
+        for word in cell.split_whitespace().chain(["alpha", "first", "note"]) {
+            assert!(
+                painted.contains(&word),
+                "the word {word:?} never reached the page: {painted:?}"
+            );
+        }
+        // The wrapped rows really are rows: the cell's text sits on more than
+        // one baseline.
+        let baselines: std::collections::HashSet<i32> = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, y, .. }
+                    if !text.trim().is_empty() && cell.contains(text.trim()) =>
+                {
+                    Some(*y as i32)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            baselines.len() > 1,
+            "the cell did not wrap onto several rows: {baselines:?}"
+        );
+        // And every wrapped piece stays inside the reading column.
+        let (col_w, x0) = crate::layout::column(800.0, &c);
+        for (x, right) in text_extents(&list, &f) {
+            assert!(x >= x0 - 0.5, "text starts left of the column: {x}");
+            assert!(
+                right <= x0 + col_w + 0.5,
+                "text runs past the column: {right} at {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cell_with_no_breakable_space_still_fits_its_column() {
+        // The wrapper hard-breaks a token wider than the column, so a cell
+        // holding a long URL wraps rather than running into the column beside
+        // it — and wrapping loses none of it.
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let url = "https://example.com/a/very/long/unbreakable/path/that/keeps/going/and/going/until/it/is/wider/than/the/whole/reading/column";
+        let src = format!("| Link | Note |\n|---|---|\n| {url} | ok |\n");
+        let list = layout(&doc(&src), 800.0, &c);
+        let pieces: String = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, .. } if url.contains(text.as_str()) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(pieces, url, "the cell's text was not all painted");
+        let (col_w, x0) = crate::layout::column(800.0, &c);
+        for (x, right) in text_extents(&list, &f) {
+            assert!(x >= x0 - 0.5, "text starts left of the column: {x}");
+            assert!(
+                right <= x0 + col_w + 0.5,
+                "text runs into the next column: {right}"
+            );
+        }
     }
 
     #[test]

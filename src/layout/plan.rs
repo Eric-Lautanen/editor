@@ -79,6 +79,17 @@ impl Rows {
         self.tops.get(i).copied().unwrap_or(self.height)
     }
 
+    /// How tall unit `i` is: the distance to the next unit's top, or — for the
+    /// last one — from its top down to the bottom of the last unit, which is
+    /// the document height less the space held below it.
+    pub fn unit_h(&self, i: usize) -> f32 {
+        let top = self.top(i);
+        match self.tops.get(i + 1) {
+            Some(next) => next - top,
+            None => (self.height - self.tail - top).max(0.0),
+        }
+    }
+
     /// The index of the unit containing `y`: the last unit that starts at or
     /// above `y`, clamped to the document. A band that begins inside a wrapped
     /// unit still starts at that unit.

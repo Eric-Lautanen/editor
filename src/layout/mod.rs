@@ -51,6 +51,55 @@ pub fn column(viewport_w: f32, ctx: &Ctx) -> (f32, f32) {
     (col_w, x0)
 }
 
+/// Fit `natural` column widths into `avail` px for a table wider than the
+/// column it has to fit.
+///
+/// Equal shares — what both table renderers used to do — starve a narrow
+/// column and leave a wide one unreadable. Here every column keeps its natural
+/// width while the columns still open can afford it, and the widest columns
+/// share what is left; the pass repeats until no open column can keep its
+/// width, so a two-column table with one long cell gives the short column
+/// exactly what it asked for. No column is shrunk below `min_w`, so cells
+/// differ by how many lines they wrap to instead of one collapsing to a
+/// character each.
+///
+/// The returned widths can sum past `avail` when `min_w` alone overruns it (a
+/// table with more columns than the row can hold); a caller paints the table
+/// clipped to its column either way.
+pub fn fit_columns(natural: &[f32], avail: f32, min_w: f32) -> Vec<f32> {
+    let mut widths = natural.to_vec();
+    let mut fixed = vec![false; widths.len()];
+    loop {
+        let open = fixed.iter().filter(|f| !**f).count();
+        if open == 0 {
+            return widths;
+        }
+        let used: f32 = widths
+            .iter()
+            .zip(&fixed)
+            .filter(|(_, f)| **f)
+            .map(|(w, _)| *w)
+            .sum();
+        let share = ((avail - used) / open as f32).max(min_w);
+        let mut kept = false;
+        for (w, f) in widths.iter().zip(fixed.iter_mut()) {
+            if !*f && *w <= share {
+                *f = true;
+                kept = true;
+            }
+        }
+        if !kept {
+            // Nothing left fits its share: the rest take it equally.
+            for (w, f) in widths.iter_mut().zip(&fixed) {
+                if !*f {
+                    *w = share;
+                }
+            }
+            return widths;
+        }
+    }
+}
+
 /// A reader pane that paints a band of itself instead of holding a
 /// whole-document display list.
 ///

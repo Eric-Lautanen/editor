@@ -1,10 +1,11 @@
-//! Delimited (CSV/TSV) layout: one header + single-line records in the
-//! reading column, sharing the Markdown table's measure (natural widths,
-//! equal shares + ellipsis over budget, header band + rule).
+//! Delimited (CSV/TSV) layout: one header + records in the reading column,
+//! sharing the Markdown table's measure (natural widths, columns shrunk to fit
+//! when they overrun the column, header band + rule).
 //!
-//! Records are single visual rows — a 2000-row sheet stays 2000 rows, never
-//! wrapped into more — so height and memory stay proportional to the capped
-//! row count, not to cell content.
+//! A record is as tall as its tallest cell: a cell that cannot fit its column
+//! wraps onto more lines rather than being cut off with an ellipsis, so nothing
+//! in the sheet is hidden. Height is still bounded — at most [`MAX_ROWS`](crate::parse::csv::MAX_ROWS)
+//! records, each the height its own content needs and no more.
 //!
 //! S1 · The sheet paints in bands: the plan records where each unit starts
 //! (header, every data row, the cap note) plus the grid geometry the units
@@ -14,7 +15,9 @@
 
 use super::{
     display_list::{DisplayList, DrawOp, FontStyle},
-    plan, Ctx,
+    plan,
+    text::wrap_ranges,
+    Ctx,
 };
 use crate::{
     gfx::{color::Color, font::FontSystem, geom::Rect},
@@ -30,32 +33,30 @@ fn baseline(fonts: &FontSystem, top: f32, style: FontStyle, size: f32, lh: f32) 
     (top + (lh - m.height()) / 2.0 + m.ascent).round()
 }
 
-fn truncate_cell(
+/// Thickness of a painted rule, in physical px — the same value `plan` spends
+/// on the header's separator when it lays the sheet's units out.
+fn thick(ctx: &Ctx) -> f32 {
+    ctx.scale.max(1.0).round()
+}
+
+/// A row's height: its tallest cell, one line for every visual row that cell's
+/// text wraps to at its column's width. The same wrapping the painter runs, so
+/// a row and the row after it cannot disagree about where the first ends.
+fn row_h(
     fonts: &FontSystem,
     style: FontStyle,
     size: f32,
-    text: &str,
-    budget: f32,
-) -> String {
-    if fonts.measure(style, text, size) <= budget {
-        return text.to_string();
+    lh: f32,
+    cells: &[String],
+    widths: &[f32],
+    cols: usize,
+) -> f32 {
+    let mut h = lh;
+    for (ci, cell) in cells.iter().enumerate().take(cols) {
+        let lines = wrap_ranges(fonts, style, size, cell, widths[ci]).len() as f32;
+        h = h.max(lines * lh);
     }
-    // Accumulate the kept prefix once: popping a char and re-measuring the
-    // whole cell each time is quadratic in the cell length, and every capped
-    // sheet runs this over every cell it paints.
-    let ell = fonts.measure(style, "…", size);
-    let mut s = String::new();
-    let mut w = 0.0;
-    for ch in text.chars() {
-        let cw = fonts.advance(style, ch, size);
-        if w + cw + ell > budget {
-            break;
-        }
-        w += cw;
-        s.push(ch);
-    }
-    s.push('…');
-    s
+    h
 }
 
 /// The grid every unit paints from: column x positions and widths, the
@@ -92,8 +93,10 @@ fn grid_of(sheet: &Sheet, width: f32, ctx: &Ctx) -> Grid {
     let natural: f32 = widths.iter().sum::<f32>() + cell_pad * 2.0 * n as f32;
     let table_w;
     if natural > col_w {
-        let share = ((col_w - cell_pad * 2.0 * n as f32) / n as f32).max(adv * 4.0);
-        widths = vec![share; n];
+        // Too wide for the reading column: shrink the columns to fit and let
+        // the cells wrap, rather than clipping each cell at its column edge.
+        let avail = (col_w - cell_pad * 2.0 * n as f32).max(0.0);
+        widths = super::fit_columns(&widths, avail, adv * 4.0);
         table_w = col_w;
     } else {
         // A sheet narrower than the reading column grows into it: data reads
@@ -175,16 +178,35 @@ pub struct CsvPlan {
 /// instead of recomputed every frame.
 pub fn plan(sheet: &Sheet, width: f32, ctx: &Ctx) -> CsvPlan {
     let g = grid_of(sheet, width, ctx);
-    let thick = ctx.scale.max(1.0).round();
+    let thick = thick(ctx);
     let pad = ctx.px(32.0);
     let note_lh = line_h(ctx.fonts, ctx.body_size() * 0.85);
+    let header_h = row_h(
+        ctx.fonts,
+        FontStyle::Bold,
+        g.size,
+        g.lh,
+        &sheet.header,
+        &g.widths,
+        sheet.cols,
+    );
     let mut tops = Vec::with_capacity(sheet.rows.len() + 2);
     let mut y = pad;
     tops.push(y);
-    y += g.lh + thick;
-    for _ in &sheet.rows {
+    // The header unit is its band plus the hairline rule under it; the band is
+    // the unit's height less that rule (see `paint_unit`).
+    y += header_h + thick;
+    for row in &sheet.rows {
         tops.push(y);
-        y += g.lh;
+        y += row_h(
+            ctx.fonts,
+            FontStyle::Regular,
+            g.size,
+            g.lh,
+            row,
+            &g.widths,
+            sheet.cols,
+        );
     }
     let capped = sheet.capped;
     if capped {
@@ -206,8 +228,10 @@ pub fn plan(sheet: &Sheet, width: f32, ctx: &Ctx) -> CsvPlan {
 }
 
 impl CsvPlan {
-    fn cell_x(&self, ci: usize, text: &str, style: FontStyle, fonts: &FontSystem) -> f32 {
-        let w = fonts.measure(style, text, self.size);
+    /// Where a cell's text starts: the column's origin plus its padding, and
+    /// flush right for a numeric column. `w` is the width of the piece being
+    /// placed — one wrapped row of the cell, not the whole cell.
+    fn cell_x(&self, ci: usize, w: f32) -> f32 {
         self.col_x[ci]
             + self.cell_pad
             + if self.numeric[ci] {
@@ -218,6 +242,49 @@ impl CsvPlan {
     }
 }
 
+/// One cell of one row: which column it belongs to, what it says, and where and
+/// how it paints. Grouped so the painter takes the cell, not six loose numbers.
+struct Cell<'a> {
+    ci: usize,
+    text: &'a str,
+    style: FontStyle,
+    /// Top of the row the cell sits in.
+    y: f32,
+    color: Color,
+}
+
+/// Paint one cell wrapped to its column: every visual row it needs, the piece
+/// right-aligned when the column holds numbers. A cell that does not fit used
+/// to be cut off with an ellipsis; now it wraps and its row grows (see
+/// [`row_h`]).
+fn paint_cell(fonts: &FontSystem, p: &CsvPlan, cell: Cell<'_>, ops: &mut Vec<DrawOp>) {
+    let Cell {
+        ci,
+        text,
+        style,
+        y,
+        color,
+    } = cell;
+    for (li, (s, e)) in wrap_ranges(fonts, style, p.size, text, p.widths[ci])
+        .into_iter()
+        .enumerate()
+    {
+        let piece: String = text.chars().skip(s).take(e - s).collect();
+        if piece.trim().is_empty() {
+            continue;
+        }
+        let w = fonts.measure(style, &piece, p.size);
+        ops.push(DrawOp::Text {
+            x: p.cell_x(ci, w),
+            y: baseline(fonts, y + li as f32 * p.lh, style, p.size, p.lh),
+            text: piece,
+            size: p.size,
+            style,
+            color,
+        });
+    }
+}
+
 /// Paint one unit of the sheet at the y the plan carries: the header band
 /// with its rule, one zebra-or-plain row, or the cap note. The only unit
 /// boundaries of the sheet, so the full layout is this over every unit.
@@ -225,27 +292,29 @@ fn paint_unit(sheet: &Sheet, p: &CsvPlan, i: usize, ctx: &Ctx, ops: &mut Vec<Dra
     let y = p.rows.top(i);
     let fonts = ctx.fonts;
     if i == 0 {
-        // Header band + bold head row.
+        // Header band + bold head row. The unit covers the band and the rule
+        // below it; the band is the part above the rule.
+        let band_h = (p.rows.unit_h(i) - thick(ctx)).max(1.0);
         ops.push(DrawOp::Rect {
-            rect: Rect::new(p.x0, y, p.table_w, p.lh),
+            rect: Rect::new(p.x0, y, p.table_w, band_h),
             color: ctx.theme.code_bg,
         });
-        for (ci, cell) in sheet.header.iter().enumerate().take(sheet.cols) {
-            let text = truncate_cell(fonts, FontStyle::Bold, p.size, cell, p.widths[ci]);
-            ops.push(DrawOp::Text {
-                x: p.cell_x(ci, &text, FontStyle::Bold, fonts),
-                y: baseline(fonts, y, FontStyle::Bold, p.size, p.lh),
+        for (ci, text) in sheet.header.iter().enumerate().take(sheet.cols) {
+            let cell = Cell {
+                ci,
                 text,
-                size: p.size,
                 style: FontStyle::Bold,
+                y,
                 color: ctx.theme.fg,
-            });
+            };
+            paint_cell(fonts, p, cell, ops);
         }
+        let rule_y = y + band_h;
         ops.push(DrawOp::Line {
             x0: p.x0,
-            y0: y + p.lh,
+            y0: rule_y,
             x1: p.x0 + p.table_w,
-            y1: y + p.lh,
+            y1: rule_y,
             color: ctx.theme.rule,
         });
         return;
@@ -274,23 +343,22 @@ fn paint_unit(sheet: &Sheet, p: &CsvPlan, i: usize, ctx: &Ctx, ops: &mut Vec<Dra
     if ri % 2 == 1 {
         let zebra = Color::rgba(ctx.theme.fg.r, ctx.theme.fg.g, ctx.theme.fg.b, 8);
         ops.push(DrawOp::Rect {
-            rect: Rect::new(p.x0, y, p.table_w, p.lh),
+            rect: Rect::new(p.x0, y, p.table_w, p.rows.unit_h(i)),
             color: zebra,
         });
     }
-    for (ci, cell) in row.iter().enumerate().take(sheet.cols) {
-        let text = truncate_cell(fonts, FontStyle::Regular, p.size, cell, p.widths[ci]);
+    for (ci, text) in row.iter().enumerate().take(sheet.cols) {
         if text.is_empty() {
             continue;
         }
-        ops.push(DrawOp::Text {
-            x: p.cell_x(ci, &text, FontStyle::Regular, fonts),
-            y: baseline(fonts, y, FontStyle::Regular, p.size, p.lh),
+        let cell = Cell {
+            ci,
             text,
-            size: p.size,
             style: FontStyle::Regular,
+            y,
             color: ctx.theme.fg,
-        });
+        };
+        paint_cell(fonts, p, cell, ops);
     }
 }
 
@@ -380,6 +448,79 @@ mod tests {
                 assert!(
                     right <= x0 + col_w + 0.5,
                     "cell runs past the column: {right}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_sheet_wraps_its_cells_instead_of_clipping_them() {
+        // The sheet shared the Markdown table's ellipsis-over-budget rule, so a
+        // sheet wider than the reading column lost the tail of every long cell.
+        // A cell wraps now and its row is as tall as its tallest cell.
+        let f = FontSystem::load_embedded();
+        let t = Theme::light();
+        let c = ctx(&f, &t);
+        let cell = "a note long enough that the two columns together cannot fit \
+                    the reading column at this window width";
+        let src = format!("label,detail\nrow,{cell}\n");
+        let sheet = crate::parse::csv::parse_with_ext(&src, None);
+        let list = layout(&sheet, 800.0, &c);
+        let painted: Vec<&str> = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !painted.iter().any(|p| p.contains('…')),
+            "a cell was clipped: {painted:?}"
+        );
+        // A wrap drops the space it broke at, so compare word by word over the
+        // pieces in paint order.
+        let joined = painted.join(" ");
+        let painted: Vec<&str> = joined.split_whitespace().collect();
+        for word in cell.split_whitespace().chain(["label", "detail", "row"]) {
+            assert!(
+                painted.contains(&word),
+                "the word {word:?} never reached the sheet: {painted:?}"
+            );
+        }
+        // The wrapped rows really are rows: the cell's text sits on more than
+        // one baseline.
+        let baselines: std::collections::HashSet<i32> = list
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, y, .. }
+                    if !text.trim().is_empty() && cell.contains(text.trim()) =>
+                {
+                    Some(*y as i32)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            baselines.len() > 1,
+            "the cell did not wrap onto several rows: {baselines:?}"
+        );
+        // And every piece stays inside the reading column.
+        let (col_w, x0) = crate::layout::column(800.0, &c);
+        for op in &list.ops {
+            if let DrawOp::Text {
+                x,
+                text,
+                size,
+                style,
+                ..
+            } = op
+            {
+                let right = x + f.measure(*style, text, *size);
+                assert!(
+                    right <= x0 + col_w + 0.5,
+                    "cell runs past the column: {text:?}"
                 );
             }
         }
