@@ -101,7 +101,7 @@ impl App {
     /// Edit/Split), and reading "Copied" for as long as that same selection is
     /// what was last copied. Rect is filled in by `statusbar::paint`.
     pub(super) fn copy_button(&self) -> Option<statusbar::StatusButton> {
-        let selected = self.preview_selection_text().is_some() || self.editor.selection().is_some();
+        let selected = self.preview_has_selection() || self.editor.selection().is_some();
         selected.then(|| statusbar::StatusButton {
             id: 8,
             label: if self.copy_done { "Copied" } else { "Copy" },

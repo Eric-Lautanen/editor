@@ -40,7 +40,10 @@ fn main() {
     // panic, so without this hook a crash leaves nothing behind (see
     // src/crash.rs).
     crash::install();
-    let code = match cli::run(std::env::args().skip(1).collect()) {
+    // args_os, not args: Unix argv is arbitrary bytes, and a filename that is
+    // not UTF-8 (legal on ext4, common out of archive extraction) has to open
+    // in the shell's spelling, not end the process before its window exists.
+    let code = match cli::run(std::env::args_os().skip(1).collect()) {
         Ok(()) => 0,
         Err(e) => {
             platform::print_err_line(&format!("editor: {e}"));

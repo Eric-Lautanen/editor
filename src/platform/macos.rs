@@ -10,7 +10,8 @@
 //! + `CGContextDrawImage` (the view is flipped so the image lands upright),
 //!   `NSPasteboard` clipboard, `NSOpenPanel`/`NSSavePanel` dialogs, `NSTimer`
 //!   (40 ms) for `Event::Tick`, `NSCursor` arrow/IBeam/hand, dock icon from
-//!   the portable icon renderer, dark preference via `defaults read -g//! AppleInterfaceStyle`, `open` for links, `mmap(MAP_PRIVATE)` font mapping.
+//!   the portable icon renderer, dark preference via `defaults read -g
+//!   AppleInterfaceStyle`, `open` for links, `mmap(MAP_PRIVATE)` font mapping.
 //!
 //! Not yet: IME/`NSTextInputClient` (`characters` covers Latin-1 and
 //! composed keys), live theme-change notification (no KVO on the
@@ -148,6 +149,12 @@ unsafe fn msg<R>(obj: Id, cmd: Sel) -> R {
     f(obj, cmd)
 }
 
+unsafe fn msg3<A, B, C, R>(obj: Id, cmd: Sel, a: A, b: B, c: C) -> R {
+    let f: unsafe extern "C" fn(Id, Sel, A, B, C) -> R =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(obj, cmd, a, b, c)
+}
+
 unsafe fn msg1<A, R>(obj: Id, cmd: Sel, a: A) -> R {
     let f: unsafe extern "C" fn(Id, Sel, A) -> R =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
@@ -211,6 +218,38 @@ unsafe fn ns_str(s: &str) -> Id {
         sel("stringWithUTF8String:"),
         b.as_ptr() as *const c_char,
     )
+}
+
+/// `NSModalResponseOK` — `runModal`'s response for the alert's first
+/// button (the added default, rightmost). The second button lands in the
+/// precomposed NSAlert range (1000+), so anything else here is a decline.
+const NS_MODAL_RESPONSE_OK: isize = 1;
+
+/// A native two-button `NSAlert` (`runModal`), the update-consent prompt
+/// (F25): it replaces the `osascript` script host — whose panel the app did
+/// not own and which could land behind the window — with a dialog this
+/// process owns, exactly what the Windows `MessageBoxW` path gives. The
+/// first button added is default and rightmost, and returns
+/// `NSModalResponseOK` (1); the second sits in the precomposed range (1000+),
+/// which this comparison treats as the decline. `runModal` blocks the
+/// calling thread until the answer lands; callers hand it the consent
+/// worker, not the GUI thread.
+/// `None` is reserved for a null class token — AppKit not loadable — so a
+/// broken surface can say so rather than fake an "Install".
+pub(crate) fn native_alert(title: &str, question: &str, yes: &str, no: &str) -> Option<bool> {
+    unsafe {
+        if class("NSAlert").is_null() {
+            return None;
+        }
+        let alert: Id = msg1(class("NSAlert"), sel("alloc"), ());
+        let alert: Id = msg(alert, sel("init"));
+        msg1::<_, ()>(alert, sel("setMessageText:"), ns_str(title));
+        msg1::<_, ()>(alert, sel("setInformativeText:"), ns_str(question));
+        msg1::<_, ()>(alert, sel("addButtonWithTitle:"), ns_str(yes));
+        msg1::<_, ()>(alert, sel("addButtonWithTitle:"), ns_str(no));
+        let code: isize = msg(alert, sel("runModal"));
+        Some(code == NS_MODAL_RESPONSE_OK)
+    }
 }
 
 /// The UTF-8 contents of an `NSString` (empty for nil).
@@ -810,23 +849,63 @@ unsafe extern "C" fn view_other_mouse_up(_: Id, _: Sel, ev: Id) {
     }
 }
 
+/// NSEventPhase bits: `phase` covers the finger on the glass (began →
+/// changed → ended/cancelled), `momentumPhase` the pad's own post-lift
+/// inertia. Their rest value is 0.
+const PHASE_BEGAN: u64 = 0x1 << 0;
+const PHASE_MAY_BEGIN: u64 = 0x1 << 5;
+
 unsafe extern "C" fn view_scroll_wheel(_: Id, _: Sel, ev: Id) {
     let m = state();
-    // Line-mode deltas are ~1 line per notch; precise (trackpad) deltas are
-    // points. A notch is three lines of the text on screen, the same distance
-    // Win32 and X11 move it — the line's height comes from the app, so this is
-    // three lines at any zoom or display scale rather than a pixel guess.
-    // AppKit already applies the user's natural-scrolling preference to the
-    // sign, so positive means "scroll up" in both modes.
     let precise = msg::<i8>(ev, sel("hasPreciseScrollingDeltas")) != 0;
-    let k = if precise {
-        m.scale as f64
-    } else {
-        (WHEEL_LINES_PER_NOTCH * m.handler.line_step_px()) as f64
-    };
+
+    // A real wheel (or a tilt): the discrete arrival macOS has always
+    // delivered. Line-mode deltas are ~1 line per notch; a notch is three
+    // lines of the text on screen, the same distance Win32 and X11 move it
+    // — the line's height comes from the app, so this is three lines at any
+    // zoom or display scale rather than a pixel guess. AppKit already
+    // applies the user's natural-scrolling preference to the sign, so
+    // positive means "scroll up" in both modes. The phase bits stay 0 for
+    // a wheel, so no phase-driven branch is taken here.
+    if !precise {
+        let k = (WHEEL_LINES_PER_NOTCH * m.handler.line_step_px()) as f64;
+        dispatch(Event::Scroll {
+            dx: (msg::<f64>(ev, sel("deltaX")) * k) as f32,
+            dy: (msg::<f64>(ev, sel("deltaY")) * k) as f32,
+            precise: false,
+        });
+        return;
+    }
+
+    // F13, precise branch. Trackpad deltas are preceded by a phase-began
+    // (or may-begin); when one starts, whatever wheel glide is still
+    // animating is cancelled — its remaining distance was bought by short
+    // notches and the finger is here now. The cancel rides a zero-delta
+    // precise Scroll, which is exactly the direct path where a glide is
+    // killed (competing rides: the wheel's glide and the pad's deltas were
+    // both driving the pane until now).
+    let phase = msg::<u64>(ev, sel("phase"));
+    if phase & (PHASE_BEGAN | PHASE_MAY_BEGIN) != 0 {
+        dispatch(Event::Scroll {
+            dx: 0.0,
+            dy: 0.0,
+            precise: true,
+        });
+    }
+    // Precise deltas are points on the pane; `scrollingDelta*` is the
+    // per-touch payload (plain `deltaY` is the line-ish compatibility form)
+    // scaled to physical px. Horizontal follows the same scaling. An event
+    // carrying `momentumPhase` instead of `phase` (the pad's own inertia
+    // after the lift) reaches the same dispatch: applied immediately, so
+    // the ride stays the pad's own and the app's glide never doubles it.
+    // `isDirectionInvertedFromDevice` is already honored by AppKit baking
+    // the user's scrolling preference into the sign below — flipping it
+    // again here would invert the swipe against what the user chose.
+    let k = m.scale as f64;
     dispatch(Event::Scroll {
-        dx: (msg::<f64>(ev, sel("deltaX")) * k) as f32,
-        dy: (msg::<f64>(ev, sel("deltaY")) * k) as f32,
+        dx: (msg::<f64>(ev, sel("scrollingDeltaX")) * k) as f32,
+        dy: (msg::<f64>(ev, sel("scrollingDeltaY")) * k) as f32,
+        precise: true,
     });
 }
 
@@ -859,10 +938,121 @@ unsafe extern "C" fn win_can_become_key(_: Id, _: Sel) -> i8 {
     1
 }
 
+unsafe extern "C" fn view_accepts_first_mouse(_: Id, _: Sel, _: Id) -> i8 {
+    // F20: the default answer is NO, so the first click on an inactive
+    // window is eaten by activation — a tab or a word in an unfocused
+    // Editor needed a second press to do anything. Answering YES hands
+    // that click to the view, whose own mouse handlers already decide what
+    // it does (including right-clicks, which get their menu on the first
+    // press like any other first press).
+    1
+}
+
+/// F12: one standard-action leaf. A `nil` action (used for the submenu
+/// wrappers) is documented as valid in `initWithTitle:action:keyEquivalent:`;
+/// an empty key leaves the item keyless.
+unsafe fn menu_item(title: &str, action: Sel, key: &str) -> Id {
+    msg3::<Id, Id, Id, Id>(
+        msg::<Id>(class("NSMenuItem"), sel("alloc")),
+        sel("initWithTitle:action:keyEquivalent:"),
+        ns_str(title),
+        action as Id,
+        ns_str(key),
+    )
+}
+
+/// F12: a submenu and its standard-action leaves, appended into `root` the
+/// AppKit way — a `nil`-action item whose submenu takes over when clicked.
+unsafe fn add_submenu(root: Id, title: &str, leaves: &[(&str, &str, &str)]) -> Id {
+    let sub = msg1::<Id, Id>(
+        msg::<Id>(class("NSMenu"), sel("alloc")),
+        sel("initWithTitle:"),
+        ns_str(title),
+    );
+    for (item, action, key) in leaves {
+        msg1::<Id, ()>(sub, sel("addItem:"), menu_item(item, sel(action), key));
+    }
+    let wrapper = menu_item(title, std::ptr::null_mut(), "");
+    msg1::<Id, ()>(wrapper, sel("setSubmenu:"), sub);
+    msg1::<Id, ()>(root, sel("addItem:"), wrapper);
+    sub
+}
+
+/// F12: the minimal menu a macOS app is expected to carry. Every leaf is
+/// a standard AppKit action, so no new app-side handler is owed: the
+/// responder chain delivers hide/quit/about/zoom/minimize, and the Edit
+/// row gives the system its substrate (Services hangs beneath it, and the
+/// items validate through the chain — inert ones gray out rather than lie).
+/// The app's own Cmd-chord map already works, and routing menu actions
+/// into the app's own commands (undo/copy against the text) is follow-up.
+unsafe fn build_main_menu(app: Id) {
+    let root = msg1::<Id, Id>(
+        msg::<Id>(class("NSMenu"), sel("alloc")),
+        sel("initWithTitle:"),
+        ns_str("MainMenu"),
+    );
+    // AppKit claims the root's FIRST submenu as the app menu (showing the
+    // process's name over the item's title), so it goes in first.
+    add_submenu(
+        root,
+        "Editor",
+        &[
+            ("About Editor", "orderFrontStandardAboutPanel:", ""),
+            ("Hide Editor", "hide:", "h"),
+            ("Quit Editor", "terminate:", "q"),
+        ],
+    );
+    let edit = add_submenu(
+        root,
+        "Edit",
+        &[
+            ("Undo", "undo:", "z"),
+            ("Redo", "redo:", "z"),
+            ("Cut", "cut:", "x"),
+            ("Copy", "copy:", "c"),
+            ("Paste", "paste:", "v"),
+            ("Select All", "selectAll:", "a"),
+        ],
+    );
+    // Redo is shift-command-Z, not the default command mask.
+    let redo_item = msg1::<Id, Id>(edit, sel("itemWithTitle:"), ns_str("Redo"));
+    if !redo_item.is_null() {
+        msg1::<i64, ()>(
+            redo_item,
+            sel("setKeyEquivalentModifierMask:"),
+            // NSShiftKeyMask | NSCommandKeyMask
+            (1 << 17) | (1 << 20),
+        );
+    }
+    add_submenu(
+        root,
+        "Window",
+        &[
+            ("Minimize", "performMiniaturize:", "m"),
+            ("Zoom", "performZoom:", ""),
+        ],
+    );
+    msg1::<Id, ()>(app, sel("setMainMenu:"), root);
+}
+
 unsafe extern "C" fn app_did_finish_launching(_: Id, _: Sel, _: Id) {
     let m = state();
+    // F20: AppKit's own restoration is off. The session file already
+    // restores tabs, mode and geometry, so two restorers would race over
+    // the same state on relaunch — one is enough.
+    msg1::<i8, ()>(m.win, sel("setRestorable:"), 0);
+    // F12: the menu goes in before the app can be seen without it.
+    build_main_menu(m.app);
+    // The pre-14 call is deprecated as of macOS 14; its replacement
+    // (`activate`) does not exist before 14 and an unrecognized selector
+    // is an ObjC exception, and this release still supports 12 — so the
+    // new call is probed for and the old one carries the rest.
+    if msg1::<Sel, i8>(m.app, sel("respondsToSelector:"), sel("activate")) != 0 {
+        msg::<()>(m.app, sel("activate"));
+    } else {
+        msg1::<i8, i8>(m.app, sel("activateIgnoringOtherApps:"), 1);
+    }
     msg1::<Id, ()>(m.win, sel("makeKeyAndOrderFront:"), null_mut());
-    msg1::<i8, ()>(m.app, sel("activateIgnoringOtherApps:"), 1);
 }
 
 unsafe extern "C" fn app_should_terminate(_: Id, _: Sel, _: Id) -> i8 {
@@ -1057,6 +1247,14 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
                     name: "scrollWheel:",
                     imp: tr!(view_scroll_wheel, unsafe extern "C" fn(Id, Sel, Id)),
                     types: "v@:@",
+                },
+                MethodDef {
+                    name: "acceptsFirstMouse:",
+                    imp: tr!(
+                        view_accepts_first_mouse,
+                        unsafe extern "C" fn(Id, Sel, Id) -> i8
+                    ),
+                    types: "B@:@",
                 },
                 MethodDef {
                     name: "draggingEntered:",

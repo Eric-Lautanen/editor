@@ -388,6 +388,109 @@ fn ctrl(key: char) -> Event {
     }
 }
 
+/// In Split, which pane owns `Ctrl`+`C`: the highlighted one — the pane a
+/// selection was last pressed in — never the read-only pane by rank. A word
+/// is double-clicked in the reader first (the old rule would have kept
+/// answering Ctrl+C with it forever), a drag is made in the text pane, and
+/// the editor's drag is what the clipboard then gets; one more reader
+/// gesture hands it back.
+#[test]
+fn the_highlighted_pane_owns_ctrl_c() {
+    let mut app = open("editor_test_sel_owner.txt", "hello world\nsecond line\n");
+    let mut host = NullHost::default();
+    // The app opens in Preview; Ctrl+E twice lands on Split.
+    app.on_event(ctrl('e'), &mut host);
+    app.on_event(ctrl('e'), &mut host);
+    assert_eq!(app.mode, Mode::Split);
+    let _ = app.render_headless(900, 600, 1.0);
+    let (reader, editor) = app.split_panes();
+    assert!(app.preview_rows.len() >= 2, "a row per line");
+    // The reader first: a double-click on the second row takes its word.
+    let row = app.preview_rows[1].clone();
+    let (rx, ry) = (
+        reader.x + row.x0 + 4.0,
+        reader.y + (row.top + row.bottom) / 2.0,
+    );
+    for _ in 0..2 {
+        app.on_event(
+            Event::MouseDown {
+                x: rx,
+                y: ry,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        app.on_event(
+            Event::MouseUp {
+                x: rx,
+                y: ry,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+    }
+    let reader_text = app
+        .preview_selection_source()
+        .expect("a double-click takes a word");
+    assert_eq!(app.sel_pane, SelPane::Reader);
+    // The editor second: a press, then a drag that extends a selection.
+    let (ex, ey) = (editor.x + 120.0, editor.y + 10.0);
+    app.on_event(
+        Event::MouseDown {
+            x: ex,
+            y: ey,
+            button: MouseButton::Left,
+        },
+        &mut host,
+    );
+    app.on_event(
+        Event::MouseMove {
+            x: ex + 80.0,
+            y: ey,
+        },
+        &mut host,
+    );
+    let editor_text = app.editor.copy(&app.buffer).expect("a drag selects");
+    assert!(!editor_text.is_empty(), "the drag crosses characters");
+    assert_eq!(app.preview_selection_source(), Some(reader_text.clone()));
+    // Both selections are live. On Ctrl+C the highlighted pane — the one
+    // pressed last — owns the clipboard, so the editor's drag answers.
+    app.on_event(ctrl('c'), &mut host);
+    assert_eq!(
+        host.clipboard.as_deref(),
+        Some(editor_text.as_str()),
+        "the text pane was highlighted last"
+    );
+    // One more reader gesture hands Ctrl+C back to the reader, even with
+    // the editor's selection still live: the highlighted pane decides.
+    for _ in 0..2 {
+        app.on_event(
+            Event::MouseDown {
+                x: rx,
+                y: ry,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+        app.on_event(
+            Event::MouseUp {
+                x: rx,
+                y: ry,
+                button: MouseButton::Left,
+            },
+            &mut host,
+        );
+    }
+    assert_eq!(app.preview_selection_source(), Some(reader_text.clone()));
+    assert_eq!(app.sel_pane, SelPane::Reader);
+    app.on_event(ctrl('c'), &mut host);
+    assert_eq!(
+        host.clipboard.as_deref(),
+        Some(reader_text.as_str()),
+        "the reader was highlighted last"
+    );
+}
+
 #[test]
 fn recent_files_track_opens_and_the_menu_reopens_them() {
     let a = crate::testing::temp_dir().join("editor_test_recent_a.md");
@@ -873,9 +976,9 @@ fn preview_clicks_clear_select_a_word_and_select_a_row() {
     click(&mut app, &mut host, bx, by);
     click(&mut app, &mut host, bx, by);
     assert_eq!(
-        app.preview_selection_text().as_deref(),
-        Some("beta"),
-        "double-click takes the word"
+        app.preview_selection_source().as_deref(),
+        Some("Alpha beta gamma"),
+        "double-click takes the word's source line"
     );
     let _ = app.render_headless(900, 600, 1.0);
     let cb = app.copy_btn.expect("Copy button for a word selection");
@@ -891,8 +994,8 @@ fn preview_clicks_clear_select_a_word_and_select_a_row() {
     );
     assert_eq!(
         host.clipboard.as_deref(),
-        Some("beta"),
-        "copy takes the word"
+        Some("Alpha beta gamma"),
+        "copy takes the word's source line, not the token as drawn"
     );
     let _ = app.render_headless(900, 600, 1.0);
     assert_eq!(app.copy_btn.unwrap().label, "Copied");
@@ -902,7 +1005,7 @@ fn preview_clicks_clear_select_a_word_and_select_a_row() {
     assert!(app.preview_word.is_none());
     assert_eq!(app.preview_sel, Some((0, 0)));
     assert_eq!(
-        app.preview_selection_text().as_deref(),
+        app.preview_selection_source().as_deref(),
         Some("Alpha beta gamma")
     );
     let _ = app.render_headless(900, 600, 1.0);
@@ -915,13 +1018,133 @@ fn preview_clicks_clear_select_a_word_and_select_a_row() {
     click(&mut app, &mut host, bx, by);
     assert!(app.preview_sel.is_none());
     assert!(app.preview_word.is_none());
-    assert!(app.preview_selection_text().is_none());
+    assert!(app.preview_selection_source().is_none());
     let _ = app.render_headless(900, 600, 1.0);
     assert!(app.copy_btn.is_none(), "no selection, no button");
 }
 
+/// `Ctrl`+`A` in Preview means the same "everything" it means in the text
+/// pane: the full row range — one highlight the painter draws edge to edge —
+/// and a word selection cannot coexist with it. `Ctrl`+`C` after it copies
+/// what the rows render.
+#[test]
+fn ctrl_a_selects_everything_in_preview() {
+    let mut app = open(
+        "editor_test_preview_select_all.txt",
+        "Alpha beta gamma\nsecond line here\nthird line\n",
+    );
+    let mut host = NullHost::default();
+    let _ = app.render_headless(900, 600, 1.0);
+    assert_eq!(app.mode, Mode::Preview);
+    let last = app.preview_rows.len() - 1;
+    app.on_event(ctrl('a'), &mut host);
+    assert!(app.preview_word.is_none());
+    assert_eq!(app.preview_sel, Some((0, last)));
+    app.on_event(ctrl('c'), &mut host);
+    assert_eq!(
+        host.clipboard.as_deref(),
+        Some("Alpha beta gamma\nsecond line here\nthird line\n"),
+        "select all copies the file, trailing newline included",
+    );
+}
+
+/// Preview copies the file, not the rendering (audit F27): a Markdown
+/// paragraph's `**bold**` and backticks arrive as written, select-all gives the
+/// file back exactly, and a row selection names the source line it was drawn
+/// from.
+#[test]
+fn preview_copy_is_the_raw_markdown_not_the_rendering() {
+    let src = "# Heading\n\nSome **bold** text and `code`.\n";
+    let mut app = open("editor_test_preview_raw.md", src);
+    let mut host = NullHost::default();
+    let _ = app.render_headless(900, 600, 1.0);
+    app.on_event(ctrl('a'), &mut host);
+    app.on_event(ctrl('c'), &mut host);
+    assert_eq!(
+        host.clipboard.as_deref(),
+        Some(src),
+        "select all is the file"
+    );
+    // The paragraph's row copies its source line, markers and all — the
+    // heading's `#` and the code span's backticks are the file's text, not the
+    // renderer's.
+    let row = app
+        .preview_rows
+        .iter()
+        .position(|r| r.text.contains("bold"))
+        .expect("the paragraph row");
+    app.preview_sel = Some((row, row));
+    assert_eq!(
+        app.preview_selection_source().as_deref(),
+        Some("Some **bold** text and `code`."),
+    );
+}
+
+/// The JSON tree draws markers and index prefixes; a copy must not. A row
+/// selection takes the node's source line, indentation included.
+#[test]
+fn preview_copy_of_json_takes_the_node_line() {
+    let src = "{\n  \"name\": \"x\",\n  \"list\": [1, 2, 3]\n}\n";
+    let mut app = open("editor_test_preview_raw.json", src);
+    let mut host = NullHost::default();
+    let _ = app.render_headless(900, 600, 1.0);
+    app.on_event(ctrl('a'), &mut host);
+    app.on_event(ctrl('c'), &mut host);
+    assert_eq!(host.clipboard.as_deref(), Some(src));
+    let row = app
+        .preview_rows
+        .iter()
+        .position(|r| r.text.contains("\"name\""))
+        .expect("the name node's row");
+    app.preview_sel = Some((row, row));
+    assert_eq!(
+        app.preview_selection_source().as_deref(),
+        Some("  \"name\": \"x\","),
+    );
+}
+
+/// CSV rows are records, so the aligned column rendering never reaches the
+/// clipboard: the record line does.
+#[test]
+fn preview_copy_of_csv_takes_the_record_line() {
+    let src = "name,age\nalice,30\nbob,4\n";
+    let mut app = open("editor_test_preview_raw.csv", src);
+    let mut host = NullHost::default();
+    let _ = app.render_headless(900, 600, 1.0);
+    app.on_event(ctrl('a'), &mut host);
+    app.on_event(ctrl('c'), &mut host);
+    assert_eq!(host.clipboard.as_deref(), Some(src));
+    // A CSV pane paints bands and keeps no row list, so there are no rows to
+    // drag or highlight — but select-all still means the file, and copies it.
+    assert!(app.preview_rows.is_empty(), "the sheet paints bands");
+}
+
 /// The touch counterpart: a double-tap selects, and the finger drag that
 /// follows extends the selection instead of scrolling the page.
+#[test]
+fn copying_the_readme_in_preview_returns_the_file() {
+    // The case the raw-copy path exists for: a real README — badges, HTML
+    // tables, code fences, footnotes — copied from the reader. Whatever the
+    // pane drew, the clipboard is the source text, byte for byte.
+    let path = std::path::PathBuf::from("README.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let mut app = App::new(None).unwrap();
+    let mut host = NullHost::default();
+    app.open_path(path, &mut host);
+    // A restored session may have left the app in another mode; the cycle is
+    // Preview -> Edit -> Split, so three presses always reach Preview.
+    for _ in 0..3 {
+        if app.mode == Mode::Preview {
+            break;
+        }
+        app.on_event(ctrl('e'), &mut host);
+    }
+    let _ = app.render_headless(1200, 900, 1.0);
+    assert_eq!(app.mode, Mode::Preview);
+    app.on_event(ctrl('a'), &mut host);
+    app.on_event(ctrl('c'), &mut host);
+    assert_eq!(host.clipboard.as_deref(), Some(source.as_str()));
+}
 #[test]
 fn a_finger_drag_after_a_preview_double_tap_selects_rows() {
     let mut app = open(
@@ -954,7 +1177,7 @@ fn a_finger_drag_after_a_preview_double_tap_selects_rows() {
         );
     }
     assert!(
-        app.preview_selection_text().is_some(),
+        app.preview_selection_source().is_some(),
         "a double-tap selects something"
     );
     let before = app.scroll.offset;
@@ -2503,6 +2726,7 @@ fn reduced_motion_applies_a_wheel_step_at_once() {
         Event::Scroll {
             dx: 0.0,
             dy: -480.0,
+            precise: false,
         },
         &mut host,
     );
@@ -2516,6 +2740,7 @@ fn reduced_motion_applies_a_wheel_step_at_once() {
         Event::Scroll {
             dx: 0.0,
             dy: -480.0,
+            precise: false,
         },
         &mut host,
     );
@@ -3095,6 +3320,7 @@ fn editor_does_not_wrap_and_scrolls_horizontally() {
         Event::Scroll {
             dx: -120.0,
             dy: 0.0,
+            precise: false,
         },
         &mut host,
     );
@@ -3114,6 +3340,7 @@ fn editor_does_not_wrap_and_scrolls_horizontally() {
         Event::Scroll {
             dx: -1_000_000.0,
             dy: 0.0,
+            precise: false,
         },
         &mut host,
     );
@@ -3122,6 +3349,7 @@ fn editor_does_not_wrap_and_scrolls_horizontally() {
         Event::Scroll {
             dx: 1_000_000.0,
             dy: 0.0,
+            precise: false,
         },
         &mut host,
     );
@@ -3170,7 +3398,14 @@ fn horizontal_tilt_glides_over_frames_instead_of_jumping() {
     // one, because every tilt landed in one jump while vertical notches
     // glide. Same easing, same clock discipline now.
     let (mut app, mut host) = open_wide("editor_test_hglide.txt");
-    app.on_event(Event::Scroll { dx: -90.0, dy: 0.0 }, &mut host);
+    app.on_event(
+        Event::Scroll {
+            dx: -90.0,
+            dy: 0.0,
+            precise: false,
+        },
+        &mut host,
+    );
     assert_eq!(app.h_scroll, 0.0, "a tilt must not land in one jump");
     assert_eq!(app.h_target, 90.0);
     assert!(host.animating, "a glide needs the frame clock");
@@ -3204,7 +3439,14 @@ fn fine_horizontal_tilt_applies_directly() {
     // Trackpad-grade deltas are already smooth: gliding them would only
     // add latency, exactly like the vertical fine path.
     let (mut app, mut host) = open_wide("editor_test_hfine.txt");
-    app.on_event(Event::Scroll { dx: -3.0, dy: 0.0 }, &mut host);
+    app.on_event(
+        Event::Scroll {
+            dx: -3.0,
+            dy: 0.0,
+            precise: false,
+        },
+        &mut host,
+    );
     assert_eq!(app.h_scroll, 3.0);
     assert_eq!(app.h_target, 3.0);
     assert!(!app.scrolling, "no glide stands behind a fine delta");
@@ -3215,7 +3457,14 @@ fn touch_pan_stays_on_the_finger_and_ends_the_h_glide() {
     // A finger landing mid-glide takes the view over horizontally too:
     // the tilt's leftover travel is dropped, not resumed under the finger.
     let (mut app, mut host) = open_wide("editor_test_hpan.txt");
-    app.on_event(Event::Scroll { dx: -90.0, dy: 0.0 }, &mut host);
+    app.on_event(
+        Event::Scroll {
+            dx: -90.0,
+            dy: 0.0,
+            precise: false,
+        },
+        &mut host,
+    );
     assert!(app.scrolling);
     // The finger is over the editor pane: the area is reachable at a
     // mid-pane position inside the 600×400 frame the fixture painted.
@@ -3511,7 +3760,14 @@ fn a_wheel_notch_glides_over_frames_instead_of_jumping() {
     let mut host = NullHost::default();
     let _ = app.render_headless(800, 600, 1.0);
     assert_eq!(app.scroll.offset, 0.0);
-    app.on_event(Event::Scroll { dx: 0.0, dy: -48.0 }, &mut host);
+    app.on_event(
+        Event::Scroll {
+            dx: 0.0,
+            dy: -48.0,
+            precise: false,
+        },
+        &mut host,
+    );
     assert_eq!(app.scroll.offset, 0.0, "a notch must not land in one jump");
     assert!(
         host.animating,
@@ -3544,6 +3800,55 @@ fn a_wheel_notch_glides_over_frames_instead_of_jumping() {
 }
 
 #[test]
+fn a_precise_scroll_lands_at_once_and_cancels_a_wheel_ride() {
+    // The opposite arrival to a notch: a trackpad's precise deltas must
+    // every one land on the event frame (no accumulated glide behind them
+    // — the pad reports its own momentum after the lift, and two drivers
+    // would double it), and the first precise event takes ownership: a
+    // wheel ride still animating is cancelled outright.
+    let mut app = open("editor_test_precise.txt", &"line\n".repeat(400));
+    let mut host = NullHost::default();
+    let _ = app.render_headless(800, 600, 1.0);
+    // A wheel notch starts its glide ...
+    app.on_event(
+        Event::Scroll {
+            dx: 0.0,
+            dy: -48.0,
+            precise: false,
+        },
+        &mut host,
+    );
+    assert!(app.scrolling, "the wheel notch glides over frames");
+    assert_eq!(app.scroll.offset, 0.0, "not one notch has landed yet");
+    // ... and a fresh finger (the phase-began event, forwarded by the
+    // macOS backend as a zero-delta precise Scroll) cancels it.
+    app.on_event(
+        Event::Scroll {
+            dx: 0.0,
+            dy: 0.0,
+            precise: true,
+        },
+        &mut host,
+    );
+    assert!(!app.scrolling, "the finger owns a wheel ride in flight");
+    assert_eq!(app.scroll.target, app.scroll.offset);
+    // And a precise delta itself never glides: it lands in one frame and
+    // stops the clock the wheel started.
+    app.on_event(
+        Event::Scroll {
+            dx: 0.0,
+            dy: -30.0,
+            precise: true,
+        },
+        &mut host,
+    );
+    assert_eq!(app.scroll.offset, 30.0, "a precise delta lands at once");
+    assert_eq!(app.scroll.target, app.scroll.offset, "no glide behind it");
+    assert!(!app.scrolling);
+    assert!(!host.animating);
+}
+
+#[test]
 fn a_finger_pan_follows_the_input_and_drops_a_glide() {
     let mut app = open("editor_test_pan.txt", &"line\n".repeat(400));
     let mut host = NullHost::default();
@@ -3566,7 +3871,14 @@ fn a_finger_pan_follows_the_input_and_drops_a_glide() {
     );
     // A finger landing mid-glide takes the view over: the notch's leftover
     // travel is dropped rather than resumed under the finger.
-    app.on_event(Event::Scroll { dx: 0.0, dy: -48.0 }, &mut host);
+    app.on_event(
+        Event::Scroll {
+            dx: 0.0,
+            dy: -48.0,
+            precise: false,
+        },
+        &mut host,
+    );
     assert!(app.scrolling);
     app.on_event(
         Event::Pan {
@@ -3718,6 +4030,7 @@ fn a_wheel_glide_survives_a_band_rebuild() {
         Event::Scroll {
             dx: 0.0,
             dy: -2000.0,
+            precise: false,
         },
         &mut host,
     );
@@ -3858,7 +4171,14 @@ fn a_wheel_notch_ends_a_coast_rather_than_fighting_it() {
     app.on_event(Event::Frame, &mut host);
     let mid_coast = app.scroll.offset;
     assert!(mid_coast > 0.0);
-    app.on_event(Event::Scroll { dx: 0.0, dy: -48.0 }, &mut host);
+    app.on_event(
+        Event::Scroll {
+            dx: 0.0,
+            dy: -48.0,
+            precise: false,
+        },
+        &mut host,
+    );
     assert!(app.scroll.coast == 0.0, "the wheel ends the ride");
     assert!(app.scrolling, "and runs its own clock");
     assert_eq!(app.scroll.target, mid_coast + 48.0);
@@ -4373,7 +4693,14 @@ fn a_wheel_horizontal_over_the_split_preview_pane_is_ignored_too() {
         &mut host,
     );
     let before = app.h_scroll;
-    app.on_event(Event::Scroll { dx: -40.0, dy: 0.0 }, &mut host);
+    app.on_event(
+        Event::Scroll {
+            dx: -40.0,
+            dy: 0.0,
+            precise: false,
+        },
+        &mut host,
+    );
     assert_eq!(
         app.h_scroll, before,
         "a horizontal wheel over the preview half must not scroll the editor"
@@ -5838,4 +6165,109 @@ fn the_split_editor_pane_stays_painted_wherever_the_progress_lands() {
             app.tabs[0].editor_band
         );
     }
+}
+
+// ---------------------------------------------------------------- F4 / F9
+
+// The save writes the file's own bytes back: encoding (BOM or 16-bit) and
+// line-ending convention are recorded at open and re-applied on save, and
+// a tab whose encoding the app cannot reproduce is refused instead of
+// silently rewritten. The fixtures live in `samples/` so suites and
+// humans read the same bytes: `samples/sample_utf16le.txt` (UTF-16LE with
+// an `FF FE` BOM) and `samples/sample_crlf.txt`.
+
+/// UTF-16LE with BOM: decoded for display, saved back as the same bytes.
+#[test]
+fn a_utf16le_file_saves_back_the_bytes_it_opened_with() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/sample_utf16le.txt");
+    let original = std::fs::read(&path).unwrap();
+    let mut app = App::new(Some(path.clone())).unwrap();
+    assert_eq!(
+        app.tabs[app.active].encoding,
+        crate::load::Encoding::Utf16Le,
+        "the BOM was not recognized as UTF-16LE"
+    );
+    assert_eq!(app.buffer.text(), "hello utf16\nsecond line\n");
+    let mut host = NullHost::default();
+    app.save(&mut host);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "saving a UTF-16LE file rewrote its bytes"
+    );
+}
+
+/// CP1252/Latin-1: the lossy decode is shown, but saving is refused with a
+/// status message, and the file on disk keeps its original bytes.
+#[test]
+fn a_file_without_a_decodable_encoding_refuses_to_save() {
+    let dir = crate::testing::temp_dir().join("editor_f4_cp1252");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("cp1252.ini");
+    // A CP1252 é, followed by plain ASCII.
+    let original: Vec<u8> = vec![0xE9, 0x74, 0x6C, 0x69, 0x62, 0x0A];
+    std::fs::write(&file, &original).unwrap();
+    let mut app = App::new(Some(file.clone())).unwrap();
+    assert_eq!(
+        app.tabs[app.active].encoding,
+        crate::load::Encoding::Unknown,
+        "CP1252 must be decoded honestly as not-carrying-a-reproducible encoding"
+    );
+    let mut host = NullHost::default();
+    app.save(&mut host);
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        original,
+        "the lossy tab rewrote the file instead of refusing"
+    );
+    assert!(
+        app.status_extra.contains("refused"),
+        "the refusal was not announced in the status bar: {:?}",
+        app.status_extra
+    );
+}
+
+/// F9: one edit in a CRLF file, one save — every line ending survives.
+#[test]
+fn a_crlf_file_keeps_its_crlf_through_a_save() {
+    let original = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/sample_crlf.txt"),
+    )
+    .unwrap();
+    let dir = crate::testing::temp_dir().join("editor_f9_crlf");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("crlf.md");
+    std::fs::write(&file, &original).unwrap();
+    let mut app = App::new(Some(file.clone())).unwrap();
+    assert_eq!(app.tabs[app.active].eol, crate::load::Eol::Crlf);
+    // One character at the top of the file (the caret stands at line 1
+    // column 1 after a load), then save — exactly the same buffer text a
+    // keystroke would leave.
+    {
+        let tab = &mut app.tabs[app.active];
+        tab.editor.insert_text(&mut tab.buffer, "x");
+    }
+    let mut host = NullHost::default();
+    app.save(&mut host);
+    let expected: Vec<u8> = std::iter::once(0x78)
+        .chain(original.iter().copied())
+        .collect();
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        expected,
+        "the save rewrote the line endings"
+    );
+}
+
+/// The other half of the EOL record: both conventions in one file is
+/// `Mixed`, and a save of it keeps the normalized LF form rather than
+/// claiming either.
+#[test]
+fn a_mixed_eol_file_is_recorded_as_mixed() {
+    let dir = crate::testing::temp_dir().join("editor_f9_mixed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("mixed.md");
+    std::fs::write(&file, b"a\r\nb\nc\n").unwrap();
+    let app = App::new(Some(file.clone())).unwrap();
+    assert_eq!(app.tabs[app.active].eol, crate::load::Eol::Mixed);
 }

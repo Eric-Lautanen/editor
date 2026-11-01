@@ -203,17 +203,19 @@ Grab the latest build from
 
 | File | For |
 |---|---|
-| `editor-<tag>-windows-x86_64.msi` | Windows 10/11 — the recommended install |
-| `editor-<tag>-windows-x86_64.zip` | Windows — portable (no install) |
-| `editor-<tag>-linux-x86_64.tar.gz` | Linux (X11/XWayland) |
-| `editor-<tag>-macos.zip` | macOS |
+| `editor-<tag>-windows-x86_64.msi` | Windows 10/11 on Intel/AMD64 — the recommended install |
+| `editor-<tag>-windows-x86_64.zip` | Windows on Intel/AMD64 — portable (no install) |
+| `editor-<tag>-linux-x86_64.tar.gz` | Linux (X11/XWayland) on Intel/AMD64 |
+| `editor-<tag>-macos.zip` | macOS 12+ on any Mac — a universal build (Intel + Apple silicon, merged with `lipo`) |
+
+No ARM asset ships yet: Windows on ARM, Linux/ARM and macOS on Apple silicon are
+served by the macOS universal bundle only for the Mac side; a native Windows or
+Linux ARM build is not published (see the audit's F26). Windows 10 support
+dates: 22H2 ended servicing on 14 Oct 2025, consumer ESU runs to 12 Oct 2027 —
+the application itself still targets 10 today.
 
 Every release publishes a `SHA256SUMS` manifest listing the SHA-256 of each
 asset; verify the file you download against it if you want to check it yourself.
-The Windows build is Authenticode-signed and the macOS bundle is signed and
-notarized when the release workflow has its signing secrets configured (see
-[packaging/SIGNING.md](packaging/SIGNING.md)); without them the binaries are
-unsigned and the OS will show its usual unknown-publisher warning.
 
 ## Install
 
@@ -269,7 +271,7 @@ for ordinary extensions; macOS matches by extension, so a bare name or a
 `.gitignore` has no per-filename menu entry. There is no Desktop shortcut to
 add here — the Dock and Spotlight are how an app is launched.
 
-The bundle is not signed or notarized yet, so Gatekeeper refuses the first
+The bundle is unsigned and not notarized, so Gatekeeper refuses the first
 launch of a downloaded copy: right-click the app and choose **Open** once
 (or run `xattr -d com.apple.quarantine /Applications/Editor.app`).
 
@@ -417,19 +419,9 @@ estimate at lift, `PanEnd`, the coast it starts, and the frames that advance
 it — is appended to `%TEMP%\editor_touch_trace.log` (cost-free when off); a
 reported "no touch inertia" is diagnosed from that log.
 
-## Code signing policy
+## Privacy
 
-Signed Windows builds use [SignPath.io](https://signpath.io), with a
-certificate issued by the [SignPath Foundation](https://signpath.org):
-
-> Free code signing provided by SignPath.io, certificate by SignPath Foundation.
-
-Roles: committers, reviewers and approvers are the repository's owner,
-[Eric Lautanen](https://github.com/Eric-Lautanen). Every release is built by
-this repository's GitHub Actions workflow on GitHub-hosted runners and is
-manually approved before it is signed.
-
-Privacy: this program will not transfer any information to other networked
+This program will not transfer any information to other networked
 systems unless specifically requested by the user or the person installing or
 operating it. The only network request it can make is the update check, which
 asks GitHub for the latest release and can be turned off with `--no-update`

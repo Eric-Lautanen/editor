@@ -33,14 +33,51 @@ jobs:
       # The suite is headless (NullHost + software canvas), so the whole
       # portable core — parse, layout, gfx, app logic — is exercised on
       # all three OSes on every push. On Windows and macOS this also compiles
-      # that platform's backend; the other two are covered by the
-      # `editor_check_*` cfgs (see `platform/mod.rs`).
+      # that platform's backend; every OS's backend is also type-checked in
+      # the `cross-check` job below (the `editor_check_*` cfgs).
       - run: cargo test
       # Warnings fail the build. The old deferral ("wait for the ttf.rs dead
       # code and mark_dirty cleanup") is done history: the tree is clippy-
       # clean under -D warnings, and a maintenance-stage app shouldn't let a
       # new warning land unchallenged.
       - run: cargo clippy --all-targets -- -D warnings
+
+  # The `editor_check_*` cfgs (declared in `Cargo.toml`, wired through
+  # `platform/mod.rs`) type-check one foreign backend per build, which is
+  # how a backend's syntax is kept healthy between visits. No job exercised
+  # them before this one, and unexercised cfgs rot: a one-line edit in a
+  # backend you were not looking at could break compiling everywhere else
+  # with nothing noticing until a release prepared on the wrong machine.
+  # `check` is enough (never linked), so no GUI header or X11 dev files are
+  # needed beyond the host toolchain.
+  #
+  # The flags cannot all leave their home OS yet, and this job runs the two
+  # that can plus a wiring pin for the third: `editor_check_linux` from the
+  # Windows runner is the true foreign check (`linux.rs` has the `not(unix)`
+  # seam for exactly that); `editor_check_win` still has unseamed
+  # `std::os::windows::ffi` uses (update.rs's wide-string builders), and
+  # `editor_check_macos` rejects any non-Apple target outright (`link(kind =
+  # "framework")` is an E0455 on foreign targets, and `macos.rs`'s map_file
+  # uses `std::os::unix`) — both flags here exercise their wiring on the
+  # home runner, not yet from abroad.
+  cross-check:
+    name: cross-check (editor_check_${{ matrix.backend }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            backend: linux
+          - os: windows-latest
+            backend: win
+          - os: macos-latest
+            backend: macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTFLAGS="--cfg editor_check_${{ matrix.backend }}" cargo check
 
   # Not a unit test but a budget: the suite above checks what the app paints,
   # and this checks what it *costs*. Large-file regressions (a whole-document
@@ -94,10 +131,30 @@ jobs:
           test -x /tmp/fakehome/.local/bin/editor
           test -f /tmp/fakehome/.local/share/applications/editor.desktop
           test -f /tmp/fakehome/.local/share/mime/packages/editor-mime.xml
+          # F23: AppStream metadata, so the app is listed by GNOME Software
+          # and KDE Discover, not only the applications menu.
+          test -f /tmp/fakehome/.local/share/metainfo/editor.metainfo.xml
+          grep -q 'dev.editor.app' /tmp/fakehome/.local/share/metainfo/editor.metainfo.xml
           for size in 16 32 48 64 128 256 512; do
             test -f "/tmp/fakehome/.local/share/icons/hicolor/${size}x${size}/apps/editor.png"
           done
           grep -q '^Exec=/tmp/fakehome/.local/bin/editor '             /tmp/fakehome/.local/share/applications/editor.desktop
+          # F16: the entry must stay valid and keep the WM_CLASS link, or the
+          # shell cannot match a running window back to it (the smoke test
+          # checks the runtime half of the same pair).
+          sudo apt-get install -y desktop-file-utils >/dev/null
+          desktop-file-validate /tmp/fakehome/.local/share/applications/editor.desktop
+          grep -q '^StartupWMClass=Editor$' /tmp/fakehome/.local/share/applications/editor.desktop
+          grep -q '^TryExec=editor$' /tmp/fakehome/.local/share/applications/editor.desktop
+          # YAML's canonical type is `application/yaml` (IANA, RFC 9512) since
+          # shared-mime-info 2.3, and `text/x-yaml` is now its alias; xdg-mime
+          # defaults key on the primary type. ALL distros supported here must
+          # end up with Editor for both spellings — which is why install.sh
+          # sets both, and why both queries are asserted below: either query
+          # returning empty (the current fallback heuristic, not our entry)
+          # is a regression, not a runner quirk.
+          test "$(HOME=/tmp/fakehome xdg-mime query default application/yaml)" = editor.desktop
+          test "$(HOME=/tmp/fakehome xdg-mime query default text/x-yaml)" = editor.desktop
           # The Desktop shortcut: same entry, executable (GNOME will not run
           # one that is not), pointing at the installed binary.
           test -x /tmp/fakehome/Desktop/editor.desktop
@@ -134,6 +191,9 @@ jobs:
         run: |
           test -f target/Editor.app/Contents/MacOS/editor
           test -f target/Editor.app/Contents/Resources/Editor.icns
+          # Universal (F2): both slices in one executable, not shorthand for
+          # "the host arch happens to be inside it".
+          lipo -info target/Editor.app/Contents/MacOS/editor | grep -qE 'x86_64[[:space:]]+arm64|arm64[[:space:]]+x86_64'
           python3 - <<'PY'
           import plistlib
           path = 'target/Editor.app/Contents/Info.plist'
@@ -152,6 +212,50 @@ jobs:
           print(f'bundle OK: version {version}, {len(exts)} document extensions')
           PY
 
+  # The .wxs is the riskiest XML in the repository — major-upgrade rows by
+  # hand, custom-action sequencing, per-user scope, two dialogs of ours — and
+  # it used to be compiled only in release.yml, on a tag, so a schema error or
+  # a missing icon source surfaced in the one build users install. Same WiX
+  # pairing and the same build flags as release.yml (keep the two in step),
+  # unsigned at Version=0.0.0, never published, never signed. The assertions
+  # live in tools/check-msi.ps1: a .wxs-text check (which the Rust tests
+  # already do) cannot see what WiX actually linked — a component defined but
+  # not referenced, a property it silently dropped, a dialog the sequence
+  # does not show — so the job queries the built package's own database.
+  packaging-windows:
+    name: packaging (windows msi)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          # WiX v7 EULA acceptance and the UI extension: both are what
+          # release.yml does before its build, and the v7 EULA is exactly the
+          # kind of gate this job is here to catch years from now.
+          & "$env:USERPROFILE\\.dotnet\\tools\\wix.exe" eula accept wix7
+          & "$env:USERPROFILE\\.dotnet\\tools\\wix.exe" extension add -g WixToolset.UI.wixext
+      - run: cargo build --release
+      - name: build the unsigned msi
+        shell: pwsh
+        run: |
+          & "$env:USERPROFILE\\.dotnet\\tools\\wix.exe" build `
+            -acceptEula wix7 `
+            -ext WixToolset.UI.wixext `
+            -arch x64 `
+            -d Version=0.0.0 `
+            -d PublishDir=target/release `
+            -d Icon=assets/icon.ico `
+            -d DialogIcon=assets/icon-setup.ico `
+            -o editor-msi-ci.msi `
+            packaging/windows/editor.wxs
+      - name: assert the tables in the built package
+        shell: pwsh
+        run: .\\tools\\check-msi.ps1 -Path editor-msi-ci.msi
+
   # Compiling a backend is not the same as running it: the X11 and AppKit
   # backends used to be covered only by `cargo test`, which never reaches
   # window creation — a backend that links cleanly and dies on the first
@@ -164,11 +268,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Xvfb provides the DISPLAY; xdotool asks that X server what is mapped.
-      - name: install X11, Xvfb and xdotool
+      # Xvfb provides the DISPLAY; xdotool asks that X server what is mapped;
+      # xclip is the second client for the editor's clipboard round trip (F6).
+      - name: install X11, Xvfb, xdotool and xclip
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev xvfb xdotool
+          sudo apt-get install -y libx11-dev xvfb xdotool xclip xclip
       - run: cargo build --release
       # The probe reports *how* a failure happened, not just that it did (see
       # tools/linux-window-smoke.sh): this is the only place a Linux window is

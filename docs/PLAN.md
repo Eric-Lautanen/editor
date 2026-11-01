@@ -366,8 +366,30 @@ working set**, and one emoji pulled in `seguiemj.ttf` (12.9 MB) on top.
   gating updated so exactly one backend is `use`d per configuration;
   `system_prefers_dark` now routes to the Linux backend on Linux.
 - **Not yet on Linux**: XDND drag-and-drop (the one parity gap, tracked for
-  the M8 follow-up), XIM/UTF-8 dead-key compose input (`XLookupString`
-  covers Latin-1 today), DPI scale is fixed at 1.0.
+  the M8 follow-up), DPI scale is fixed at 1.0.
+- **Text input state, per platform** (the honest version of the old one-line
+  "IME pending" note):
+  - **Linux** — XIM is wired (input-method context on the window, dead keys
+    and Compose through it, CJK when ibus/fcitx is running and pointed at by
+    the user's `XMODIFIERS`). Without any IM the bare `XLookupString` path
+    still types Latin-1. Not yet exercised against a live ibus; the Xvfb
+    smoke cannot compose text, so this line does not claim CJK is proven,
+    only that the path exists (`create_im_ic` in `platform/linux.rs`).
+  - **Windows** — committed IME text *does* arrive: `DefWindowProc` turns
+    the IME's result string into `WM_CHAR`, which the loop handles. What is
+    missing is in-buffer preedit (the composition is only visible in the
+    IME's floating window), backspace-into-composition editing,
+    reconversion, and at-caret candidate placement — the composition window
+    anchors at the window origin instead of the caret. That is the
+    documented Microsoft fallback, not a silent break; it is also the
+    reason the release notes' "IME" line does not say "broken on
+    Windows". To fix: handle `WM_IME_*` messages, read
+    `GCS_COMPSTR/GCS_CURSORPOS/GCS_RESULTSTR` via `ImmGetCompositionString`,
+    and anchor with `ImmSetCompositionWindow`/`ImmSetCandidateWindow` on
+    caret moves.
+  - **macOS** — no `NSTextInputClient` on the view yet: committed text
+    reaches `keyDown:`, but composed input has no preedit surface here.
+    Tracked with the same M8/F11 follow-up.
 - Runtime verification needs a real X server (X11/XWayland) — CI
   (`ci.yml`) compiles + runs the headless suite on ubuntu-latest from the
   first push, and the `smoke (linux window)` job starts the release binary

@@ -6,6 +6,7 @@ use crate::{
     parse::{json, jsonl},
     platform, settings, update,
 };
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: editor [FILE ...]\n\
@@ -62,7 +63,12 @@ fn usage(msg: impl Into<String>) -> Error {
 /// Parse the command line. Kept apart from [`run`] so its rules — `--` ends the
 /// flags, several files are allowed, an unknown flag is refused — can be
 /// checked without a window or a filesystem.
-fn parse(args: &[String]) -> Result<Opts> {
+///
+/// Arguments arrive as `OsString` (F10): Unix argv is arbitrary bytes and
+/// `std::env::args()` panics on them before any window exists. Flags are
+/// matched only when the argument is convertible to text; what is not is a
+/// path, byte for byte — a flag cannot be spelled in non-UTF-8 anyway.
+fn parse(args: &[OsString]) -> Result<Opts> {
     let mut o = Opts {
         files: Vec::new(),
         render: None,
@@ -92,7 +98,17 @@ fn parse(args: &[String]) -> Result<Opts> {
                 .cloned()
                 .ok_or_else(|| usage(format!("{name} needs a value")))
         };
-        match a.as_str() {
+        // An argument no spelling of a flag could need is somebody's filename
+        // by construction (Unix argv is arbitrary bytes); take it as an
+        // operand — the same choice the `-`-prefixed file case makes below.
+        let rest = match a.to_str() {
+            Some(s) => s,
+            None => {
+                o.files.push(PathBuf::from(a));
+                continue;
+            }
+        };
+        match rest {
             "--version" | "-V" => {
                 o.immediate.get_or_insert(Immediate::Version);
             }
@@ -115,28 +131,38 @@ fn parse(args: &[String]) -> Result<Opts> {
             "--size" => {
                 let v = val("--size")?;
                 let (w, h) = v
-                    .split_once('x')
+                    .to_str()
+                    .and_then(|t| t.split_once('x'))
                     .ok_or_else(|| usage("--size expects WxH"))?;
                 o.size = (
                     w.parse().map_err(|_| usage("bad width"))?,
                     h.parse().map_err(|_| usage("bad height"))?,
                 );
             }
-            "--scale" => o.scale = val("--scale")?.parse().map_err(|_| usage("bad --scale"))?,
+            "--scale" => {
+                o.scale = val("--scale")?
+                    .to_str()
+                    .and_then(|t| t.parse().ok())
+                    .ok_or_else(|| usage("bad --scale"))?
+            }
             "--scroll" => {
                 o.scroll = val("--scroll")?
-                    .parse()
-                    .map_err(|_| usage("bad --scroll"))?
+                    .to_str()
+                    .and_then(|t| t.parse().ok())
+                    .ok_or_else(|| usage("bad --scroll"))?
             }
             "--dark" => o.dark = true,
             "--light" => o.light = true,
             "--mode" => {
-                o.mode = Some(match val("--mode")?.as_str() {
+                let value = val("--mode")?;
+                let text = value.to_str().ok_or_else(|| usage("bad --mode"))?;
+                let mode = match text {
                     "preview" => Mode::Preview,
                     "edit" => Mode::Edit,
                     "split" => Mode::Split,
                     other => return Err(usage(format!("bad --mode {other}"))),
-                })
+                };
+                o.mode = Some(mode);
             }
             "--mem-report" => o.mem_report = true,
             other if !other.starts_with('-') => o.files.push(PathBuf::from(other)),
@@ -156,13 +182,24 @@ fn session_view(mode: u8) -> Mode {
     }
 }
 
-pub fn run(args: Vec<String>) -> Result<()> {
+pub fn run(args: Vec<OsString>) -> Result<()> {
     // The update helper is a copy of this exe invoked with `--apply-update`
     // (see src/update.rs). It has no window and no session; dispatching it
     // before `parse` keeps it out of the flag table entirely, so the helper
     // cannot be broken by a change to the ordinary CLI.
-    if args.first().is_some_and(|a| a == "--apply-update") {
-        return update::apply_update(&args[1..]);
+    if args
+        .first()
+        .is_some_and(|a| a.to_str() == Some("--apply-update"))
+    {
+        // The helper's arguments are written by update.rs itself, on Windows
+        // only, where argv arrives as UTF-16 and the conversion below is
+        // exact. A non-UTF-8 byte can only get here by hand-running the
+        // helper on Unix, where it would answer "Windows-only" regardless.
+        let text: Vec<String> = args[1..]
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        return update::apply_update(&text);
     }
     let o = parse(&args)?;
     if let Some(act) = o.immediate {
@@ -405,8 +442,8 @@ mod tests {
         assert_eq!(session_view(9), Mode::Preview);
     }
 
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    fn args(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(|s| OsString::from(*s)).collect()
     }
 
     #[test]
@@ -456,5 +493,53 @@ mod tests {
         assert!(parse(&args(&["--nope"])).is_err());
         assert!(parse(&args(&["--size"])).is_err());
         assert!(parse(&args(&["--mode", "diagonal"])).is_err());
+    }
+
+    // ------------------------------------------------------------------ F10
+    // argv is arbitrary bytes on Unix; these tests need bytes std cannot
+    // build on Windows (its OsString only carries UTF-16), so they are
+    // unix-only and run on the CI ubuntu runner, which compiles the real
+    // `args_os` path alongside them.
+    #[cfg(unix)]
+    fn arg(bytes: &[u8]) -> OsString {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        OsString::from(OsStr::from_bytes(bytes))
+    }
+
+    /// A file argument that is not UTF-8 reaches `files` byte for byte
+    /// instead of panicking at startup — the crash this finding measured.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_operand_is_a_file_argued_bytewise() {
+        use std::os::unix::ffi::OsStrExt;
+        let o = parse(&[arg(b"\xff\xfe.md")]).unwrap();
+        assert_eq!(o.files.len(), 1, "the name is a file, not a refusal");
+        assert_eq!(o.files[0].as_os_str().as_bytes(), b"\xff\xfe.md");
+    }
+
+    /// And a malformed name that begins with `-` is still a file: a flag
+    /// cannot be spelled in non-UTF-8, so there is nothing to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_dash_name_is_never_an_unknown_flag() {
+        use std::os::unix::ffi::OsStrExt;
+        let o = parse(&[arg(b"-\xfedraft.md")]).unwrap();
+        assert_eq!(o.files.len(), 1, "the byte-odd name opened as a file");
+        assert_eq!(o.files[0].as_os_str().as_bytes(), b"-\xfedraft.md");
+    }
+
+    /// The text-taking flags refuse a value that is not text with their own
+    /// message, never a flag-unknown error for the value.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_flag_value_refuses_with_its_own_message() {
+        assert_eq!(
+            parse(&[OsString::from("--mode"), arg(b"\xfe")])
+                .err()
+                .expect("a non-text --mode value must refuse")
+                .to_string(),
+            "bad --mode"
+        );
     }
 }

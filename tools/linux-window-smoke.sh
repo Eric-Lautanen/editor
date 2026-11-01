@@ -11,14 +11,22 @@
 #
 #   sh tools/linux-window-smoke.sh [path-to-editor]
 #
-# Needs an X server: Xvfb is started here when DISPLAY is unset (xvfb-run and
-# xdotool must be installed — the workflows do that).
+# Needs an X server: Xvfb is started here when DISPLAY is unset (xvfb-run,
+# xdotool and xclip must be installed — the workflows do that).
 set -u
 
-here=$(cd "$(dirname "$0")" && pwd)
+mode=edit
+arg1=${1:-""}
+case "$arg1" in --mode) mode=$2; shift 2 ;; esac
 bin=${1:-./target/release/editor}
 sample="$here/../samples/sample_markdown.md"
 log=/tmp/editor-window-smoke.log
+
+# The chord proof (F1) needs a file the app is allowed to write over: the
+# sample in the tree is opened on a writable copy.
+work=$(mktemp -d /tmp/editor-smoke-XXXXXX)
+trap 'rm -rf "$work"' EXIT
+cp "$sample" "$work/file.md"
 
 if [ ! -x "$bin" ]; then
     echo "FAIL: no executable at $bin (build it first)"
@@ -40,7 +48,10 @@ fi
 
 echo "binary: $("$bin" --version)"
 echo "DISPLAY=$DISPLAY"
-"$bin" --no-update "$sample" >"$log" 2>&1 &
+# Edit mode for the F1/F6 keystroke proofs regardless of the restored
+# session view: pastes and copies must land in the buffer, not a preview
+# pane's read-only selection.
+"$bin" --no-update --mode "$mode" "$work/file.md" >"$log" 2>&1 &
 pid=$!
 ids=""
 gone=""
@@ -63,8 +74,89 @@ if [ -n "$ids" ]; then
     first=$(printf "%s\n" "$ids" | head -1)
     echo "mapped window: $(xdotool getwindowname "$first")"
     xdotool getwindowgeometry "$first"
+    # F16: the shell matches this window to editor.desktop by WM_CLASS; a
+    # generic-icon window would still be "a window named Editor", so the
+    # title check above cannot catch a missing class. The class half
+    # ("Editor") is what StartupWMClass in editor.desktop names.
+    wmclass=$(xdotool getwindowproperty "$first" WM_CLASS 2>/dev/null || echo MISSING)
+    echo "WM_CLASS: $wmclass"
+    case "$wmclass" in
+        *Editor*) ;;
+        *)
+            echo "FAIL: WM_CLASS does not name Editor (desktop cannot match it)"
+            exit 1
+            ;;
+    esac
+    # Ctrl chords (F1): with ControlMask set, libX11 converts the buffer
+    # `XLookupString` fills into an ASCII control character, so a backend
+    # that derives its keys from that buffer dispatches nothing at all for
+    # Ctrl+letter — the window opens, typing works, save never fires. The
+    # proof is observable after the fact: send `ctrl+s` at the live window
+    # and the file on disk must actually change.
+    xdotool windowfocus "$first" 2>/dev/null
+    before=$(stat -c %Y "$work/file.md")
+    xdotool type "x"
+    xdotool key ctrl+s
+    sleep 1
+    after=$(stat -c %Y "$work/file.md")
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    if [ "$after" = "$before" ]; then
+        echo "FAIL: Ctrl+S did not save the open file (mtime unchanged at $before)"
+        echo "its output was:"
+        cat "$log"
+        exit 1
+    fi
+    echo "OK: Ctrl+S saved (mtime $before -> $after)"
+
+    # Clipboard across the max-request boundary (F6): one X protocol request
+    # is capped at about 256 KiB, so an owner that answers a selection
+    # request with one big XChangeProperty dies with BadLength and the
+    # pasting client gets nothing. An 8 MB document therefore travels as an
+    # INCR announcement plus 64 KiB chunks on PropertyNotify, in both
+    # directions, and the proof is a second client — xclip — exchanging the
+    # full byte count through it:
+    #   1. xclip owns an 8 MB CLIPBOARD; the editor pastes it (our read side
+    #      consumes an INCR ownership and reassembles) and Ctrl+S must leave
+    #      exactly that byte count on disk.
+    #   2. Ctrl+A + Ctrl+C make the editor own that text; `xclip -o` (our
+    #      write side announced INCR) must read out the same byte count.
+    if ! command -v xclip >/dev/null 2>&1; then
+        echo "FAIL: xclip not installed (needed as the second clipboard client)"
+        exit 1
+    fi
+    big="$work/big.txt"
+    yes 01234567 | head -1048576 >"$big"
+    expect=$(wc -c <"$big")
+    echo "clipboard round trip: $expect bytes"
+    xclip -selection clipboard -i "$big"
+    sleep 1
+    xdotool key ctrl+a
+    sleep 0.3
+    xdotool key ctrl+v
+    sleep 1
+    xdotool key ctrl+s
+    sleep 1
+    got=$(wc -c <"$work/file.md")
+    if [ "$got" != "$expect" ]; then
+        echo "FAIL: pasting the 8 MB selection did not reassemble it (file is $got bytes, selection is $expect)"
+        echo "its output was:"
+        cat "$log"
+        exit 1
+    fi
+    echo "OK: pasted the whole $expect-byte selection in"
+    xdotool key ctrl+a
+    sleep 0.3
+    xdotool key ctrl+c
+    sleep 1
+    out=$(xclip -selection clipboard -o | wc -c)
+    if [ "$out" != "$expect" ]; then
+        echo "FAIL: the copy out of the editor reached xclip at $out bytes of $expect (the owner or requestor wrote through the request-size cap?)"
+        echo "its output was:"
+        cat "$log"
+        exit 1
+    fi
+    echo "OK: xclip read all $expect bytes of the copy back"
 else
     echo "the app is gone before any window: status ${gone:-?} (139 segv, 134 abort)"
     echo "its output was $(wc -c <"$log") bytes:"

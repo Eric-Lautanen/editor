@@ -51,7 +51,7 @@ mod linux;
     not(editor_check_win),
     not(editor_check_linux)
 ))]
-mod macos;
+pub(crate) mod macos;
 #[cfg(any(target_os = "windows", editor_check_win))]
 mod windows;
 
@@ -107,8 +107,8 @@ use macos as backend;
 ))]
 use windows as backend;
 
-/// Services the app can ask of the host window.
-/// Grows per milestone: macOS open/save dialogs arrive with M9.
+/// Services the app can ask of the host window. All three backends
+/// implement it; there is no deferred milestone on any of them.
 pub trait Host {
     fn request_redraw(&mut self);
     fn set_title(&mut self, title: &str);
@@ -202,6 +202,13 @@ pub fn run(handler: impl Handler + 'static) -> Result<()> {
 /// the friendly thing rather than spawning a duplicate. `cli::run` calls
 /// this right before `platform::run`.
 pub fn forward_to_running(files: &[std::path::PathBuf]) -> Result<bool> {
+    // F18: every launch takes the session lease before any backend logic
+    // runs. On Windows the mutex/FindWindow handoff below stays the
+    // authority — the answer is not consulted, and the lease's only effect
+    // is that `session.txt` is guarded even when that handoff fails or the
+    // process never reaches a backend (headless runs). Off Windows it is
+    // the only single-instance signal there is yet.
+    let _ = crate::settings::try_hold_session();
     // Gated on the *selected backend*, not on the host: the `editor_check_*`
     // cfgs exist to type-check one backend from another OS, and a bare
     // `target_os = "windows"` arm would call `backend::handoff_to_running`
@@ -225,9 +232,17 @@ pub fn forward_to_running(files: &[std::path::PathBuf]) -> Result<bool> {
         not(editor_check_macos)
     )))]
     {
-        // The linux/macos backends do the same trick (they open at their
-        // window-creation site — same as the win one) once their GUI (M8/M9)
-        // lands; until then a second launch keeps the classic behavior.
+        // F18: the std-only half of the single-instance story lives here —
+        // the first process takes the session lease for its whole run
+        // (`settings::try_hold_session`, an advisory `File::try_lock`), so a
+        // later launch learns from the same call whether one runs. What is
+        // still owed is the handoff itself: argv forwarding into the running
+        // window, which needs a listener — a socket in `$XDG_RUNTIME_DIR` or
+        // a D-Bus name. Until that lands, a detected second launch keeps the
+        // classic behavior and continues below, and the session file cannot
+        // be corrupted by concurrent writes in the meantime (the scratch
+        // stage name is per-process in `settings`). The lease itself was
+        // taken above, before the backend gate.
         let _ = files;
         Ok(false)
     }

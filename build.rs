@@ -5,8 +5,7 @@
 //! value (`editor.exe,0`), not from anything the process draws. An exe with no
 //! icon resource therefore made every associated `.md`/`.json`/… file show the
 //! generic Windows app icon. The version resource is what Explorer's
-//! Properties → Details pane reads, what Add/Remove Programs and signing
-//! policies (SignPath enforces product name and version) expect. This script
+//! Properties → Details pane reads, what Add/Remove Programs expects. This script
 //! turns `assets/icon.ico` and the package version into a `.res` file and
 //! hands it to the MSVC linker, which is the whole fix.
 //!
@@ -33,6 +32,16 @@ fn main() {
     let ico = fs::read(root.join("assets/icon.ico")).expect("read assets/icon.ico");
     let mut res = res_file(&ico).expect("assets/icon.ico is a well-formed icon");
     entry(&mut res, RT_VERSION, 1, &version_info(&version));
+    // F14: the manifest comes along the same road — one `entry()` call, id 1
+    // (1 = EXE per the resource spec).
+    let manifest = manifest(&version);
+    entry(&mut res, RT_MANIFEST, 1, &manifest);
+    // The build-time round trip: parse the stream back and require the
+    // manifest at (id 1) byte-equal — if entry()'s header layout ever
+    // changes, the build fails here instead of shipping an exe the loader
+    // silently ignores.
+    let found = find_entry(&res, RT_MANIFEST, 1).expect("the manifest entry round-trips");
+    assert_eq!(found, manifest, "the embedded manifest must be byte-equal");
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("editor.res");
     fs::write(&out, res).expect("write editor.res");
     // A bare path is an input file to link.exe, exactly like an .obj: the
@@ -43,6 +52,7 @@ fn main() {
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
 const RT_VERSION: u16 = 16;
+const RT_MANIFEST: u16 = 24;
 
 /// One entry of an `.ico`: the image bytes plus what a group icon has to say
 /// about it.
@@ -135,9 +145,9 @@ fn entry(out: &mut Vec<u8>, kind: u16, id: u16, data: &[u8]) {
     }
 }
 
-/// The `VS_VERSIONINFO` block Explorer's Properties → Details pane,
-/// Add/Remove Programs and signing policies read: the fixed file-info header
-/// plus a `StringFileInfo` table and the translation `VarFileInfo`.
+/// The `VS_VERSIONINFO` block Explorer's Properties → Details pane and
+/// Add/Remove Programs read: the fixed file-info header plus a
+/// `StringFileInfo` table and the translation `VarFileInfo`.
 fn version_info(version: &str) -> Vec<u8> {
     let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
     let major = parts.next().unwrap_or(0);
@@ -167,8 +177,8 @@ fn version_info(version: &str) -> Vec<u8> {
         fixed.extend_from_slice(&field.to_le_bytes());
     }
 
-    // ProductName and ProductVersion are the two a SignPath artifact
-    // configuration pins; the rest is what a Windows user expects to find.
+    // ProductName and ProductVersion are what package-level consumers pin;
+    // the rest is what a Windows user expects to find.
     //
     // FileDescription is the *name* Windows shows for the app — the taskbar
     // tooltip, the window grouping in Alt+Tab and Task Manager — not a
@@ -238,4 +248,73 @@ fn align4(v: &mut Vec<u8>) {
     while !v.len().is_multiple_of(4) {
         v.push(0);
     }
+}
+
+/// The application manifest (F14), embedded as `RT_MANIFEST` id 1. Everything
+/// in it buys something:
+///
+/// - one `supportedOS` GUID — `{8e0f7a12-…}` covers Windows 10 *and* 11, so
+///   `GetVersionEx`-era lying about the version (it reports 6.2 without the
+///   manifest) ends — with `<compatibility>`;
+/// - `<trustInfo>` pinning `asInvoker`, so UAC never virtualizes writes;
+/// - `<dpiAwareness>PerMonitorV2, PerMonitor</dpiAwareness>`, which is the
+///   manifest-level replacement for the runtime
+///   `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` call (Microsoft
+///   recommends the manifest over the API, and the API is a hard import
+///   requiring Windows 10 1703+).
+///
+/// `longPathAware` is left out (inert without the machine-wide registry
+/// value), and so is `activeCodePage=UTF-8` (it changes the ACP process-wide
+/// for `*A` APIs; the app uses the W APIs, so it is pure risk).
+fn manifest(version: &str) -> Vec<u8> {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\
+         <assemblyIdentity version=\"{major}.{minor}.{patch}.0\"\
+          processorArchitecture=\"*\" name=\"editor\" type=\"win32\"/>\
+         <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">\
+         <security><requestedPrivileges>\
+         <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"/>\
+         </requestedPrivileges></security></trustInfo>\
+         <compatibility xmlns=\"urn:schemas-microsoft-com:compatibility.v1\"><application>\
+         <supportedOS Id=\"{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}\"/>\
+         </application></compatibility>\
+         <application xmlns=\"urn:schemas-microsoft-com:asm.v3\"><windowsSettings>\
+         <dpiAwareness\
+          xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\"\
+          >PerMonitorV2, PerMonitor</dpiAwareness>\
+         </windowsSettings></application>\
+         </assembly>"
+    );
+    xml.into_bytes()
+}
+
+/// Walk a `.res` stream and return the data of the first (kind, id) entry —
+/// the build-time proof that `entry()` wrote what the loader will read.
+/// Ordinal-only entries (the only kind this writer produces) carry `0xFFFF`
+/// before the type and the id; the leading all-zero placeholder carries no
+/// ordinals and is skipped by that test.
+fn find_entry(res: &[u8], kind: u16, id: u16) -> Option<Vec<u8>> {
+    let mut p = 0x20; // the placeholder's length, always the first entry
+    while p + 16 <= res.len() {
+        let size = u32::from_le_bytes(res[p..p + 4].try_into().ok()?) as usize;
+        let header = u32::from_le_bytes(res[p + 4..p + 8].try_into().ok()?) as usize;
+        let ordinal = |at: usize, want: u16| -> bool {
+            res.get(at..at + 2) == Some(&0xFFFFu16.to_le_bytes())
+                && res.get(at + 2..at + 4) == Some(&want.to_le_bytes())
+        };
+        if ordinal(p + 8, kind) && ordinal(p + 12, id) {
+            return res.get(p + header..p + header + size).map(<[u8]>::to_vec);
+        }
+        // Past the header the stream holds the data, then 4-byte alignment.
+        p += header + size;
+        while !p.is_multiple_of(4) {
+            p += 1;
+        }
+    }
+    None
 }

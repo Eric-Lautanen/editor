@@ -1,9 +1,17 @@
 [Desktop Entry]
 Type=Application
 Name=Editor
+GenericName=Text Editor
 Comment=Read and lightly edit Markdown, JSON, CSV, configs, logs and code
 Exec=editor %f
+TryExec=editor
 Icon=editor
 Terminal=false
 Categories=Utility;TextEditor;Viewer;
-MimeType=text/markdown;application/json;application/x-ndjson;text/plain;text/csv;text/x-yaml;application/toml;text/x-editor-dotfile;
+Keywords=edit;text;markdown;json;csv;yaml;toml;
+MimeType=text/markdown;application/json;application/x-ndjson;text/plain;text/csv;application/yaml;text/x-yaml;application/toml;text/x-editor-dotfile;
+# F16: GNOME Shell and KDE match the window's WM_CLASS (res_class "Editor")
+# against this key first; without it the association falls back to heuristics
+# and the dock shows a generic icon. Must equal the class in
+# src/platform/linux.rs (set_class).
+StartupWMClass=Editor

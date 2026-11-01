@@ -99,13 +99,19 @@ pub enum Event {
         x: f32,
         y: f32,
     },
-    /// A *discrete* scroll step — a wheel notch, a tilt wheel — in physical px.
-    /// Coarse by nature, so the app may glide to the new position instead of
-    /// jumping; a precision touchpad's small deltas come through here too and
-    /// are applied at once.
+    /// A scroll step in physical px. `precise` separates its two very
+    /// different arrivals: **false** is a *discrete* wheel notch or tilt —
+    /// coarse by nature, so the app may glide to the new position instead of
+    /// jumping; **true** is a precision-touchpad delta (macOS's
+    /// `hasPreciseScrollingDeltas`, with the pad's own phase bits riding
+    /// along): it is applied the instant it lands and never accumulates a
+    /// glide, because the pad reports its own momentum after the lift and an
+    /// app-side glide would double it.
     Scroll {
         dx: f32,
         dy: f32,
+        /// Precision-touchpad semantics (see above) versus a discrete wheel.
+        precise: bool,
     },
     /// Continuous manipulation: a finger (or pen) dragging the content. This
     /// tracks the input exactly — a glide in the way of a finger reads as lag

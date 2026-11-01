@@ -952,10 +952,18 @@ mod sha256 {
 /// Editors came up, the second hung on the first one's single-instance mutex,
 /// and a process started mid-transaction can still hold a file the install
 /// wants to replace — which is how Windows Installer ends up scheduling a
-/// restart, i.e. rebooting the machine. `REBOOT=ReallySuppress`,
-/// `MSIDISABLERMRESTART=1` and `MSIRESTARTMANAGERCONTROL=Disable` close that
-/// door for good: an update may close and reopen the app, never restart the
-/// computer.
+/// restart, i.e. rebooting the machine. `REBOOT=ReallySuppress` and
+/// `MSIRESTARTMANAGERCONTROL=Disable` close that door for good: an update
+/// may close and reopen the app, never restart the computer.
+///
+/// (`MSIDISABLERMRESTART=1` rides along deliberately, but it does no work
+/// here and is not part of that guarantee: it only tunes what the Restart
+/// Manager does when it *is* active, and is documented as ignored when RM
+/// is unavailable or disabled by `MSIRESTARTMANAGERCONTROL=Disable` — the
+/// state this rung's flags put the install in. It stays because every flag
+/// in the chain has a measured failure behind it, and because a package
+/// sharing this property space cannot rely on every caller's RM state;
+/// see `packaging/windows/README.md`.)
 ///
 /// The relaunched app is argument-less on purpose: it restores the session it
 /// saved on the way out, so the last file and the window place come back. With
@@ -1564,11 +1572,124 @@ fn install_macos(file: &std::path::Path, tag: &str) -> Result<()> {
             dir.display()
         )));
     };
-    std::fs::remove_dir_all(&bundle)?;
-    std::fs::rename(&fresh, &bundle)?;
+    // The swap never deletes the bundle first (F5, the audit's exact case):
+    // until the fresh copy sits beside it, the running app's files on disk
+    // are the only install there is, and a rename that cannot land (the
+    // staging archive on another volume, a full disk, a permissions change)
+    // would otherwise leave the machine with no app at all.
+    stage_and_swap(&fresh, &bundle)?;
     // The zip and any unpacking leftovers: nothing else removes them.
     let _ = std::fs::remove_dir_all(&dir);
     hand_off(&bundle.join("Contents/MacOS/editor"), tag);
+    Ok(())
+}
+
+/// Stage the fresh bundle INSIDE the destination's parent directory, then
+/// swap: `bundle → bundle.update-old`, `stage → bundle`, remove the old —
+/// restoring the original when the second rename fails. Every `rename` in
+/// the swap is between two entries of the same directory, so it is
+/// same-filesystem by construction: the `EXDEV` failure a `$TMPDIR` staging
+/// dir can hit (an app living on an external volume) cannot happen, and the
+/// delete that used to precede the move is gone (the old copy is a rename
+/// away until the new one is confirmed in place).
+fn stage_and_swap(fresh: &std::path::Path, bundle: &std::path::Path) -> Result<()> {
+    let parent = bundle.parent().ok_or_else(|| {
+        Error::Platform(format!(
+            "the bundle has no directory to stage in: {}",
+            bundle.display()
+        ))
+    })?;
+    // Nothing has been touched yet: a parent that refuses the write is a
+    // clean refusal, not a half-way install.
+    let probe = parent.join(format!(".editor-update-probe-{}", std::process::id()));
+    std::fs::File::create(&probe)
+        .and_then(|_| std::fs::remove_file(&probe))
+        .map_err(|e| {
+            Error::Platform(format!(
+                "cannot write next to the bundle at {}: install the new build by hand ({e})",
+                bundle.display()
+            ))
+        })?;
+    let name = bundle
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stage = parent.join(format!("{name}.update-new"));
+    let old = parent.join(format!("{name}.update-old"));
+    // Leftovers from a previous interrupted run are the stage's first job.
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::remove_dir_all(&old);
+    if let Err(e) = copy_dir(fresh, &stage) {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(e);
+    }
+    std::fs::rename(bundle, &old).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&stage);
+        Error::Platform(format!(
+            "could not move the old bundle aside ({e}); nothing was replaced and the fresh one is at {}",
+            fresh.display()
+        ))
+    })?;
+    match std::fs::rename(&stage, bundle) {
+        Ok(()) => {
+            // Both renames landed: the old copy and the staging dir have
+            // done their job.
+            let _ = std::fs::remove_dir_all(&old);
+            Ok(())
+        }
+        Err(e) => {
+            // Put the original back (it never left the volume); if even
+            // that fails the old bundle sits at the `.update-old` name and
+            // that fact goes in the message, not in a silent gap.
+            let restored = std::fs::rename(&old, bundle).is_ok();
+            let _ = std::fs::remove_dir_all(&stage);
+            Err(Error::Platform(format!(
+                "replacing the bundle failed after staging ({e}); {}",
+                if restored {
+                    format!(
+                        "the old bundle is back in place; the fresh one is at {}",
+                        fresh.display()
+                    )
+                } else {
+                    format!(
+                        "the original bundle is preserved at {} — rename it back to {}",
+                        old.display(),
+                        bundle.display()
+                    )
+                }
+            )))
+        }
+    }
+}
+
+/// A whole-file-tree copy in std terms: what the bundle needs because the
+/// staging archive may sit on another volume, where `rename` cannot reach.
+/// Symlinks are followed (the copy takes their content); this bundle has
+/// none of its own.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to).map_err(|e| {
+        Error::Platform(format!(
+            "the staged bundle could not be created at {}: {e}",
+            to.display()
+        ))
+    })?;
+    for entry in std::fs::read_dir(from)
+        .map_err(|e| Error::Platform(format!("could not read {}: {e}", from.display())))?
+    {
+        let entry = entry
+            .map_err(|e| Error::Platform(format!("could not read {}: {e}", from.display())))?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            copy_dir(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest).map_err(|e| {
+                Error::Platform(format!(
+                    "copying the fresh bundle failed at {}: {e}",
+                    entry.path().display()
+                ))
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -1716,21 +1837,18 @@ fn win_dialog(text: &str, caption: &str, yes_no: bool) -> bool {
 
 #[cfg(target_os = "macos")]
 fn ask_install(tag: &str) -> bool {
-    // `display dialog` is a stock system surface the way `open` (which routes
-    // links through it above) is — using it asks nothing and installs
-    // nothing by itself; the answer decides. `--question` and friends run a
-    // non-admin path every macOS has.
-    let script = format!(
-        "display dialog \"Editor {tag} is available. Download and install it now?\" with title \"Editor update\" buttons {{\"Not now\",\"Install\"}} default button \"Install\""
-    );
-    match std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-    {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("button returned:\"Install\""),
-        // No osascript (broken install): skip the update this launch.
-        Err(_) => false,
-    }
+    // A real `NSAlert` (F25): the previous path ran `osascript` — a script
+    // host whose panel the app did not own, so it could open behind the
+    // window, the exact shape the Windows path was rewritten to eliminate.
+    // The alert belongs to this process like the Windows dialog does, and
+    // `runModal` blocks this consent thread until the answer lands — the
+    // same contract `win_dialog` has. The first button added returns
+    // `NSModalResponseOK` (1), so the comparison below is the "Install"
+    // answer; `Some(false)` ("Not now" and unwrapping the helper) declines
+    // like any other rung.
+    let question = format!("Editor {tag} is available. Download and install it now?");
+    crate::platform::macos::native_alert("Editor update", &question, "Install", "Not now")
+        == Some(true)
 }
 
 #[cfg(all(
@@ -1748,7 +1866,65 @@ fn ask_install(tag: &str) -> bool {
     if let Some(yes) = ask_with("zenity", &["--question", &question]) {
         return yes;
     }
-    ask_with("kdialog", &["--yesno", &question]).unwrap_or(false)
+    if let Some(yes) = ask_with("kdialog", &["--yesno", &question]) {
+        return yes;
+    }
+    // F25: a kit with neither helper used to end here with a silent `false`
+    // every check — the decline indistinguishable from "nothing was asked".
+    // Asking on `/dev/tty` (with a plain y/N) works wherever the process has
+    // a controlling terminal, which `--update`'s console story already
+    // assumes; and every skip below carries its reason into
+    // `last-update.log` so the invisible failure is gone either way.
+    tty_prompt(&text)
+}
+
+/// The last rung of the Linux consent chain: a plain y/N at the controlling
+/// terminal. Every decline *not* given by a user names its reason in
+/// `last-update.log` instead of being a silent `false`.
+#[cfg(all(
+    any(all(unix, not(target_os = "macos")), editor_check_linux),
+    not(editor_check_win),
+    not(editor_check_macos)
+))]
+fn tty_prompt(question: &str) -> bool {
+    use std::io::{BufRead, Write};
+    let mut tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = log_step(&format!(
+                "consent skipped: no dialog helper is installed and no terminal is attached ({e})"
+            ));
+            return false;
+        }
+    };
+    // Echo stays on (a plain read, no termios games): a yes/no with what is
+    // typed in plain sight needs no privacy. EOF (Ctrl+D) is a decline, not
+    // a crash — the prompt has to end one way or the other.
+    let prompt = format!("{question} [y/N] ");
+    if write!(tty, "{prompt}").and_then(|_| tty.flush()).is_err() {
+        let _ = log_step("consent skipped: the terminal refused the question");
+        return false;
+    }
+    let mut buf = String::new();
+    let read = std::io::BufReader::new(&tty).read_line(&mut buf);
+    match read {
+        Ok(0) => {
+            let _ = log_step("consent skipped: the terminal answered EOF");
+            false
+        }
+        Ok(_) => {
+            let a = buf.trim();
+            a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")
+        }
+        Err(e) => {
+            let _ = log_step(&format!("consent skipped: reading the answer failed: {e}"));
+            false
+        }
+    }
 }
 
 /// Runs a dialog helper and maps its exit code; `None` = helper not installed
@@ -2281,5 +2457,100 @@ mod tests {
             ),
             "an upgrade must not run the outgoing build's uninstall sweep"
         );
+    }
+
+    #[test]
+    fn the_swap_replaces_the_bundle_and_leaves_no_sidecars() {
+        let dir = crate::testing::temp_dir().join("editor_swap_ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = dir.join("Editor.app");
+        let fresh = dir.join("staging").join("Editor.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        std::fs::create_dir_all(fresh.join("Contents/MacOS")).unwrap();
+        std::fs::write(bundle.join("Contents/MacOS/editor"), "old build").unwrap();
+        std::fs::write(fresh.join("Contents/MacOS/editor"), "new build").unwrap();
+        stage_and_swap(&fresh, &bundle).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("Contents/MacOS/editor")).unwrap(),
+            "new build",
+            "the fresh bundle did not land"
+        );
+        assert!(
+            !dir.join("Editor.app.update-old").exists(),
+            "the aside copy was not removed"
+        );
+        assert!(
+            !dir.join("Editor.app.update-new").exists(),
+            "the staging copy was not removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_swap_leaves_the_running_bundle_intact() {
+        // The fresh bundle is not a directory: `copy_dir` fails on the very
+        // first step, before the old bundle is moved aside. The install must
+        // report it, clean the half-written stage, and leave the bundle as it
+        // was — this is the case the old delete-then-rename flattened to
+        // "no app at all".
+        let dir = crate::testing::temp_dir().join("editor_swap_fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = dir.join("Editor.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        std::fs::write(bundle.join("Contents/MacOS/editor"), "old build").unwrap();
+        let fresh = dir.join("not-a-directory");
+        std::fs::write(&fresh, "junk").unwrap();
+        let err = stage_and_swap(&fresh, &bundle).unwrap_err();
+        assert!(
+            err.to_string().contains(&fresh.display().to_string()),
+            "the error must name the fresh source: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("Contents/MacOS/editor")).unwrap(),
+            "old build",
+            "the swap damaged the bundle it failed to replace"
+        );
+        assert!(
+            !dir.join("Editor.app.update-old").exists(),
+            "a sidecar was left behind"
+        );
+        assert!(
+            !dir.join("Editor.app.update-new").exists(),
+            "a half-written stage was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unwritable_parent_refuses_before_anything_is_staged() {
+        // The bundle's parent cannot take the probe (here: it does not even
+        // exist — an unwritable /Applications refusal has the same shape).
+        // The refusal must come from the writability probe, BEFORE `copy_dir`
+        // stages anything: the probe runs first so a plainly impossible
+        // install cannot leave a stage behind, and the fresh bundle stays as
+        // it was, ready for the manual install the error names.
+        let dir = crate::testing::temp_dir().join("editor_swap_noperm");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join("No-such-parent");
+        let bundle = parent.join("Editor.app");
+        let fresh = dir.join("fresh");
+        std::fs::create_dir_all(fresh.join("Contents/MacOS")).unwrap();
+        std::fs::write(fresh.join("Contents/MacOS/editor"), "new build").unwrap();
+        let err = stage_and_swap(&fresh, &bundle).unwrap_err();
+        assert!(
+            err.to_string().contains("by hand"),
+            "the refusal must point at a manual install: {err}"
+        );
+        assert!(
+            !parent.exists(),
+            "the staging copied something behind the probe's back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("Contents/MacOS/editor")).unwrap(),
+            "new build",
+            "the fresh bundle was touched on a refused install"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

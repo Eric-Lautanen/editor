@@ -94,9 +94,79 @@ fn file_in(dir: &Path) -> PathBuf {
 }
 
 /// The file a session is written to *before* it replaces the real one. Same
-/// directory, so the rename that commits it is a same-volume move.
+/// directory, so the rename that commits it is a same-volume move. F18: the
+/// name carries this process's id, because two instances writing at once
+/// used to meet on the one shared scratch file — one truncating the other's
+/// staged bytes before either rename landed, so a mid-write snapshot could
+/// commit. Unique name, no meeting, and the atomic rename still guarantees
+/// every commit is a complete text. (Saves within one process run
+/// sequentially on the same thread, so a pid is where the uniqueness
+/// actually has to live.)
 fn temp_in(dir: &Path) -> PathBuf {
-    dir.join("session.tmp")
+    dir.join(format!("session.tmp.{}", std::process::id()))
+}
+
+/// The single-instance lease (F18): a file that never gets renamed or
+/// rewritten, only locked. Locking the session file itself would not work —
+/// the rename replaces its inode, and a lock on the old inode guards
+/// nothing.
+fn lock_in(dir: &Path) -> PathBuf {
+    dir.join("session.lock")
+}
+
+/// First-instance detection for the launch path (F18), pure std: Rust's
+/// advisory file locks (`File::try_lock`, stable since 1.89) answer instantly,
+/// no FFI, no waiting. `true` = this process now holds the session lease and
+/// is the first Editor on this config dir; `false` = one is already running
+/// (or the filesystem refuses advisory locks — some network shares — in
+/// which case the launch must never be blocked).
+///
+/// The handle is leaked on purpose when it wins: letting it drop releases
+/// the lock a later launch needs to see. A detected second launch keeps the
+/// classic behavior for now — what remains of this finding is argv
+/// forwarding into the running window, which is a socket in
+/// `$XDG_RUNTIME_DIR` (or a D-Bus name) away; see
+/// `platform::forward_to_running`.
+pub fn try_hold_session() -> bool {
+    let Some(dir) = config_dir() else {
+        return false;
+    };
+    hold_lease_at(&dir)
+}
+
+fn hold_lease_at(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    // `truncate(false)`: the lock file's contents are never this process's
+    // business — only its lock is — and a second instance takes a
+    // descriptor on it without cutting the first holder's bytes.
+    let lease = match std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_in(dir))
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    match lease.try_lock() {
+        // The lease is the process's, for its whole run — the open
+        // descriptor keeps the lock on both Windows (LockFileEx) and Unix
+        // (flock). The remaining outcomes are both conservative: an error
+        // means the filesystem refused an advisory lock (some network
+        // shares), and must not block the launch any more than a lock held
+        // by a running instance does — the latter simply falls through to
+        // the classic multiple-window behavior.
+        Ok(()) => {
+            std::mem::forget(lease);
+            true
+        }
+        Err(_) => {
+            drop(lease);
+            false
+        }
+    }
 }
 
 /// Render the settings as the tiny text file format.
@@ -296,6 +366,35 @@ mod tests {
         assert_eq!(s.window, Some((-1920, -40, 1100, 800)));
         assert!(s.maximized);
         assert_eq!(parse(&render(&s)).window, s.window);
+    }
+
+    /// F18, the detection half: the first holder wins, a second holder on
+    /// the same directory is refused — even after the first one, because
+    /// the lease is deliberately held for the winner's whole lifetime.
+    #[test]
+    fn the_session_lease_is_taken_once() {
+        let dir = crate::testing::temp_dir().join("editor_settings_lease");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(hold_lease_at(&dir), "the first instance holds the lease");
+        // A second attempt — in-process on a fresh handle, or by another
+        // process — is refused while the winner's descriptor is open.
+        assert!(!hold_lease_at(&dir), "a second holder is refused");
+    }
+
+    /// F18, the collision half: the scratch name two concurrent instance
+    /// writes used to share is now one this process cannot meet another
+    /// process on.
+    #[test]
+    fn the_scratch_name_is_per_process() {
+        let dir = crate::testing::temp_dir().join("editor_settings_scratchname");
+        assert_eq!(
+            temp_in(&dir)
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            format!("session.tmp.{}", std::process::id()),
+            "two processes writing at once meeting on one scratch file is how a\n            mid-write snapshot committed"
+        );
     }
 
     #[test]

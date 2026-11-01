@@ -40,9 +40,15 @@ fn colour_candidates() -> Vec<PathBuf> {
 
     if cfg!(target_os = "windows") {
         let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+        let fonts = PathBuf::from(dir).join("Fonts");
+        // F19: asked of the directory, not assumed — a shipped name that
+        // differs in case from what this list spells resolves as it lies on
+        // disk, with the constructed path as the last resort.
+        let held = dir_listing(&fonts);
         push(
-            &PathBuf::from(dir)
-                .join("Fonts/seguiemj.ttf")
+            &match_font_name(&held, "seguiemj.ttf")
+                .map(|f| fonts.join(f))
+                .unwrap_or_else(|| fonts.join("seguiemj.ttf"))
                 .to_string_lossy(),
         );
     } else if cfg!(target_os = "macos") {
@@ -71,9 +77,12 @@ fn candidates() -> Vec<PathBuf> {
     let mut push = |p: &str| out.push(PathBuf::from(p));
 
     if cfg!(target_os = "windows") {
-        // `%WINDIR%\Fonts` is where every Windows install keeps these.
+        // `%WINDIR%\Fonts` is where every Windows install keeps these. F19:
+        // the names are resolved against what the directory actually holds
+        // rather than assumed — the constructed list stays the last resort.
         let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
         let fonts = PathBuf::from(dir).join("Fonts");
+        let held = dir_listing(&fonts);
         for name in [
             // Symbols and pictographs, monochrome, ~2.5 MB. Measured to cover
             // emoji codepoints with *better* outlines than Segoe UI Emoji's
@@ -88,7 +97,12 @@ fn candidates() -> Vec<PathBuf> {
             "Nirmala.ttc",
             "YuGothM.ttc",
         ] {
-            push(&fonts.join(name).to_string_lossy());
+            push(
+                &match_font_name(&held, name)
+                    .map(|f| fonts.join(f))
+                    .unwrap_or_else(|| fonts.join(name))
+                    .to_string_lossy(),
+            );
         }
     } else if cfg!(target_os = "macos") {
         for p in [
@@ -118,6 +132,58 @@ fn candidates() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// F19: what a font directory actually holds — the list the wanted
+/// basenames are resolved against (case drift and `.ttf`/`.ttc` shipping
+/// differences lose nothing). A directory we cannot read yields an empty
+/// list and the constructed paths stay the last resort.
+fn dir_listing(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// F19: the file in `held` that IS `want` — Windows font directories are
+/// case-blind, so the comparison is too. `None` sends the caller to the
+/// constructed path it started from.
+fn match_font_name<'a>(held: &'a [String], want: &str) -> Option<&'a str> {
+    held.iter()
+        .find(|f| f.eq_ignore_ascii_case(want))
+        .map(|f| f.as_str())
+}
+
+/// F19 (Linux): fontconfig's codepoint query — its charset values are hex
+/// Unicode codepoints, and one wrong base silently asks for a different
+/// character.
+fn charset_pattern(cp: u32) -> String {
+    format!(":charset={cp:X}")
+}
+
+/// F19 (Linux): where fontconfig says a codepoint actually lives. The
+/// static lists below are Debian/Fedora-shaped prefixes; on Arch,
+/// openSUSE, NixOS and any other layout CJK and emoji render as tofu
+/// there. `fc-match -f %{file} :charset=<cp>` answers for the real system,
+/// including user-installed faces. It always prints *a* file — its best
+/// guess — even when nothing covers, so "no answer" is decided by the
+/// caller's scan, never here. Compiled on every target so the runtime
+/// gate stays a plain `cfg!` branch: it only ever runs on Linux.
+fn fc_match_file(cp: u32) -> Option<PathBuf> {
+    let out = std::process::Command::new("fc-match")
+        .arg("-f")
+        .arg("%{file}")
+        .arg(charset_pattern(cp))
+        .output()
+        .ok()?;
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(path)
 }
 
 /// Codepoints whose default presentation is colour emoji, per UTS #51.
@@ -372,6 +438,20 @@ impl Chain {
             }
         }
 
+        // F19 (Linux): before the hardcoded prefixes, ask the system's own
+        // fontconfig where this codepoint lives. The static lists below are
+        // kept exactly as the audit scopes them — the last resort — and
+        // their walk still starts at its own cursor, so an fc-match load        // does not disturb the "loaded N of M candidates" bookkeeping. An        // fc-match answer that does not really carry the codepoint (its        // best-guess behaviour) fails the scan and falls through here.
+        if cfg!(target_os = "linux") {
+            if let Some(path) = fc_match_file(cp) {
+                if let Some(first) = self.load(&path) {
+                    if let Some(hit) = self.scan(first, cp, want) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+
         let files = candidates();
         while self.next < files.len() {
             let path = files[self.next].clone();
@@ -509,6 +589,33 @@ mod tests {
             (parsed, slots),
             "a memoized lookup parsed more members"
         );
+    }
+
+    /// The fc-match query must be hex — fontconfig reads its charset
+    /// values as hex Unicode codepoints, and one wrong base silently asks
+    /// for a different character (F19, Linux half).
+    #[test]
+    fn the_fc_charset_query_is_hex() {
+        assert_eq!(charset_pattern(0x4E2D), ":charset=4E2D");
+        assert_eq!(charset_pattern(0x1F600), ":charset=1F600");
+        assert_eq!(charset_pattern(0x41), ":charset=41");
+    }
+
+    /// A Windows basename resolves against what the Fonts directory
+    /// actually holds — case-blind — and a miss falls back to the
+    /// constructed path (F19, Windows half).
+    #[test]
+    fn a_windows_basename_resolves_against_the_fonts_directory() {
+        let held = vec!["SEGUISYM.TTF".to_string(), "msyh.ttf".to_string()];
+        assert_eq!(
+            match_font_name(&held, "seguisym.ttf"),
+            Some("SEGUISYM.TTF"),
+            "case must not separate the name from the disk"
+        );
+        assert_eq!(match_font_name(&held, "YuGothM.ttc"), None);
+        // And an unreadable directory is the literal path, exactly as
+        // before: the constructed list stays the last resort.
+        assert_eq!(match_font_name(&[], "seguisym.ttf"), None);
     }
 
     #[test]

@@ -44,6 +44,10 @@ pub(super) fn size_error(len: u64) -> Option<String> {
 impl Tab {
     pub(super) fn untitled() -> Self {
         Self {
+            // New text is UTF-8/LF; a load records what it read instead
+            // (see `load::Encoding`/`load::Eol`, audit F4/F9).
+            encoding: crate::load::Encoding::Utf8,
+            eol: crate::load::Eol::Lf,
             path: None,
             kind: FileKind::PlainText,
             buffer: Buffer::from_text(""),
@@ -94,7 +98,11 @@ impl Tab {
         let kind = FileKind::from_path(&p);
         let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
         match crate::load::load(&p)? {
-            crate::load::Loaded::Whole { buffer, saved_text } => {
+            crate::load::Loaded::Whole {
+                buffer,
+                saved_text,
+                info,
+            } => {
                 let saved_lines = saved_text.split("\n").count();
                 Ok(Self {
                     kind,
@@ -104,6 +112,10 @@ impl Tab {
                     edited_from: usize::MAX,
                     mtime,
                     path: Some(p),
+                    // What the bytes were: a save re-encodes in this kind
+                    // and refuses for `Encoding::Unknown` (audit F4/F9).
+                    encoding: info.encoding,
+                    eol: info.eol,
                     streamer: None,
                     ..Self::untitled()
                 })
@@ -291,6 +303,12 @@ pub struct Tab {
     pub h_max: f32,
     /// File modification time as last seen or written (reload detection).
     pub mtime: Option<std::time::SystemTime>,
+    /// What the file's bytes were when opened: encoding (possibly refused
+    /// for a lossy/16-bit stream) and the line-ending convention. A save
+    /// re-encodes the the buffer text back in this kind (audit F4/F9).
+    pub encoding: crate::load::Encoding,
+    /// The line-ending convention `App::save` re-applies on write.
+    pub eol: crate::load::Eol,
     /// Virtual-layout plan for a big JSONL (record tops, heights, id bases).
     /// Empty for every other kind — small JSONLs take the plain layout.
     pub plan: layout::json_tree::Plan,

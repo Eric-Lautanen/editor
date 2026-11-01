@@ -157,6 +157,17 @@ pub const VIRTUAL_UNITS: usize = 20_000;
 /// half of line-based text is a few milliseconds' work.
 const PREVIEW_PREFIX_LINES: usize = 1_200;
 
+/// Which pane the most recent selection press landed in. With both halves
+/// live in Split, the highlighted pane owns `Ctrl`+`C` — the read-only pane's
+/// pane is not preferred just because it is checked first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SelPane {
+    /// A read-only pane: Preview mode's viewport, Split's left half.
+    Reader,
+    /// The text pane: Edit's viewport, Split's right half.
+    Editor,
+}
+
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active: usize,
@@ -256,6 +267,13 @@ pub struct App {
     /// selection, mirroring [`TouchSel`] for the editor pane.
     #[cfg(any(target_os = "windows", test))]
     preview_touch: Option<PreviewTouch>,
+    /// Which pane a selection was last gestured in, so the highlighted pane
+    /// — not whichever one's text is checked first — owns a copy: `Ctrl`+`C`,
+    /// the status bar's Copy button and the menu's Copy all resolve from it,
+    /// falling back to the other pane when it has nothing selected. Reader
+    /// presses point the reader; editor presses (caret placements included)
+    /// and every keyboard move in the text pane point the editor.
+    sel_pane: SelPane,
     /// The address under the pointer, shown in the status bar after the Copy
     /// button. Kept as the string, not a bool: the bar needs the value.
     hover_link: Option<String>,
@@ -394,6 +412,7 @@ impl App {
             preview_drag: false,
             #[cfg(any(target_os = "windows", test))]
             preview_touch: None,
+            sel_pane: SelPane::Editor,
             hover_link: None,
             last_mouse: (0.0, 0.0),
             theme_manual: false,
@@ -449,6 +468,17 @@ impl App {
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.clear_preview_sel();
+        // A mode switch is itself a highlight change: the pane that went
+        // away cannot be the highlighted one, so the incoming mode points
+        // its own pane (Split shows both, and the next press — not the
+        // direction the switch was made from — decides).
+        if mode != Mode::Split {
+            self.sel_pane = if mode == Mode::Preview {
+                SelPane::Reader
+            } else {
+                SelPane::Editor
+            };
+        }
         self.layout_dirty = true;
     }
 
@@ -590,7 +620,7 @@ impl App {
     /// input carries its own position (a finger's tracked contact), falling
     /// back to the tracked mouse pointer (a horizontal wheel / tilt) or to
     /// the editor (no pointer at all — keyboard-driven).
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(any(target_os = "windows", target_os = "macos", test))]
     fn pan_horizontal_direct_at(&mut self, dx: f32, at: Option<(f32, f32)>) {
         if self.mode != Mode::Preview && self.over_editor_pane(at) {
             self.set_h_scroll(self.h_scroll - dx);
@@ -599,9 +629,9 @@ impl App {
 
     /// Whether the locate point `at` (falling back to the tracked pointer)
     /// sits over the editor pane, in whichever mode is showing one.
-    /// Gated with its only caller: outside Windows (and the tests) nothing
-    /// locates a horizontal gesture, and dead helpers fail clippy there.
-    #[cfg(any(target_os = "windows", test))]
+    /// Gated with its callers: where nothing locates a horizontal gesture
+    /// (Linux), the dead helper would fail clippy.
+    #[cfg(any(target_os = "windows", target_os = "macos", test))]
     fn over_editor_pane(&self, at: Option<(f32, f32)>) -> bool {
         match at {
             Some((x, y)) => self.editor_area().contains(Point { x, y }),
@@ -645,7 +675,7 @@ impl App {
     /// belongs to). The whole-length gate: Preview has no horizontal
     /// scroll of its own, and in Split the *pointer* decides which half a
     /// horizontal gesture drives, not the mode.
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(any(target_os = "windows", target_os = "macos", test))]
     fn pointer_or_default_over_editor(&self) -> bool {
         if self.last_mouse == (0.0, 0.0) {
             return true;
@@ -1505,10 +1535,25 @@ impl App {
             Key::Tab if self.find.is_some() && !mods.ctrl && !mods.alt => {}
             Key::F(3) if self.find.is_some() => self.find_step(mods.shift, host),
             // -- editing chords (need the editor pane) -----------------------
-            Key::Char('a') if mods.ctrl && self.mode != Mode::Preview => {
-                let tab = &mut self.tabs[self.active];
-                tab.editor.select_all(&tab.buffer);
-                self.follow_caret();
+            Key::Char('a') if mods.ctrl => {
+                if self.mode == Mode::Preview {
+                    // Select-all in the reader takes the whole row range —
+                    // the highlight the painter draws for a drag edge to
+                    // edge. A word selection cannot coexist with one, so it
+                    // goes. A banded pane (CSV always, a huge Markdown, JSON
+                    // or JSONL) keeps no row list at all — it paints only the
+                    // units on screen — so there is nothing to highlight and
+                    // the copy means the file: the range still records the
+                    // gesture, and `preview_selection_source` answers with the
+                    // whole text when there are no rows behind it.
+                    self.preview_word = None;
+                    self.preview_sel = Some((0, self.preview_rows.len().saturating_sub(1)));
+                    host.request_redraw();
+                } else {
+                    let tab = &mut self.tabs[self.active];
+                    tab.editor.select_all(&tab.buffer);
+                    self.follow_caret();
+                }
             }
             Key::Char('z') if mods.ctrl && self.mode != Mode::Preview => {
                 let tab = &mut self.tabs[self.active];
@@ -1534,10 +1579,7 @@ impl App {
                 }
             }
             Key::Char('c') if mods.ctrl => {
-                if let Some(text) = self.preview_selection_text() {
-                    host.clipboard_set(&text);
-                    self.copy_done = true;
-                } else if let Some(text) = self.editor.copy(&self.buffer) {
+                if let Some(text) = self.highlighted_pane_copy() {
                     host.clipboard_set(&text);
                     self.copy_done = true;
                 }
@@ -1712,10 +1754,7 @@ impl App {
             // exists while there is a selection to copy.
             if let Some(cb) = &self.copy_btn {
                 if cb.rect.contains(p) {
-                    if let Some(text) = self
-                        .preview_selection_text()
-                        .or_else(|| self.editor.copy(&self.buffer))
-                    {
+                    if let Some(text) = self.highlighted_pane_copy() {
                         host.clipboard_set(&text);
                         // The button itself says so — it reads "Copied"
                         // until the selection changes.
@@ -1836,6 +1875,9 @@ impl App {
                 host.request_redraw();
                 return;
             }
+            // A press on the text pane is a text-pane gesture, even one that
+            // only places the caret: the highlighted pane owns a copy.
+            self.sel_pane = SelPane::Editor;
             let ctx = self.ctx();
             let pos =
                 self.editor
@@ -1877,6 +1919,9 @@ impl App {
         // turns into a drag still selects (and a press that does not stays a
         // click, leaving nothing selected).
         if !self.preview_click(x, y, host) {
+            // Same rule as the text pane above: a press here is a reader
+            // gesture, so the reader is the highlighted pane.
+            self.sel_pane = SelPane::Reader;
             let point = self.toggle_point(x, y);
             let row = point.and_then(|(_, dy)| self.preview.row_at(&self.preview_rows, dy));
             let clicks = self.click_seq(x, y);
@@ -1956,7 +2001,7 @@ impl App {
             menu::Action::Header => {}
             menu::Action::CopyAll => host.clipboard_set(&self.buffer.text()),
             menu::Action::Copy => {
-                if let Some(text) = self.editor.copy(&self.buffer) {
+                if let Some(text) = self.highlighted_pane_copy() {
                     host.clipboard_set(&text);
                 }
             }
@@ -2152,6 +2197,8 @@ impl App {
     #[cfg(any(target_os = "windows", test))]
     fn arm_touch_sel(&mut self, x: f32, y: f32) {
         if let Some(anchor) = self.editor.selection().map(|(a, _)| a) {
+            // The finger's selection is a text-pane gesture like any other.
+            self.sel_pane = SelPane::Editor;
             self.touch_sel = Some(TouchSel {
                 anchor,
                 pointer: (x, y),
@@ -2164,6 +2211,8 @@ impl App {
     /// selects rows from `anchor` instead of scrolling.
     #[cfg(any(target_os = "windows", test))]
     fn arm_preview_touch(&mut self, x: f32, y: f32, anchor: usize) {
+        // The finger's selection is a reader gesture like any other.
+        self.sel_pane = SelPane::Reader;
         self.preview_touch = Some(PreviewTouch {
             anchor,
             pointer: (x, y),
@@ -2607,9 +2656,73 @@ impl App {
         }
     }
 
-    /// Text of the preview selection, if any: a double-clicked word, or else
-    /// the row range (anchor..caret, ordered).
-    fn preview_selection_text(&self) -> Option<String> {
+    /// The clipboard text the copy commands mean: from the pane selection was
+    /// last gestured in — the highlighted pane owns `Ctrl`+`C` — falling back
+    /// to the other pane when the owner has nothing selected (its last
+    /// press was a plain caret placement, say). The old calculus tried the
+    /// reader first on every copy, so in Split a stale preview drag
+    /// silently beat a word just double-clicked in the text pane.
+    fn highlighted_pane_copy(&self) -> Option<String> {
+        let reader = self.preview_selection_source();
+        let editor = self.editor.copy(&self.buffer);
+        match self.sel_pane {
+            SelPane::Reader => reader.or(editor),
+            SelPane::Editor => editor.or(reader),
+        }
+    }
+
+    /// Whether the reader pane has a selection. The Copy button asks this every
+    /// frame, so it stays a field test — building the source index is the
+    /// copy's own work, not a paint's.
+    fn preview_has_selection(&self) -> bool {
+        self.preview_word.is_some() || self.preview_sel.is_some()
+    }
+
+    /// What copying in Preview puts on the clipboard: the file's own text for
+    /// the source lines the selected rows were rendered from, never the
+    /// rendering (audit F27 — `**bold**`, not `bold`).
+    ///
+    /// A double-clicked word takes the whole source line it sits on: the
+    /// renderer keeps no mapping from a drawn word back to its source spelling,
+    /// and a line is lossless where a guessed token is not. Selecting every row
+    /// copies the whole file — blank lines, trailing newline and line ending
+    /// included. Where a row has no source line behind it (a placeholder card,
+    /// an error banner, a pane whose plan could not be rebuilt) the rendered
+    /// text stands, which is all that exists for it.
+    fn preview_selection_source(&self) -> Option<String> {
+        let lines = self.preview_row_lines();
+        if let Some(w) = &self.preview_word {
+            return Some(match lines.get(w.row) {
+                Some(&line) if line != preview::NO_LINE => self.source_line_text(line),
+                _ => w.text.clone(),
+            });
+        }
+        let (a, b) = self.preview_sel?;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        // No rows behind the gesture (a banded pane), or rows that cover only
+        // the band on screen while the rest of the document is still being
+        // laid out: what was selected is the document, so the copy is all of
+        // it. A partial band's rows would otherwise copy a screenful and call
+        // it "everything".
+        if lines.is_empty() || self.tabs[self.active].streamer.is_some() || self.preview_pending() {
+            return Some(self.whole_source_text());
+        }
+        let hi = hi.min(lines.len() - 1);
+        if lo == 0 && hi == lines.len() - 1 {
+            return Some(self.whole_source_text());
+        }
+        let sel = &lines[lo..=hi];
+        let first = sel.iter().copied().filter(|l| *l != preview::NO_LINE).min();
+        let last = sel.iter().copied().filter(|l| *l != preview::NO_LINE).max();
+        match (first, last) {
+            (Some(first), Some(last)) => Some(self.source_range_text(first, last)),
+            _ => self.rendered_selection_text(),
+        }
+    }
+
+    /// The rows' drawn text: what Preview copied before the source index, kept
+    /// for the rows that have no source behind them.
+    fn rendered_selection_text(&self) -> Option<String> {
         if let Some(w) = &self.preview_word {
             return Some(w.text.clone());
         }
@@ -2626,6 +2739,48 @@ impl App {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+
+    /// One source line, as the file has it.
+    fn source_line_text(&self, line: u32) -> String {
+        let tab = &self.tabs[self.active];
+        match usize::try_from(line)
+            .ok()
+            .filter(|i| *i < tab.buffer.line_count())
+        {
+            Some(i) => tab.buffer.line(i).to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// A contiguous run of source lines, joined with the tab's own line ending,
+    /// so a copy pastes back into the file it came from byte for byte.
+    fn source_range_text(&self, first: u32, last: u32) -> String {
+        let tab = &self.tabs[self.active];
+        let sep = match tab.eol {
+            crate::load::Eol::Crlf => "\r\n",
+            _ => "\n",
+        };
+        let mut out = String::new();
+        for line in first..=last {
+            if line > first {
+                out.push_str(sep);
+            }
+            out.push_str(&self.source_line_text(line));
+        }
+        out
+    }
+
+    /// The whole file's text with its own line endings — what select-all in
+    /// Preview copies. The buffer holds LF-joined lines, so the file's
+    /// convention is re-applied here exactly as a save would.
+    fn whole_source_text(&self) -> String {
+        let tab = &self.tabs[self.active];
+        let text = tab.buffer.text();
+        match tab.eol {
+            crate::load::Eol::Crlf => text.replace('\n', "\r\n"),
+            _ => text,
+        }
     }
 
     /// Paint the preview selection over a preview pane: one word's span, or
@@ -2704,8 +2859,21 @@ impl App {
                 p
             }
         };
+        // F4/F9: the write is the file's own bytes, not the buffer's
+        // normalized form — re-apply the tab's line-ending convention and
+        // re-encode in the tab's kind, and refuse (loudly, in the status
+        // bar) when that cannot be faithful. `saved_text`, the dirty
+        // anchor, stays the decoded text: for `same_lines` it is already
+        // the right shape.
+        let tab = &self.tabs[self.active];
         let text = self.buffer.text();
-        match std::fs::write(&path, &text) {
+        let Some(bytes) = crate::load::encode(&text, tab.eol, tab.encoding) else {
+            self.status_extra =
+                "save refused: this file's encoding cannot be written back faithfully".into();
+            host.request_redraw();
+            return;
+        };
+        match std::fs::write(&path, &bytes) {
             Ok(()) => {
                 self.mark_saved(&text);
                 self.buffer.dirty = false;
@@ -2724,20 +2892,30 @@ impl App {
         let Some(path) = self.path.clone() else {
             return;
         };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                self.buffer = Buffer::from_text(&text);
+        match crate::load::load_with(&path, usize::MAX, usize::MAX) {
+            Ok(crate::load::Loaded::Whole {
+                buffer,
+                saved_text,
+                info,
+            }) => {
+                self.buffer = buffer;
                 // Wholesale replace: the per-line log tally is wordless
                 // about the new lines until its next edit re-seeds it.
                 self.log_tally = None;
-                let saved = self.buffer.text();
-                self.mark_saved(&saved);
+                self.mark_saved(&saved_text);
+                // The tab's save record comes from the same load: the file
+                // may have changed encoding on disk while it was open.
+                self.tabs[self.active].encoding = info.encoding;
+                self.tabs[self.active].eol = info.eol;
                 self.editor.caret = self.buffer.clamp(self.editor.caret);
                 self.editor.anchor = None;
                 self.clear_preview_sel();
                 self.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 self.status_extra = "reloaded".into();
                 self.layout_dirty = true;
+            }
+            Ok(crate::load::Loaded::Streaming { .. }) => {
+                unreachable!("reload uses a head budget no file can exceed, so it never streams")
             }
             Err(e) => self.status_extra = format!("reload failed: {e}"),
         }
@@ -2773,6 +2951,10 @@ impl App {
         if self.mode == Mode::Preview {
             return;
         }
+        // A caret that moved is keyboard work in the text pane: arrows,
+        // Home/End, select-all. That is the pane the user is acting on, so
+        // like an editor press it points a copy there.
+        self.sel_pane = SelPane::Editor;
         self.poke_caret();
         let viewport_w = self.editor_area().w;
         let ctx = self.ctx();
@@ -3346,6 +3528,33 @@ fn extension_of(path: Option<&std::path::Path>) -> String {
         .to_ascii_lowercase()
 }
 
+/// The unit a document-space `y` falls in, among slot-shaped units (a JSON
+/// node, a JSONL record): the last slot that starts at or above `y`. A slot
+/// inside a collapsed subtree carries no height and paints nothing, so it is
+/// skipped — the row on screen belongs to the folded node above it.
+fn slot_at<T>(
+    slots: &[T],
+    y: f32,
+    top: impl Fn(&T) -> f32,
+    height: impl Fn(&T) -> f32,
+) -> Option<usize> {
+    let mut at = slots.partition_point(|s| top(s) <= y).checked_sub(1)?;
+    while height(&slots[at]) <= 0.0 && at > 0 {
+        at -= 1;
+    }
+    Some(at)
+}
+
+/// The 0-based source line a byte offset sits on. JSON node spans are byte
+/// ranges, and the buffer's text is the document they were parsed from.
+fn line_of_byte(text: &str, byte: usize) -> u32 {
+    let end = byte.min(text.len());
+    text.as_bytes()[..end]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count() as u32
+}
+
 /// The tint a line-based pane uses, or `None` for a kind with a renderer of
 /// its own. Plain text is a line pane too: same grid, no tint. This mapping is
 /// what makes the line family closed: a new text kind either names a tint here
@@ -3591,9 +3800,29 @@ impl Handler for App {
                 }
                 host.request_redraw();
             }
-            Event::Scroll { dx, dy } => {
-                self.pan_horizontal(dx, host);
-                self.scroll_input(-dy, host);
+            Event::Scroll { dx, dy, precise } => {
+                if precise {
+                    // F13: a precision touchpad's deltas are applied the instant
+                    // they land, on both axes, and never accumulate a glide — the
+                    // pad is still under the finger, the deltas keep arriving, and
+                    // after the lift its own momentum events carry on the ride, so
+                    // an app-side glide here would compete with the pad's and
+                    // double the momentum. A zero-delta precise event (the pad's
+                    // phase-began, forward-mapped) is still routed through here:
+                    // the direct path is where a glide in flight is cancelled, so
+                    // a finger laid on the glass owns a running wheel ride.
+                    self.scroll_direct(-dy, host);
+                    // The horizontal half splits on the pane the deltas drive;
+                    // finds that helper on the platforms that can ever send
+                    // precise deltas. X11's is always false, so Linux carries
+                    // the shared `Scroll` arm without it.
+                    #[cfg(any(target_os = "windows", target_os = "macos", test))]
+                    self.pan_horizontal_direct_at(dx, None);
+                } else {
+                    // A discrete wheel: notches glide into one ride.
+                    self.pan_horizontal(dx, host);
+                    self.scroll_input(-dy, host);
+                }
             }
             #[cfg(any(target_os = "windows", test))]
             Event::Pan { dx, dy, x, y } => {

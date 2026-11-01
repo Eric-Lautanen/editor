@@ -37,7 +37,14 @@
 //! escaped for the one rung that is a shell, and [`trusted`] refuses any URL
 //! that is not HTTPS on GitHub's release hosts — so a compromised or spoofed
 //! API response cannot turn a fetch into a local file read or a plaintext
-//! download.
+//! download. The curl rungs pin that claim harder than it was first written:
+//! `--proto/--proto-redir =https --max-redirs 3` keeps even `-L` redirects on
+//! https (F17). The wget and python rungs still follow redirects to hostname
+//! and scheme with no equivalent switch the audit notes no rewrite for —
+//! there is no portable redirect pin — so the trust anchor remains the
+//! initial TLS request to the GitHub API: whoever injects a response has
+//! already broken that TLS, and then they hold the session keys and could
+//! redirect regardless.
 
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -130,6 +137,30 @@ fn rungs(url: &str, out: &Path, timeout: u32) -> Vec<Rung> {
     }
 }
 
+/// The curl argv both curl rungs share. F17: bare `-L` follows redirects to
+/// any host and any scheme, so the URL `trusted()` pins said less about the
+/// transfer than the module comment claimed. The audit's flags pin the whole
+/// redirect chain on https with a small hop count — `=https` (not bare
+/// `https`) because the bare form would refuse the initial URL too.
+fn curl_args(timeout: u32, out: &str, ua: &str) -> Vec<String> {
+    vec![
+        "-sS".into(),
+        "-m".into(),
+        timeout.to_string(),
+        "-L".into(),
+        "--proto".into(),
+        "=https".into(),
+        "--proto-redir".into(),
+        "=https".into(),
+        "--max-redirs".into(),
+        "3".into(),
+        "-H".into(),
+        format!("User-Agent: {ua}"),
+        "-o".into(),
+        out.to_string(),
+    ]
+}
+
 fn helpers(url: &str, out: &Path, timeout: u32) -> Vec<Helper> {
     let out = out.display().to_string();
     let ua = user_agent();
@@ -140,17 +171,15 @@ fn helpers(url: &str, out: &Path, timeout: u32) -> Vec<Helper> {
         v.push(Helper {
             name: "curl",
             program: "curl.exe",
-            args: vec![
-                "-sS".into(),
-                "-m".into(),
-                timeout.to_string(),
-                "-L".into(),
-                "-H".into(),
-                format!("User-Agent: {ua}"),
-                "-o".into(),
-                out.clone(),
-                url.into(),
-            ],
+            // F17's redirect pins live in `curl_args` with the Unix curl's
+            // — one code path, so a pin lost there is lost in both rungs,
+            // and the test below covers both hosts. The URL is the operand
+            // it ends with.
+            args: {
+                let mut args = curl_args(timeout, &out, &ua);
+                args.push(url.into());
+                args
+            },
         });
         // The only Windows helper, and the fallback for an image where WinINet
         // is unavailable. Deliberately not PowerShell (a script host asked to
@@ -160,17 +189,11 @@ fn helpers(url: &str, out: &Path, timeout: u32) -> Vec<Helper> {
         v.push(Helper {
             name: "curl",
             program: "curl",
-            args: vec![
-                "-sS".into(),
-                "-m".into(),
-                timeout.to_string(),
-                "-L".into(),
-                "-H".into(),
-                format!("User-Agent: {ua}"),
-                "-o".into(),
-                out.clone(),
-                url.into(),
-            ],
+            args: {
+                let mut args = curl_args(timeout, &out, &ua);
+                args.push(url.into());
+                args
+            },
         });
         // GNU wget takes the header; busybox's does not, hence the second
         // spelling (busybox images are the ones with no curl).
@@ -448,6 +471,51 @@ mod tests {
     }
 
     #[test]
+    fn curl_rungs_keep_redirects_on_https() {
+        // F17: both curl rungs build on the same `curl_args`, and this pins
+        // it — whatever host the suite runs on, every curl helper must
+        // follow redirects only on https, only a few hops.
+        for helper in helpers("https://github.com/x/y.msi", Path::new("/tmp/out.bin"), 30) {
+            if !helper.program.contains("curl") {
+                continue; // wget/busybox have no equivalent switch (see the module comment)
+            }
+            let value_after = |flag: &str| {
+                helper
+                    .args
+                    .iter()
+                    .position(|s| s == flag)
+                    .map(|at| helper.args[at + 1].as_str())
+            };
+            assert_eq!(
+                value_after("--proto"),
+                Some("=https"),
+                "{}: --proto must be =https: {:?}",
+                helper.name,
+                helper.args
+            );
+            assert_eq!(
+                value_after("--proto-redir"),
+                Some("=https"),
+                "{}: --proto-redir must be =https: {:?}",
+                helper.name,
+                helper.args
+            );
+            assert_eq!(
+                value_after("--max-redirs"),
+                Some("3"),
+                "{}: --max-redirs must be 3: {:?}",
+                helper.name,
+                helper.args
+            );
+            assert!(
+                helper.args.iter().any(|s| s == "-L"),
+                "{} still follows redirects",
+                helper.name
+            );
+        }
+    }
+
+    #[test]
     fn untrusted_urls_never_reach_a_rung() {
         let e = get_text("https://evil.example/x", 5)
             .unwrap_err()
@@ -562,8 +630,16 @@ mod tests {
                 }
                 Err(e) => {
                     let msg = e.to_string();
+                    // F17: the loopback fixture is plain HTTP, and the curl
+                    // pins refuse exactly that — a refusal is the pin proving
+                    // itself (curl reports protocol violations with exit 1),
+                    // not a rung that is missing or blocked.
+                    let refused_by_pin =
+                        rung.name().contains("curl") && msg.contains("exit code: 1");
                     assert!(
-                        msg.contains("is not installed") || msg.contains("is blocked here"),
+                        refused_by_pin
+                            || msg.contains("is not installed")
+                            || msg.contains("is blocked here"),
                         "{} failed: {msg}",
                         rung.name()
                     );

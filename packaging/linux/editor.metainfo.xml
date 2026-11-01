@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata (F23): without it, Editor never appears in GNOME
+     Software or KDE Discover — only in the applications menu via its
+     .desktop entry. Mirrors `packaging/linux/editor.desktop` (id = the
+     bundle id macOS already uses, launchable = the desktop file install.sh
+     writes); keep the two in step when descriptions change. -->
+<component type="desktop-application">
+  <id>dev.editor.app</id>
+  <name>Editor</name>
+  <summary>Read and lightly edit Markdown, JSON, CSV, configs, logs and code</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <url type="homepage">https://github.com/Eric-Lautanen/editor</url>
+  <launchable type="desktop-id">editor.desktop</launchable>
+  <provides>
+    <mimetypes>
+      <mimetype>text/markdown</mimetype>
+      <mimetype>application/json</mimetype>
+      <mimetype>application/x-ndjson</mimetype>
+      <mimetype>text/plain</mimetype>
+      <mimetype>text/csv</mimetype>
+      <mimetype>application/yaml</mimetype>
+      <mimetype>text/x-yaml</mimetype>
+      <mimetype>application/toml</mimetype>
+      <mimetype>text/x-editor-dotfile</mimetype>
+    </mimetypes>
+  </provides>
+  <description>
+    <p>A small native viewer and editor for text files: Markdown rendered in a
+    preview pane, JSON as a foldable tree, CSV as aligned columns, and plain
+    config/log/code files in a reading column with light editing. Opens files
+    fast, remembers the session, and updates itself.</p>
+    <p>Runs everywhere the README's download table claims: Windows (per-user
+    MSI), Linux under X11/XWayland, macOS 12+ as a universal bundle.</p>
+  </description>
+</component>

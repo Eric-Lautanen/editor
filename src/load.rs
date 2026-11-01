@@ -29,7 +29,7 @@ use crate::core::buffer::Buffer;
 use std::io::Read;
 use std::path::Path;
 
-/// How much of a big file is shown before the window opens: ~10k rows at
+/// How many stream lines are shown before the window opens: ~10k rows at
 /// the ~100-byte lines these documents have. The user's first screen lives
 /// here with room to spare.
 pub const STREAM_HEAD_BYTES: usize = 1_000_000;
@@ -45,10 +45,217 @@ pub const STREAM_CHUNK_BYTES: usize = 1_000_000;
 pub enum Loaded {
     /// The whole file is in the buffer; nothing else will arrive. The old
     /// synchronous-shaped contract.
-    Whole { buffer: Buffer, saved_text: String },
+    Whole {
+        buffer: Buffer,
+        saved_text: String,
+        /// What the bytes were (F4/F9): the tab records this so a save can
+        /// put the file back in kind, and so a save that cannot is refused.
+        info: LoadInfo,
+    },
     /// The head is shown (`buffer`); the tail streams in on ticks until
     /// [`Loader::drain`] reports done and the caller seals the tab.
     Streaming { buffer: Buffer, loader: Box<Loader> },
+}
+
+/// The encoding a file's bytes were in, decided at open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    /// UTF-8, no BOM. The default round trip: bytes in, bytes out.
+    Utf8,
+    /// UTF-8 with an `EF BB BF` BOM: stripped before the buffer sees it,
+    /// re-prepended on save, so the file keeps its BOM.
+    Utf8Bom,
+    /// UTF-16 little-endian with an `FF FE` BOM — Notepad's "Unicode", and
+    /// what PowerShell 5.1's `>` redirection writes by default.
+    Utf16Le,
+    /// UTF-16 big-endian with an `FE FF` BOM.
+    Utf16Be,
+    /// Anything else: bytes that are not valid UTF-8 and carry none of the
+    /// BOMs (CP1252, Latin-1, Shift-JIS...) decode lossily to U+FFFD. The
+    /// buffer shows that loss, but a save which "succeeds" would write the
+    /// damage over the original file's bytes forever — so saving such a tab
+    /// is refused instead (`Tab::encoding` carries this, `App::save` reads
+    /// it).
+    Unknown,
+}
+
+/// How a file's lines were ended, decided at open and re-applied on save
+/// (F9). The buffer itself is EOL-agnostic (`from_text` strips `\r`), so
+/// this is the only place the convention lives; the dirty compare already
+/// tolerates either (`same_lines` trims `\r` on the saved side).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Eol {
+    Lf,
+    Crlf,
+    /// Both conventions in one file: no single re-encoding is faithful, so
+    /// a save keeps the normalized LF form rather than guessing.
+    Mixed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadInfo {
+    pub encoding: Encoding,
+    pub eol: Eol,
+}
+
+/// Decode a whole file's bytes: BOM sniffing first (`FF FE`/`FE FF` — both
+/// are invalid UTF-8 starts, so the order can never misfire), UTF-16 pair
+/// decode for the 16-bit types, then UTF-8 strict for the honest answer
+/// about "not UTF-8".
+pub fn decode(bytes: &[u8]) -> (String, Encoding) {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode16(rest, true, Encoding::Utf16Le);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode16(rest, false, Encoding::Utf16Be);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        let (text, enc) = utf8(rest);
+        return (
+            text,
+            if enc == Encoding::Utf8 {
+                Encoding::Utf8Bom
+            } else {
+                enc
+            },
+        );
+    }
+    utf8(bytes)
+}
+
+/// One 16-bit decoding path. A file left with an odd number of remaining
+/// bytes (a cut, a repair) or containing lone surrogates is not
+/// reproducible: decoded lossily for display, but recorded
+/// [`Encoding::Unknown`] so a save cannot write the mangled rounding back.
+fn decode16(rest: &[u8], le: bool, enc: Encoding) -> (String, Encoding) {
+    let pairs = |bytes: &[u8]| -> Vec<u16> {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| {
+                if le {
+                    u16::from_le_bytes(p)
+                } else {
+                    u16::from_be_bytes(p)
+                }
+            })
+            .collect()
+    };
+    if !rest.len().is_multiple_of(2) {
+        // `as_chunks` keeps whole pairs only, so the odd tail is dropped
+        // from the decode: showing that loss is fine, restoring it is not.
+        return (String::from_utf16_lossy(&pairs(rest)), Encoding::Unknown);
+    }
+    let units = pairs(rest);
+    match String::from_utf16(&units) {
+        Ok(text) => (text, enc),
+        // Lone surrogates decode lossily below — those cannot be
+        // re-encoded, either.
+        Err(_) => (String::from_utf16_lossy(&units), Encoding::Unknown),
+    }
+}
+
+/// Strict-or-lossy UTF-8 decode with the honest encoding flag.
+fn utf8(bytes: &[u8]) -> (String, Encoding) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => (s.to_string(), Encoding::Utf8),
+        Err(_) => (
+            String::from_utf8_lossy(bytes).into_owned(),
+            Encoding::Unknown,
+        ),
+    }
+}
+
+/// The BOM at a byte sequence's front, if there is one; the streamed
+/// load's open consults this on its first head bytes.
+fn sniff_bom(bytes: &[u8]) -> Bom {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        Bom::Utf16
+    } else if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Bom::Utf8
+    } else {
+        Bom::None
+    }
+}
+
+/// Count the file's line endings: CRLF alone is `Crlf`; bare `\n` alongside
+/// it is `Mixed`; neither convention present reads as `Lf`. A streamed
+/// load counts this over the full text once, at the seal (everything is
+/// in memory there); the saved side of the dirty compare is already
+/// EOL-tolerant, so the record carries no accuracy debt into editing.
+pub fn eol_of(text: &str) -> Eol {
+    let mut crlf = false;
+    let mut bare = false;
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            if i > 0 && bytes[i - 1] == b'\r' {
+                if !crlf {
+                    crlf = true;
+                }
+            } else {
+                bare = true;
+            }
+        }
+    }
+    match (crlf, bare) {
+        (true, false) => Eol::Crlf,
+        (true, true) => Eol::Mixed,
+        _ => Eol::Lf,
+    }
+}
+
+/// Re-apply the file's line-ending convention to the buffer's normalized
+/// `\n` text, then encode it back in the file's own kind, so a save puts
+/// back the bytes it read. `None` is the refusal: an [`Encoding::Unknown`]
+/// tab has no faithful byte form for what the buffer now holds, and writing
+/// the lossy decode over the file would be the data loss F4 exists to stop.
+pub fn encode(text: &str, eol: Eol, encoding: Encoding) -> Option<Vec<u8>> {
+    if encoding == Encoding::Unknown {
+        return None;
+    }
+    // The buffer holds `\n` lines (a paste may carry `\r`: strip it before
+    // the conversion below, or a CR would survive as `\r\r\n`).
+    let liney = match eol {
+        Eol::Lf | Eol::Mixed => text.to_string(),
+        Eol::Crlf => text.replace("\r\n", "\n").replace('\n', "\r\n"),
+    };
+    let out = match encoding {
+        Encoding::Utf8 => liney.into_bytes(),
+        Encoding::Utf8Bom => {
+            let mut v = vec![0xEF, 0xBB, 0xBF];
+            v.extend_from_slice(liney.as_bytes());
+            v
+        }
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            let le = encoding == Encoding::Utf16Le;
+            let mut v = vec![if le { 0xFF } else { 0xFE }, if le { 0xFE } else { 0xFF }];
+            for u in liney.encode_utf16() {
+                let (a, b) = if le {
+                    (u & 0xFF, u >> 8)
+                } else {
+                    (u >> 8, u & 0xFF)
+                };
+                v.push(a as u8);
+                v.push(b as u8);
+            }
+            v
+        }
+        Encoding::Unknown => unreachable!("refused above"),
+    };
+    Some(out)
+}
+
+/// The BOM a streamed load's bytes began with, decided at open. The
+/// streamed decode is bytes-to-UTF-8, so a 16-bit BOM cannot round-trip
+/// through it: those tabs record [`Encoding::Unknown`] at the seal and are
+/// not savable (F4), while the UTF-8 BOM is only a flag to restore.
+#[derive(Clone, Copy, PartialEq)]
+enum Bom {
+    None,
+    Utf8,
+    Utf16,
 }
 
 /// An in-flight streaming load. Owns the file handle; `head_text +
@@ -78,6 +285,16 @@ pub struct Loader {
     scratch: Vec<u8>,
     saved: String,
     done: bool,
+    /// F4 on the streamed path: the BOM the open's first bytes began with,
+    /// and whether every byte the file produced so far decoded as valid
+    /// UTF-8. Together they decide the tab's `LoadInfo` at the seal — a
+    /// 16-bit file or one with an invalid sequence cannot be re-encoded,
+    /// so its tab is `Encoding::Unknown` and its save is refused.
+    bom: Bom,
+    valid_utf8: bool,
+    /// Filled at the seal; `None` until then, and the callers consult it
+    /// only when `drain` has reported done.
+    sealed_info: Option<LoadInfo>,
 }
 
 impl Loader {
@@ -93,6 +310,15 @@ impl Loader {
         let mut chunk = vec![0u8; self.chunk];
         let (n, _) = read_upto(&mut self.file, &mut chunk, &mut self.scratch);
         if n > 0 {
+            // The `scratch` trim below takes a chunk cut at a *char
+            // boundary*; a real invalid sequence in the middle is not that,
+            // and decodes to U+FFFD — which has no byte form to restore, so
+            // the tab loses the ability to save here, honestly.
+            if let Err(e) = std::str::from_utf8(&chunk[..n]) {
+                if e.error_len().is_some() {
+                    self.valid_utf8 = false;
+                }
+            }
             self.decoded.push_str(&String::from_utf8_lossy(&chunk[..n]));
         }
         let more = self.more_file(n);
@@ -151,10 +377,31 @@ impl Loader {
                 buffer.append_line("");
             }
             buffer.sealed();
+            // F4/F9: decide the tab's save record now, from everything the
+            // file produced. A drained stream never re-reads the file, so
+            // this is the only moment the whole text and the byte verdict
+            // are both known.
+            self.sealed_info = Some(LoadInfo {
+                encoding: match (self.bom, self.valid_utf8) {
+                    // 16-bit and not-UTF-8 streams were decoded lossily
+                    // through the byte path; no save can be faithful.
+                    (Bom::Utf16, _) => Encoding::Unknown,
+                    (_, false) => Encoding::Unknown,
+                    (Bom::Utf8, true) => Encoding::Utf8Bom,
+                    (Bom::None, true) => Encoding::Utf8,
+                },
+                eol: eol_of(&full),
+            });
             self.saved = full;
             self.done = true;
         }
         true
+    }
+
+    /// What the load's bytes were — BOM/encoding and line-ending record.
+    /// `Some` only once `drain` has reported done.
+    pub fn sealed_info(&self) -> Option<LoadInfo> {
+        self.sealed_info
     }
 
     /// The saved-text snapshot a synchronous load would have taken. Only
@@ -235,16 +482,30 @@ pub fn load_with(path: &Path, head_bytes: usize, chunk_bytes: usize) -> std::io:
     if size as usize <= head_bytes {
         let mut bytes = Vec::with_capacity(size as usize);
         file.read_to_end(&mut bytes)?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        // F4: the synchronous path is what almost every file takes. Decode
+        // with the BOM/encoding record instead of a bare lossy decode, and
+        // carry that record to the tab: a save puts the bytes back in kind,
+        // a save that cannot is refused. The snapshot (`saved_text`) stays
+        // the decoded text — it is the anchor the dirty compare compares
+        // against — while `Info` is what a save encodes.
+        let (text, encoding) = decode(&bytes);
         let saved_text = text.clone();
         return Ok(Loaded::Whole {
             buffer: Buffer::from_text(&text),
             saved_text,
+            info: LoadInfo {
+                encoding,
+                eol: eol_of(&text),
+            },
         });
     }
     let mut head = vec![0u8; head_bytes];
     let mut scratch = Vec::new();
     let (n, _) = read_upto(&mut file, &mut head, &mut scratch);
+    // F4 on the streamed path: the BOM decides an early verdict even
+    // before the seal (a 16-bit BOM means this tab can never be saved); a
+    // UTF-8 BOM is remembered for it.
+    let bom = sniff_bom(&head[..n]);
     let head_all = String::from_utf8_lossy(&head[..n]);
     // Cut the shown head on a line end; the trailing partial line (the
     // head read consumed it, but a half line must not be shown) begins
@@ -262,6 +523,9 @@ pub fn load_with(path: &Path, head_bytes: usize, chunk_bytes: usize) -> std::io:
             scratch,
             saved: String::new(),
             done: false,
+            bom,
+            valid_utf8: true,
+            sealed_info: None,
         }),
     })
 }
@@ -385,7 +649,11 @@ mod tests {
     fn a_small_file_loads_whole_with_no_loader() {
         let p = written("small.txt", "a\nb\n");
         match load_with(&p, 1 << 20, 1 << 20).unwrap() {
-            Loaded::Whole { buffer, saved_text } => {
+            Loaded::Whole {
+                buffer,
+                saved_text,
+                info: _,
+            } => {
                 assert_eq!(buffer.text(), "a\nb\n");
                 assert_eq!(saved_text, "a\nb\n");
             }
@@ -424,5 +692,78 @@ mod tests {
         let (buffer, saved, _) = stream_all(&p);
         assert_eq!(buffer.text(), body);
         assert_eq!(saved, body);
+    }
+
+    /// F4: encodings that carry their bytes' meaning take a
+    /// decode→encode round trip and end where they started; the ones
+    /// that do not are recorded `Unknown` and encode refuses them.
+    #[test]
+    fn decodable_encodings_round_trip_and_the_rest_are_refused() {
+        let text = "héllo utf16\nsecond été\n";
+        for (bom, le, enc) in [
+            ([0xFF, 0xFE], true, Encoding::Utf16Le),
+            ([0xFE, 0xFF], false, Encoding::Utf16Be),
+        ] {
+            let mut bytes = bom.to_vec();
+            for u in text.encode_utf16() {
+                if le {
+                    bytes.extend([u as u8, (u >> 8) as u8]);
+                } else {
+                    bytes.extend([(u >> 8) as u8, u as u8]);
+                }
+            }
+            let (decoded, got) = decode(&bytes);
+            assert_eq!(decoded, text, "{enc:?} decode");
+            assert_eq!(got, enc, "{enc:?} verdict");
+            let back = encode(&decoded, Eol::Lf, enc).unwrap();
+            assert_eq!(back, bytes, "{enc:?} round trip");
+        }
+        // A UTF-8 BOM is reported and restored byte for byte.
+        let body = "payload\n";
+        let mut bytes8 = b"\xEF\xBB\xBF".to_vec();
+        bytes8.extend_from_slice(body.as_bytes());
+        let (decoded, got) = decode(&bytes8);
+        assert_eq!(decoded, body);
+        assert_eq!(got, Encoding::Utf8Bom);
+        assert_eq!(
+            encode(&decoded, Eol::Lf, Encoding::Utf8Bom).unwrap(),
+            bytes8,
+            "UTF-8 BOM round trip"
+        );
+
+        // Refusals: a CP1252 text, an odd-length UTF-16 file, and a lone
+        // surrogate — all decoded for display, and none could be written
+        // back over the file without losing data.
+        let (text, got) = decode(&[0xE9, 0x74, 0x6C]);
+        assert!(
+            matches!(got, Encoding::Unknown),
+            "CP1252 shape must be refused"
+        );
+        assert!(text.contains('\u{FFFD}'));
+        assert_eq!(encode(&text, Eol::Lf, got), None);
+
+        let odd = vec![0xFF, 0xFE, b'a', 0, b'b'];
+        let (t2, got2) = decode(&odd);
+        assert_eq!(got2, Encoding::Unknown);
+        assert_eq!(encode(&t2, Eol::Lf, got2), None);
+
+        // A lone surrogate with no partner (`\xD800` as a 16-bit unit)
+        // decodes to U+FFFD and gets nothing written, ever.
+        let lone = vec![0xFF, 0xFE, 0x00, 0xD8];
+        let (t3, got3) = decode(&lone);
+        assert_eq!(got3, Encoding::Unknown);
+        assert_eq!(encode(&t3, Eol::Lf, got3), None);
+    }
+
+    /// F9: the line-ending census counts both conventions.
+    #[test]
+    fn eol_census_reads_the_convention_back() {
+        assert_eq!(eol_of("a\nb\n"), Eol::Lf);
+        assert_eq!(eol_of("a\r\nb\r\n"), Eol::Crlf);
+        assert_eq!(eol_of("a\r\nb\nc\n"), Eol::Mixed);
+        assert_eq!(eol_of(""), Eol::Lf);
+        // The old bug's shape: CRLF trimming would have made the next
+        // "\n"-joining save lose everything above.
+        assert_eq!(eol_of("# Title\r\nBody\r\n"), Eol::Crlf);
     }
 }

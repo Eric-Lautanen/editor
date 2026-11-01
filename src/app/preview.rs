@@ -5,7 +5,285 @@
 
 use super::*;
 
+/// A preview row that came from no source line: chrome the renderer draws
+/// rather than the file's own text (a placeholder card, an error banner, the
+/// CSV cap note). An index of one `u32` per row is what a copy walks, so a
+/// sentinel costs less than `Option<u32>` on every row.
+pub(super) const NO_LINE: u32 = u32::MAX;
+
 impl App {
+    /// The source line behind each preview row, `NO_LINE` where the row is
+    /// chrome. Copy is the only caller, so the index is built when it is asked
+    /// for — a paint never pays for it.
+    ///
+    /// Rows carry no provenance of their own (`Row` is the drawn text and the
+    /// box it fills), and they do not need to: every pane family indexes its
+    /// units by document-space y, and the tab keeps the parse those units came
+    /// from. A row's `top` therefore names its unit — a buffer line for text,
+    /// code and logs, a record for CSV and JSONL, a node for JSON, a top-level
+    /// block for Markdown — and the unit names the source lines it was
+    /// rendered from. That is what makes a copy from the reader the file's own
+    /// text instead of the rendering (audit F27).
+    pub(super) fn preview_row_lines(&self) -> Vec<u32> {
+        let tops: Vec<f32> = self.preview_rows.iter().map(|r| r.top).collect();
+        if tops.is_empty() {
+            return Vec::new();
+        }
+        match self.tabs[self.active].kind {
+            FileKind::Markdown => self.markdown_row_lines(&tops),
+            FileKind::Json => self.json_row_lines(&tops),
+            FileKind::JsonLines => self.jsonl_row_lines(&tops),
+            FileKind::Csv => self.csv_row_lines(&tops),
+            _ => self.line_row_lines(&tops),
+        }
+    }
+
+    /// The width the reader pane was laid out at — the same expression
+    /// [`App::relayout`] uses, so a plan rebuilt on demand here indexes the
+    /// rows on screen and not a pane of some other size.
+    fn preview_width(&self) -> f32 {
+        match self.mode {
+            Mode::Split => self.split_panes().0.w,
+            _ => self.size.0 as f32,
+        }
+    }
+
+    fn preview_ctx(&self) -> Ctx<'_> {
+        Ctx {
+            fonts: &self.fonts,
+            theme: &self.theme,
+            scale: self.scale,
+            zoom: self.zoom,
+        }
+    }
+
+    /// Line panes: one plan unit per buffer line, so the unit *is* the line.
+    /// The plan on the tab is used when it describes this revision; a small
+    /// pane (which is laid out whole) gets one built on demand, at the same
+    /// width, so its tops are the rows' own.
+    fn line_row_lines(&self, tops: &[f32]) -> Vec<u32> {
+        let tab = &self.tabs[self.active];
+        let fresh = tab.pane_rev == tab.buffer.revision();
+        let rows = match &tab.pane_plan {
+            Some(crate::layout::PanePlan::Lines(p)) if fresh => p.rows.clone(),
+            Some(crate::layout::PanePlan::Text(r)) if fresh => r.clone(),
+            _ => {
+                let width = self.preview_width();
+                let ctx = self.preview_ctx();
+                match line_kind(tab.kind) {
+                    Some(kind) if !matches!(kind, crate::layout::highlight::Kind::Plain) => {
+                        crate::layout::highlight::build_plan(&tab.buffer, width, &ctx, kind).rows
+                    }
+                    _ => crate::layout::text::plan_lines(&tab.buffer, width, &ctx),
+                }
+            }
+        };
+        if rows.len() == 0 {
+            return vec![NO_LINE; tops.len()];
+        }
+        let height = rows.height();
+        tops.iter()
+            .map(|y| {
+                if *y < 0.0 || *y > height {
+                    NO_LINE
+                } else {
+                    rows.at(*y) as u32
+                }
+            })
+            .collect()
+    }
+
+    /// Markdown: a unit is a top-level block, and the document carries each
+    /// block's source line range (`Document::spans`, in frontmatter-stripped
+    /// coordinates). Rows inside one block are distributed across its lines in
+    /// order, so a wrapped paragraph's continuation rows still name the line
+    /// they came from and no line is ever skipped.
+    fn markdown_row_lines(&self, tops: &[f32]) -> Vec<u32> {
+        let tab = &self.tabs[self.active];
+        let revision = tab.buffer.revision();
+        let kept = tab
+            .markdown_doc
+            .as_ref()
+            .filter(|(rev, _)| *rev == revision)
+            .map(|(_, d)| d);
+        let parsed;
+        let doc = match kept {
+            Some(d) => d,
+            None => {
+                parsed = crate::parse::markdown::parse_buffer(&tab.buffer);
+                &parsed
+            }
+        };
+        let rows = match &tab.pane_plan {
+            Some(crate::layout::PanePlan::Markdown(p)) if tab.pane_rev == revision => {
+                p.rows.clone()
+            }
+            _ => {
+                let width = self.preview_width();
+                let ctx = self.preview_ctx();
+                crate::layout::markdown::plan(doc, width, &ctx).rows
+            }
+        };
+        let mut out = vec![NO_LINE; tops.len()];
+        if rows.len() == 0 {
+            return out;
+        }
+        let height = rows.height();
+        let (mut unit, mut ord) = (usize::MAX, 0u32);
+        for (i, y) in tops.iter().enumerate() {
+            if *y < 0.0 || *y > height {
+                continue;
+            }
+            let at = rows.at(*y);
+            if at != unit {
+                unit = at;
+                ord = 0;
+            }
+            let Some(&(first, end)) = doc.spans.get(at) else {
+                continue;
+            };
+            if end <= first {
+                continue;
+            }
+            // The row's position within its block, clamped to the block's
+            // lines: a wrapped row repeats the line it continues.
+            out[i] = first + doc.lead + ord.min(end - first - 1);
+            ord += 1;
+        }
+        out
+    }
+
+    /// JSON: a unit is a node, and `Doc::spans` holds every node's byte range
+    /// in the same pre-order as the plan's slots. The range starts at the
+    /// node's first token, so the line it starts on is the node's source line
+    /// — including a node inside a collapsed subtree, whose text is in the
+    /// file even though the pane folded it away.
+    fn json_row_lines(&self, tops: &[f32]) -> Vec<u32> {
+        let tab = &self.tabs[self.active];
+        let revision = tab.buffer.revision();
+        let text = tab.buffer.text();
+        let kept = tab
+            .json_doc
+            .as_ref()
+            .filter(|(rev, _)| *rev == revision)
+            .map(|(_, d)| d);
+        let parsed;
+        let doc = match kept {
+            Some(d) => d,
+            None => {
+                let width = self.preview_width();
+                let ctx = self.preview_ctx();
+                match crate::layout::json_tree::Doc::parse(&text, &tab.collapsed, width, &ctx) {
+                    Ok(d) => {
+                        parsed = d;
+                        &parsed
+                    }
+                    Err(_) => return vec![NO_LINE; tops.len()],
+                }
+            }
+        };
+        tops.iter()
+            .map(|y| {
+                let Some(slot) = slot_at(&doc.plan.slots, *y, |s| s.top, |s| s.h) else {
+                    return NO_LINE;
+                };
+                match doc.spans.get(slot) {
+                    Some(span) => line_of_byte(&text, span.start),
+                    None => NO_LINE,
+                }
+            })
+            .collect()
+    }
+
+    /// JSONL: a record is one physical line, so a record's unit is its line —
+    /// no spans needed. The tab's plan and parse are reused when they describe
+    /// this revision; a small list (laid out whole, no virtual plan) is planned
+    /// on demand the same way the virtualized path plans it.
+    fn jsonl_row_lines(&self, tops: &[f32]) -> Vec<u32> {
+        let tab = &self.tabs[self.active];
+        let revision = tab.buffer.revision();
+        let fresh_records = tab.records_rev == revision && !tab.records.is_empty();
+        let records_owned;
+        let records = if fresh_records {
+            &tab.records
+        } else {
+            records_owned = crate::parse::jsonl::parse(&tab.buffer.text());
+            &records_owned
+        };
+        let plan_owned;
+        let plan = if !tab.plan.slots.is_empty() && tab.plan_width == self.preview_width() {
+            &tab.plan
+        } else {
+            let width = self.preview_width();
+            let ctx = self.preview_ctx();
+            plan_owned =
+                crate::layout::json_tree::build_plan(records, &tab.collapsed, width, &ctx, true);
+            &plan_owned
+        };
+        tops.iter()
+            .map(|y| {
+                let Some(at) = slot_at(&plan.slots, *y, |s| s.top, |s| s.h) else {
+                    return NO_LINE;
+                };
+                match plan.slots.get(at).and_then(|s| records.get(s.record)) {
+                    Some(record) => (record.line - 1) as u32,
+                    None => NO_LINE,
+                }
+            })
+            .collect()
+    }
+
+    /// CSV: a unit is the header, a data record, or the cap note. Records are
+    /// the file's non-blank lines in order, so the sheet's unit index names a
+    /// line without the parser having had to keep one.
+    fn csv_row_lines(&self, tops: &[f32]) -> Vec<u32> {
+        let tab = &self.tabs[self.active];
+        let revision = tab.buffer.revision();
+        let ext = extension_of(tab.path.as_deref());
+        let kept = tab
+            .csv_sheet
+            .as_ref()
+            .filter(|(rev, _)| *rev == revision)
+            .map(|(_, s)| s);
+        let parsed;
+        let sheet = match kept {
+            Some(s) => s,
+            None => {
+                parsed = crate::parse::csv::parse_with_ext(&tab.buffer.text(), Some(&ext));
+                &parsed
+            }
+        };
+        let rows = match &tab.pane_plan {
+            Some(crate::layout::PanePlan::Csv(p)) if tab.pane_rev == revision => p.rows.clone(),
+            _ => {
+                let width = self.preview_width();
+                let ctx = self.preview_ctx();
+                crate::layout::csv::plan(sheet, width, &ctx).rows
+            }
+        };
+        if rows.len() == 0 {
+            return vec![NO_LINE; tops.len()];
+        }
+        let mut lines: Vec<u32> = Vec::with_capacity(sheet.rows.len() + 1);
+        for i in 0..tab.buffer.line_count() {
+            if lines.len() > sheet.rows.len() {
+                break;
+            }
+            if !tab.buffer.line(i).trim().is_empty() {
+                lines.push(i as u32);
+            }
+        }
+        let height = rows.height();
+        tops.iter()
+            .map(|y| {
+                if *y < 0.0 || *y > height {
+                    return NO_LINE;
+                }
+                lines.get(rows.at(*y)).copied().unwrap_or(NO_LINE)
+            })
+            .collect()
+    }
+
     /// What the preview pane paints and hit-tests at: its own share of the
     /// shared progress. Identity outside Split.
     pub(super) fn preview_scroll(&self) -> f32 {
@@ -978,6 +1256,13 @@ impl App {
         if done {
             // The loader hands the snapshot over: copying it here was another
             // whole-file allocation on the UI thread at the seal.
+            // F4/F9: with the seal the file's whole text is known, so the
+            // tab's save record (encoding/BOM verdict and line endings)
+            // lands from it — before `into_saved` consumes the loader.
+            if let Some(info) = loader.sealed_info() {
+                self.tabs[self.active].encoding = info.encoding;
+                self.tabs[self.active].eol = info.eol;
+            }
             let saved = loader.into_saved();
             self.tabs[self.active].mark_saved(&saved);
         } else {

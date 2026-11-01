@@ -37,6 +37,12 @@ fi
 # uses packaging/macos/bundle.sh).
 install -Dm755 "$bin" "$HOME/.local/bin/editor"
 install -Dm644 "$here/editor-mime.xml" "$HOME/.local/share/mime/packages/editor-mime.xml"
+# AppStream metadata: without it (F23) the app exists only in the
+# applications menu — GNOME Software and KDE Discover never list it.
+if [ -f "$here/editor.metainfo.xml" ]; then
+    install -Dm644 "$here/editor.metainfo.xml" \
+        "$HOME/.local/share/metainfo/editor.metainfo.xml"
+fi
 
 # The launcher entry points at the installed binary by absolute path: ~/.local/bin
 # is not on PATH by default on every distribution (and only after a re-login),
@@ -95,7 +101,12 @@ fi
 
 update-mime-database "$HOME/.local/share/mime" || true
 update-desktop-database "$HOME/.local/share/applications" || true
-for t in text/markdown application/json application/x-ndjson text/plain text/csv text/x-yaml application/toml text/x-editor-dotfile; do
+# Both YAML spellings are defaulted deliberately: `application/yaml` is the
+# canonical IANA type (RFC 9512) since shared-mime-info 2.3, and `text/x-yaml`
+# is now merely an alias — but `mimeapps.list` lookups key on the primary
+# type, so a distro whose mime database is older than 2.3 still resolves the
+# second spelling. Declaring and defaulting both covers every generation.
+for t in text/markdown application/json application/x-ndjson text/plain text/csv application/yaml text/x-yaml application/toml text/x-editor-dotfile; do
     xdg-mime default editor.desktop "$t" || true
 done
 
@@ -108,7 +119,7 @@ echo "  launcher  ~/.local/share/applications/editor.desktop"
 if [ -n "$desktop_launcher" ]; then
     echo "  shortcut  $desktop_launcher"
 fi
-echo "  defaults  Markdown, JSON, NDJSON, plain text, CSV, YAML and TOML"
+echo "  defaults  Markdown, JSON, NDJSON, plain text, CSV, YAML (both types), TOML"
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *) echo "note: ~/.local/bin is not on your PATH — add it to use 'editor' directly" ;;

@@ -278,6 +278,8 @@ mod ffi {
     pub const WM_NCCREATE: u32 = 0x0081;
     pub const WM_NCCALCSIZE: u32 = 0x0083;
     pub const WM_NCHITTEST: u32 = 0x0084;
+    pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+    pub const WM_NCMOUSEMOVE: u32 = 0x00A0;
     pub const WM_KEYDOWN: u32 = 0x0100;
     pub const WM_CHAR: u32 = 0x0102;
     pub const WM_SYSKEYDOWN: u32 = 0x0104;
@@ -397,6 +399,10 @@ mod ffi {
     // Non-client hit codes (WM_NCHITTEST / WM_SETCURSOR)
     pub const HTCLIENT: isize = 1;
     pub const HTCAPTION: isize = 2;
+    /// What Win11's Snap Layouts flyout keys on: a hover reported as the
+    /// maximize button opens the layouts popup over it (F21), nothing else
+    /// does.
+    pub const HTMAXBUTTON: isize = 9;
     pub const HTLEFT: isize = 10;
     pub const HTRIGHT: isize = 11;
     pub const HTTOP: isize = 12;
@@ -1704,6 +1710,21 @@ unsafe fn paint(hwnd: Hwnd, st: &mut State) {
     end_paint(hwnd, &ps);
 }
 
+/// F21: which non-client code a title-bar point earns, before the resize
+/// band gets a say. `Maximize` is the one app-drawn control that reports
+/// an OS button — Win11's Snap Layouts flyout opens only when the hover
+/// report is `HTMAXBUTTON`, so reporting `HTCLIENT` for it (as everything
+/// app-drawn used to) quietly disabled the feature with no observable
+/// failure. `Drag` and `Client` return `None`: the drag area's top edge
+/// is the band's, so it cannot decide until the band test has run.
+fn nc_code(hit: TitleHit) -> Option<isize> {
+    match hit {
+        TitleHit::Maximize => Some(HTMAXBUTTON),
+        TitleHit::Drag | TitleHit::Client => None,
+        _ => Some(HTCLIENT),
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) -> Lresult {
     if msg == WM_NCCREATE {
         let cs = lp as *const CreateStructW;
@@ -1796,8 +1817,13 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             };
             screen_to_client(hwnd, &mut pt);
             let hit = st.handler.title_hit(pt.x as f32, pt.y as f32);
-            if !matches!(hit, TitleHit::Drag | TitleHit::Client) {
-                return HTCLIENT;
+            // Every control that has a decided code leaves here — before the
+            // resize band, which otherwise eats the corner of the buttons
+            // flush with the border (the same rule the old control-first
+            // return carried). `nc_code` decides nothing for the drag area,
+            // whose top edge still has to reach the band below.
+            if let Some(code) = nc_code(hit) {
+                return code;
             }
             if is_zoomed(hwnd) == 0 {
                 let (x, y) = (pt.x, pt.y);
@@ -1829,6 +1855,52 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
                 TitleHit::Drag => HTCAPTION,
                 _ => HTCLIENT,
             }
+        }
+        WM_NCLBUTTONDOWN => {
+            if loword(wp as isize) == HTMAXBUTTON as i32 {
+                // F21: the maximize button is non-client now, so its click
+                // arrives here instead of WM_LBUTTONDOWN. The button acts on
+                // press — the app toggles maximize on `MouseDown` — so only
+                // the Down is converted, and Windows itself never sees a
+                // click it would maximize on differently.
+                let mut pt = Point {
+                    x: loword(lp),
+                    y: hiword(lp),
+                };
+                screen_to_client(hwnd, &mut pt);
+                dispatch(
+                    st,
+                    hwnd,
+                    Event::MouseDown {
+                        x: pt.x as f32,
+                        y: pt.y as f32,
+                        button: MouseButton::Left,
+                    },
+                );
+                return 0;
+            }
+            def_window_proc_w(hwnd, msg, wp, lp)
+        }
+        WM_NCMOUSEMOVE => {
+            // F21: over the claimed button the ordinary client
+            // WM_MOUSEMOVE stops; NC move carries the same point on
+            // screen. Converted and fed onward, the title bar keeps
+            // repainting its hover; the default proc still tracks NC
+            // hover for its own button.
+            let mut pt = Point {
+                x: loword(lp),
+                y: hiword(lp),
+            };
+            screen_to_client(hwnd, &mut pt);
+            dispatch(
+                st,
+                hwnd,
+                Event::MouseMove {
+                    x: pt.x as f32,
+                    y: pt.y as f32,
+                },
+            );
+            def_window_proc_w(hwnd, msg, wp, lp)
         }
         WM_SETCURSOR => {
             // Client area cursors come from the app; the OS handles the rest
@@ -2217,7 +2289,16 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) 
             } else {
                 (notches * step, 0.0)
             };
-            dispatch(st, hwnd, Event::Scroll { dx, dy });
+            dispatch(
+                st,
+                hwnd,
+                Event::Scroll {
+                    dx,
+                    dy,
+                    // A real wheel: discrete notches, the app may glide.
+                    precise: false,
+                },
+            );
             0
         }
         WM_CLOSE => {
@@ -2377,7 +2458,12 @@ extern "system" {
 
 pub fn run(handler: Box<dyn Handler>) -> Result<()> {
     unsafe {
-        // Best effort: fails harmlessly on pre-1703 Windows 10.
+        // Best effort: fails harmlessly on pre-1703 Windows 10. With the
+        // manifest embedded (F14: RT_MANIFEST with dpiAwareness), this
+        // returns ERROR_ACCESS_DENIED on every recent Windows — the
+        // process already declared its DPI mode at load — and the result
+        // stays discarded by design: the manifest is the declaration, and
+        // this call is only the old-OS fallback.
         set_process_dpi_awareness_context(DPI_PER_MONITOR_V2);
 
         let hinst = get_module_handle_w(null());
@@ -2566,8 +2652,8 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
 mod tests {
     use super::ffi::*;
     use super::{
-        create_frame_timer, end_gesture, maximize_metrics, timer_event, touch_action, State,
-        TouchAction, TIMER_TICK,
+        create_frame_timer, end_gesture, maximize_metrics, nc_code, timer_event, touch_action,
+        State, TouchAction, TIMER_TICK,
     };
     use crate::platform::{Handler, Host};
     use crate::ui::event::{CursorShape, Event, MouseButton};
@@ -2598,6 +2684,29 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------ F21
+
+    /// The maximize button is the only title-bar point that reports an OS
+    /// button code. Its value is Win32's own — pinned so a typo in the
+    /// constant fails here instead of shipping a flyout that never opens.
+    #[test]
+    fn the_maximize_button_claims_its_os_code_and_nothing_else_does() {
+        assert_eq!(HTMAXBUTTON, 9, "Win32's real value, not a local one");
+        assert_eq!(nc_code(TitleHit::Maximize), Some(HTMAXBUTTON));
+        // Everything else app-drawn stays a client point — the pre-F21
+        // behavior — and the drag area is still undecided here because the
+        // band tests first.
+        assert_eq!(nc_code(TitleHit::Minimize), Some(HTCLIENT));
+        assert_eq!(nc_code(TitleHit::Close), Some(HTCLIENT));
+        assert_eq!(nc_code(TitleHit::NewTab), Some(HTCLIENT));
+        assert_eq!(nc_code(TitleHit::Tab(0)), Some(HTCLIENT));
+        assert_eq!(nc_code(TitleHit::TabClose(0)), Some(HTCLIENT));
+        assert_eq!(nc_code(TitleHit::Drag), None);
+        assert_eq!(nc_code(TitleHit::Client), None);
+    }
+
+    /// The touch phases (F? none — this predates the audit): flags captured
+    /// from a live window, decoded with `touch_action`.
     #[test]
     fn touch_contacts_decode_to_the_phase_they_are() {
         // The flags a real touchscreen sends, captured from a live window: a
