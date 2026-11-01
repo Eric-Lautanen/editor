@@ -61,15 +61,15 @@ type Atom = c_ulong;
 type Cursor = c_ulong;
 type Gc = *mut c_void;
 
-// F11: XIM input-method handles.
-type XIM = *mut c_void;
-type XIC = *mut c_void;
-type XIMStyle = c_ulong;
+// F11: X11 input-method (XIM/XIC) handles, named so clippy accepts them.
+type Xim = *mut c_void;
+type Xic = *mut c_void;
+type XimStyle = c_ulong;
 
 #[repr(C)]
-struct XIMStyles {
+struct XimStyles {
     count_styles: u16,
-    supported_styles: *mut XIMStyle,
+    supported_styles: *mut XimStyle,
 }
 type Xid = c_ulong;
 type Time = c_ulong;
@@ -184,16 +184,16 @@ extern "C" {
         db: *mut c_void,
         res_name: *const c_char,
         res_class: *const c_char,
-    ) -> XIM;
-    fn XGetIMValues(im: XIM, ...) -> *mut c_char;
-    fn XCreateIC(im: XIM, ...) -> XIC;
-    fn XGetICValues(ic: XIC, ...) -> *mut c_char;
-    fn XSetICFocus(ic: XIC);
-    fn XUnsetICFocus(ic: XIC);
-    fn XDestroyIC(ic: XIC);
+    ) -> Xim;
+    fn XGetIMValues(im: Xim, ...) -> *mut c_char;
+    fn XCreateIC(im: Xim, ...) -> Xic;
+    fn XGetICValues(ic: Xic, ...) -> *mut c_char;
+    fn XSetICFocus(ic: Xic);
+    fn XUnsetICFocus(ic: Xic);
+    fn XDestroyIC(ic: Xic);
     fn XFilterEvent(ev: *mut XEvent, w: Window) -> i32;
     fn Xutf8LookupString(
-        ic: XIC,
+        ic: Xic,
         ev: *const XKeyEvent,
         buf: *mut c_char,
         len: i32,
@@ -429,13 +429,13 @@ const MOTION_NOTIFY: i32 = 6;
 const FOCUS_IN: i32 = 9;
 const FOCUS_OUT: i32 = 10;
 
-// F11: XIM constants. Style bits from XIM.h; the *Nothing* pair is the
+// F11: Xim constants. Style bits from Xim.h; the *Nothing* pair is the
 // zero-UI style the local/lib model input methods always offer, and
 // `XNFilterEvents` is the event mask the IC wants added to the window's
 // `XSelectInput` (the IM's own keys — skipping it loses Backspace and
 // arrows inside preedit).
-const XIM_PREEDIT_NOTHING: XIMStyle = 0x8;
-const XIM_STATUS_NOTHING: XIMStyle = 0x80;
+const XIM_PREEDIT_NOTHING: XimStyle = 0x8;
+const XIM_STATUS_NOTHING: XimStyle = 0x80;
 const XN_QUERY_INPUT_STYLE: &[u8] = b"queryInputStyle\0";
 const XN_INPUT_STYLE: &[u8] = b"inputStyle\0";
 const XN_CLIENT_WINDOW: &[u8] = b"clientWindow\0";
@@ -604,8 +604,8 @@ struct X {
     /// `XMODIFIERS`); `ic` is the conversion context owned by this window.
     /// Either can be null: no IM, or an IM that offers no usable style —
     /// `KEY_PRESS` then falls back to `XLookupString` alone.
-    im: XIM,
-    ic: XIC,
+    im: Xim,
+    ic: Xic,
 }
 
 #[derive(Clone, Copy)]
@@ -937,12 +937,12 @@ fn file_dialog(save: bool, default_name: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Read the CLIPBOARD selection (UTF-8). The X11 selection protocol is
-/// async: we ask the owner to drop the text on our scratch property, then
-/// spin the event queue until the SelectionNotify lands. Events that arrive
-/// meanwhile are stashed and replayed by the main loop. An owner with more
-/// text than one request can carry answers with an `INCR` announcement
-/// instead (F6), and the chunks are collected as they arrive below.
+// Read the CLIPBOARD selection (UTF-8). The X11 selection protocol is
+// async: we ask the owner to drop the text on our scratch property, then
+// spin the event queue until the SelectionNotify lands. Events that arrive
+// meanwhile are stashed and replayed by the main loop. An owner with more
+// text than one request can carry answers with an `INCR` announcement
+// instead (F6), and the chunks are collected as they arrive below.
 
 /// One property read as raw bytes, deleting it on read — the consumption
 /// half of a property transfer: a read-with-delete is what an INCR
@@ -1394,14 +1394,14 @@ unsafe fn paint(x: *mut X) {
 }
 
 // ----------------------------------------------------------------
-// F11: XIM input-method context
+// F11: Xim input-method context
 
 /// Pure negotiation: which style bit-pair to ask the IM for. The
 /// `Nothing`/`Nothing` pair is the one an in-process (lib model) input
 /// method offers without any callback UI, and the only one this backend
 /// can host — everything else (on-the-spot preedit, status callbacks)
 /// needs a window the app does not draw. Details in `pick_im`.
-fn pick_style(styles: *const XIMStyles) -> XIMStyle {
+fn pick_style(styles: *const XimStyles) -> XimStyle {
     let want = XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING;
     if unsafe { (*styles).supported_styles.is_null() } || unsafe { (*styles).count_styles == 0 } {
         return 0;
@@ -1421,7 +1421,7 @@ fn pick_style(styles: *const XIMStyles) -> XIMStyle {
 /// lost, but nothing broken. `filter_mask` is the IC's `XNFilterEvents`
 /// value, which must be OR-ed into `XSelectInput` for the IM's own keys
 /// (preedit editing) to reach it.
-unsafe fn create_im_ic(d: *mut Display, win: Window) -> (XIM, XIC, c_long) {
+unsafe fn create_im_ic(d: *mut Display, win: Window) -> (Xim, Xic, c_long) {
     // Empty, not "@im=none": the latter *overrides* the user's XMODIFIERS
     // and silently disables ibus/fcitx. Empty defers to what the user set.
     XSetLocaleModifiers(b"\0".as_ptr() as *const c_char);
@@ -1429,11 +1429,11 @@ unsafe fn create_im_ic(d: *mut Display, win: Window) -> (XIM, XIC, c_long) {
     if im.is_null() {
         return (null_mut(), null_mut(), 0);
     }
-    let mut styles: XIMStyles = std::mem::zeroed();
+    let mut styles: XimStyles = std::mem::zeroed();
     XGetIMValues(
         im,
         XN_QUERY_INPUT_STYLE.as_ptr() as *const c_char,
-        &mut styles as *mut XIMStyles,
+        &mut styles as *mut XimStyles,
         null_mut::<c_char>(),
     );
     let style = pick_style(&styles);
@@ -2031,6 +2031,12 @@ pub fn run(handler: Box<dyn Handler>) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+        // F11: the input context is ours; the display close frees the server
+        // side, but the client-side IC is released here (an IC must never
+        // outlive the IM it was created from).
+        if !x.ic.is_null() {
+            XDestroyIC(x.ic);
+        }
         XCloseDisplay(d);
         Ok(())
     }
@@ -2067,12 +2073,12 @@ mod tests {
     /// crash on an empty/off the IM's empty list).
     #[test]
     fn the_nothing_style_is_picked_when_offered() {
-        let mut offered: [XIMStyle; 3] = [
+        let mut offered: [XimStyle; 3] = [
             XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING,
             0x1 | 0x20, // PreeditArea|StatusArea — needs windows we do not draw
             0x2 | 0x40, // PreeditPosition|StatusCallbacks — likewise
         ];
-        let styles = XIMStyles {
+        let styles = XimStyles {
             count_styles: 3,
             supported_styles: offered.as_mut_ptr(),
         };
@@ -2089,8 +2095,8 @@ mod tests {
     /// demand preedit windows).
     #[test]
     fn a_styleless_input_method_anchors_to_the_bare_path() {
-        let mut offered: [XIMStyle; 2] = [0x1 | 0x20, 0x2 | 0x40];
-        let styles = XIMStyles {
+        let mut offered: [XimStyle; 2] = [0x1 | 0x20, 0x2 | 0x40];
+        let styles = XimStyles {
             count_styles: 2,
             supported_styles: offered.as_mut_ptr(),
         };
@@ -2101,7 +2107,7 @@ mod tests {
     /// refusal, reached without indexing anything.
     #[test]
     fn an_empty_style_list_anchors_to_none() {
-        let styles = XIMStyles {
+        let styles = XimStyles {
             count_styles: 0,
             supported_styles: null_mut(),
         };
