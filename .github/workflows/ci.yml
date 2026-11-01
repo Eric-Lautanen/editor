@@ -77,7 +77,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: RUSTFLAGS="--cfg editor_check_${{ matrix.backend }}" cargo check
+      # `VAR=value command` is bash syntax; windows-latest's default shell is
+      # PowerShell, which reads the assignment as a command name and fails
+      # before cargo ever runs. The step's `env:` works in every shell.
+      - run: cargo check
+        env:
+          RUSTFLAGS: --cfg editor_check_${{ matrix.backend }}
 
   # Not a unit test but a budget: the suite above checks what the app paints,
   # and this checks what it *costs*. Large-file regressions (a whole-document
