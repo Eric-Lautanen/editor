@@ -19,6 +19,10 @@ mode=edit
 arg1=${1:-""}
 case "$arg1" in --mode) mode=$2; shift 2 ;; esac
 bin=${1:-./target/release/editor}
+# The script's own directory, so the sample resolves beside it however the
+# script was started (`set -u` makes an undefined `here` a hard error, which
+# is how this line was caught).
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 sample="$here/../samples/sample_markdown.md"
 log=/tmp/editor-window-smoke.log
 

@@ -32,7 +32,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev xvfb xdotool
+          # xclip is the smoke probe's second clipboard client (F6: an 8 MB
+          # selection across the X request-size cap); without it the probe
+          # refuses to run rather than calling a half-test a pass.
+          sudo apt-get install -y libx11-dev xvfb xdotool xclip
       # The tag is what the MSI is stamped with (`-d Version=`), and Cargo.toml
       # is what the binary reports at runtime. Drift between the two is
       # invisible until someone installs a package whose version disagrees
