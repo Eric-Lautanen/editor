@@ -273,7 +273,7 @@ jobs:
       - name: install X11, Xvfb, xdotool and xclip
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev xvfb xdotool xclip
+          sudo apt-get install -y libx11-dev xvfb xdotool xclip x11-utils
       - run: cargo build --release
       # The probe reports *how* a failure happened, not just that it did (see
       # tools/linux-window-smoke.sh): this is the only place a Linux window is

@@ -82,7 +82,15 @@ if [ -n "$ids" ]; then
     # generic-icon window would still be "a window named Editor", so the
     # title check above cannot catch a missing class. The class half
     # ("Editor") is what StartupWMClass in editor.desktop names.
-    wmclass=$(xdotool getwindowproperty "$first" WM_CLASS 2>/dev/null || echo MISSING)
+    # `xdotool getwindowproperty` is not in the 3.2016 package Ubuntu LTS
+    # ships, where asking for it just prints "unknown command" — which the
+    # old form reported as MISSING and failed a window that was correct.
+    # `getwindowclassname` and `xprop` both predate that, so try each.
+    wmclass=$(
+        xdotool getwindowclassname "$first" 2>/dev/null \
+            || xprop -id "$first" WM_CLASS 2>/dev/null \
+            || echo MISSING
+    )
     echo "WM_CLASS: $wmclass"
     case "$wmclass" in
         *Editor*) ;;
