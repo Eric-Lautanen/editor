@@ -106,20 +106,21 @@ if [ -n "$ids" ]; then
     # proof is observable after the fact: send `ctrl+s` at the live window
     # and the file on disk must actually change.
     xdotool windowfocus "$first" 2>/dev/null
-    before=$(stat -c %Y "$work/file.md")
+    # Content, not mtime: the save lands in the same second the window mapped,
+    # and `stat -c %Y` only counts whole seconds — a correct save read as
+    # "unchanged" and failed the probe.
+    before=$(cksum <"$work/file.md")
     xdotool type "x"
     xdotool key ctrl+s
     sleep 1
-    after=$(stat -c %Y "$work/file.md")
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    after=$(cksum <"$work/file.md")
     if [ "$after" = "$before" ]; then
-        echo "FAIL: Ctrl+S did not save the open file (mtime unchanged at $before)"
+        echo "FAIL: Ctrl+S did not save the open file (content unchanged: $before)"
         echo "its output was:"
         cat "$log"
         exit 1
     fi
-    echo "OK: Ctrl+S saved (mtime $before -> $after)"
+    echo "OK: Ctrl+S saved (content changed)"
 
     # Clipboard across the max-request boundary (F6): one X protocol request
     # is capped at about 256 KiB, so an owner that answers a selection
@@ -169,6 +170,10 @@ if [ -n "$ids" ]; then
         exit 1
     fi
     echo "OK: xclip read all $expect bytes of the copy back"
+    # The app has to stay up for the clipboard leg above: a dead owner answers
+    # no selection request. It goes now that both proofs are done.
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 else
     echo "the app is gone before any window: status ${gone:-?} (139 segv, 134 abort)"
     echo "its output was $(wc -c <"$log") bytes:"
