@@ -1424,7 +1424,7 @@ fn pick_style(styles: *const XimStyles) -> XimStyle {
 unsafe fn create_im_ic(d: *mut Display, win: Window) -> (Xim, Xic, c_long) {
     // Empty, not "@im=none": the latter *overrides* the user's XMODIFIERS
     // and silently disables ibus/fcitx. Empty defers to what the user set.
-    XSetLocaleModifiers(b"\0".as_ptr() as *const c_char);
+    XSetLocaleModifiers(c"".as_ptr());
     let im = XOpenIM(d, null_mut(), null(), null());
     if im.is_null() {
         return (null_mut(), null_mut(), 0);
