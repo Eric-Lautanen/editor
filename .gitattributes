@@ -1,0 +1,3 @@
+# The CRLF sample is the fixture for the line-ending path: it must arrive with
+# CRLF endings on every clone, not the endings the checkout happens to use.
+samples/sample_crlf.txt -text

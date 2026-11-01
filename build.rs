@@ -271,25 +271,44 @@ fn manifest(version: &str) -> Vec<u8> {
     let major = parts.next().unwrap_or(0);
     let minor = parts.next().unwrap_or(0);
     let patch = parts.next().unwrap_or(0);
+    // `\n\` keeps the line break and drops the indentation; a bare `\` at the
+    // end of a line drops both, which silently welds two attributes together
+    // (`version="0.2.14.0"processorArchitecture=…`) and hands the loader XML it
+    // refuses with a side-by-side error (14001) — nowhere near this line.
     let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\
-         <assemblyIdentity version=\"{major}.{minor}.{patch}.0\"\
-          processorArchitecture=\"*\" name=\"editor\" type=\"win32\"/>\
-         <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">\
-         <security><requestedPrivileges>\
-         <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"/>\
-         </requestedPrivileges></security></trustInfo>\
-         <compatibility xmlns=\"urn:schemas-microsoft-com:compatibility.v1\"><application>\
-         <supportedOS Id=\"{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}\"/>\
-         </application></compatibility>\
-         <application xmlns=\"urn:schemas-microsoft-com:asm.v3\"><windowsSettings>\
-         <dpiAwareness\
-          xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\"\
-          >PerMonitorV2, PerMonitor</dpiAwareness>\
-         </windowsSettings></application>\
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n\
+         <assemblyIdentity version=\"{major}.{minor}.{patch}.0\" processorArchitecture=\"*\" name=\"editor\" type=\"win32\"/>\n\
+         <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n\
+         <security><requestedPrivileges>\n\
+         <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"/>\n\
+         </requestedPrivileges></security></trustInfo>\n\
+         <compatibility xmlns=\"urn:schemas-microsoft-com:compatibility.v1\"><application>\n\
+         <supportedOS Id=\"{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}\"/>\n\
+         </application></compatibility>\n\
+         <application xmlns=\"urn:schemas-microsoft-com:asm.v3\"><windowsSettings>\n\
+         <dpiAwareness xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\">PerMonitorV2, PerMonitor</dpiAwareness>\n\
+         </windowsSettings></application>\n\
          </assembly>"
     );
+    // A malformed manifest does not fail the build: the loader refuses the
+    // binary at start-up (side-by-side error 14001), which on CI looks like a
+    // test that never ran. Require the one structural property a welded
+    // continuation breaks — after an attribute's closing quote comes
+    // whitespace, or the tag's own `>`, `/` or `?`.
+    let bytes = xml.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        // An opening quote follows its `=`; only a closing one is a weld site.
+        if *b != b'"' || i > 0 && bytes[i - 1] == b'=' {
+            continue;
+        }
+        let next = bytes.get(i + 1).copied().unwrap_or(b'>');
+        assert!(
+            next.is_ascii_whitespace() || matches!(next, b'>' | b'/' | b'?'),
+            "manifest attribute quote welded to {:?} at byte {i}",
+            next as char
+        );
+    }
     xml.into_bytes()
 }
 

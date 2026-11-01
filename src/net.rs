@@ -634,8 +634,12 @@ mod tests {
                     // pins refuse exactly that — a refusal is the pin proving
                     // itself (curl reports protocol violations with exit 1),
                     // not a rung that is missing or blocked.
-                    let refused_by_pin =
-                        rung.name().contains("curl") && msg.contains("exit code: 1");
+                    // curl reports a protocol violation with exit 1, and the
+                    // message that carries it reads "exit status: 1" on
+                    // macOS/curl 8 ("exit code: 1" elsewhere): both spellings
+                    // are the pin refusing, not a missing or blocked rung.
+                    let refused_by_pin = rung.name().contains("curl")
+                        && (msg.contains("exit code: 1") || msg.contains("exit status: 1"));
                     assert!(
                         refused_by_pin
                             || msg.contains("is not installed")

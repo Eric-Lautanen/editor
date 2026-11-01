@@ -6230,10 +6230,10 @@ fn a_file_without_a_decodable_encoding_refuses_to_save() {
 /// F9: one edit in a CRLF file, one save — every line ending survives.
 #[test]
 fn a_crlf_file_keeps_its_crlf_through_a_save() {
-    let original = std::fs::read(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/sample_crlf.txt"),
-    )
-    .unwrap();
+    // The bytes are built here, not read from a fixture: a checkout is free to
+    // normalize line endings (git's autocrlf does), and what this test is about
+    // is the app preserving CRLF, not what a clone happens to hold.
+    let original: Vec<u8> = b"first line\r\nsecond line\r\nthird line\r\n".to_vec();
     let dir = crate::testing::temp_dir().join("editor_f9_crlf");
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("crlf.md");
